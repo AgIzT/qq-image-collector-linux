@@ -1,35 +1,35 @@
 {
   "onebot": {
-    "config_dir": "/app/napcat/config",
-    "server_name": "qq-image-collector-local",
-    "timeout_seconds": 180
-  },
-  "qce": {
-    "base_url": "http://127.0.0.1:40653",
-    "security_config": "/app/.qq-chat-exporter/security.json",
-    "security_configs": [
-      "/app/.qq-chat-exporter/security.json",
-      "/root/.qq-chat-exporter/security.json"
-    ],
-    "timeout_seconds": 180
+    "base_url": "http://napcat:3000",
+    "ws_url": "ws://napcat:3001",
+    "webui_url": "http://napcat:6099",
+    "token_file": "/app/napcat/config/collector.onebot.token",
+    "timeout_seconds": 20
   },
   "groups": [],
   "storage": {
     "root": "/data/qq-image-collector",
-    "database": "/data/qq-image-collector/state/collector_state.sqlite3",
-    "legacy_roots": [],
-    "keep_rejected": false,
-    "migrate_existing_accepted_on_start": false
+    "database": "/data/qq-image-collector/state/collector_state.sqlite3"
   },
   "runtime": {
     "pid_file": "/data/qq-image-collector/state/collector.pid",
-    "poll_interval_seconds": 90,
-    "poll_jitter_seconds": 20,
-    "catchup_page_size": 20,
-    "catchup_initial_lookback_seconds": 3600,
-    "backfill_page_size": 20,
-    "backfill_pages_per_cycle": 1,
-    "retry_limit_per_cycle": 3,
-    "deep_backfill_enabled": false
+    "collector_paused": false,
+    "download_interval_seconds": 15,
+    "download_jitter_seconds": 3,
+    "accelerated_interval_seconds": 5,
+    "accelerate_queue_age_seconds": 1800,
+    "resume_normal_queue_age_seconds": 900,
+    "daily_download_limit": 600,
+    "max_download_bytes": 134217728,
+    "ws_ping_interval_seconds": 30,
+    "ws_disconnect_gap_seconds": 3,
+    "history_page_size": 20,
+    "history_max_pages_per_gap": 5,
+    "history_hourly_limit": 6,
+    "history_daily_limit": 20,
+    "cdn_403_window_seconds": 600,
+    "cdn_403_trip_count": 3,
+    "cdn_circuit_seconds": 3600,
+    "cdn_429_pause_seconds": 3600
   }
 }

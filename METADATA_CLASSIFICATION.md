@@ -61,10 +61,10 @@ message occurrences remain in SQLite.
 ## Source Compatibility
 
 The parser keeps legacy `novelai-stealth` and `novelai-ztxt` values mapped to
-`NAI含参但不可直接读取的`. Parser version `3` records the corrected official
+`NAI含参但不可直接读取的`. Parser version `4` records the corrected official
 fallback simulation in the asset table.
 
-Normal Worker startup may set `storage.migrate_existing_accepted_on_start=false`
-to leave existing files in their historical directories. This does not affect
-classification of newly collected files. Explicit provenance migration remains
-available when an intentional historical re-layout is required.
+Normal event Worker startup never reclassifies or rehashes existing assets. This
+does not affect classification of newly collected files. Explicit provenance
+migration remains a separate offline operation when an intentional historical
+re-layout is required.

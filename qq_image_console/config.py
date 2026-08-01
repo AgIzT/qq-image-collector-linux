@@ -65,7 +65,7 @@ class ConsoleConfig:
     direct_public_enabled: bool = False
     direct_public_hosts: list[str] = field(default_factory=list)
     direct_public_port: int = 17891
-    external_service_detail: str = "NapCat/QCE 由 Docker Compose 管理"
+    external_service_detail: str = "NapCat 与采集器由 Docker Compose 管理"
 
     @property
     def data_path(self) -> Path:
@@ -129,21 +129,16 @@ class ConsoleConfig:
 
 
 def _create_collector_config(path: Path, napcat_root: Path, data_dir: Path) -> None:
+    del napcat_root, data_dir
     storage_root = Path("/data/qq-image-collector")
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "onebot": {
-            "config_dir": str(napcat_root / "config"),
-            "server_name": "qq-image-collector-local",
-        },
-        "qce": {
-            "base_url": "http://127.0.0.1:40653",
-            "security_config": "/app/.qq-chat-exporter/security.json",
-            "security_configs": [
-                "/app/.qq-chat-exporter/security.json",
-                "/root/.qq-chat-exporter/security.json",
-            ],
-            "timeout_seconds": 180,
+            "base_url": "http://napcat:3000",
+            "ws_url": "ws://napcat:3001",
+            "webui_url": "http://napcat:6099",
+            "token_file": "/app/napcat/config/collector.onebot.token",
+            "timeout_seconds": 20,
         },
         "groups": [],
         "storage": {
@@ -155,13 +150,24 @@ def _create_collector_config(path: Path, napcat_root: Path, data_dir: Path) -> N
         },
         "runtime": {
             "pid_file": str(storage_root / "state" / "collector.pid"),
-            "poll_interval_seconds": 60,
-            "catchup_page_size": 50,
-            "catchup_initial_lookback_seconds": 3600,
-            "backfill_page_size": 50,
-            "backfill_pages_per_cycle": 1,
-            "retry_limit_per_cycle": 5,
-            "deep_backfill_enabled": False,
+            "collector_paused": False,
+            "download_interval_seconds": 15,
+            "download_jitter_seconds": 3,
+            "accelerated_interval_seconds": 5,
+            "accelerate_queue_age_seconds": 1800,
+            "resume_normal_queue_age_seconds": 900,
+            "daily_download_limit": 600,
+            "max_download_bytes": 134217728,
+            "ws_ping_interval_seconds": 30,
+            "ws_disconnect_gap_seconds": 3,
+            "history_page_size": 20,
+            "history_max_pages_per_gap": 5,
+            "history_hourly_limit": 6,
+            "history_daily_limit": 20,
+            "cdn_403_trip_count": 3,
+            "cdn_403_window_seconds": 600,
+            "cdn_circuit_seconds": 3600,
+            "cdn_429_pause_seconds": 3600,
         },
     }
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")

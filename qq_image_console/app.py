@@ -33,7 +33,7 @@ from .storage import StorageMigrationManager
 
 
 SESSION_COOKIE = "qqic_session"
-REMOTE_PERMISSIONS = ["status", "system", "groups", "backfill", "safe_settings", "audit"]
+REMOTE_PERMISSIONS = ["status", "system", "groups", "gap_recovery", "safe_settings", "audit"]
 STATE_CHANGING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 
 
@@ -46,21 +46,13 @@ class GroupCreate(BaseModel):
     display_name: str | None = Field(default=None, max_length=200)
 
 
-class BackfillRequest(BaseModel):
-    mode: Literal["page", "continuous", "rescan"] = "page"
-
-
 class SettingsPatch(BaseModel):
-    qq_path: str | None = None
-    napcat_root: str | None = None
-    launcher_kind: Literal["framework", "shell", "external"] | None = None
-    shell_launcher: str | None = None
-    poll_interval_seconds: int | None = Field(default=None, ge=15, le=3600)
-    catchup_page_size: int | None = Field(default=None, ge=20, le=500)
-    backfill_page_size: int | None = Field(default=None, ge=2, le=500)
+    download_interval_seconds: int | None = Field(default=None, ge=5, le=3600)
+    download_jitter_seconds: int | None = Field(default=None, ge=0, le=60)
+    daily_download_limit: int | None = Field(default=None, ge=1, le=10000)
+    history_hourly_limit: int | None = Field(default=None, ge=0, le=100)
+    history_daily_limit: int | None = Field(default=None, ge=0, le=1000)
     collector_paused: bool | None = None
-    backfill_paused: bool | None = None
-    deep_backfill_enabled: bool | None = None
 
 
 class StorageMigrationRequest(BaseModel):
@@ -85,6 +77,34 @@ class AppContext:
         health = self.health.snapshot()
         services = dict(health["services"])
         services["worker"] = self.supervisor.worker_status()
+        statistics = self.repository.stats()
+        event_state = statistics.get("events") or {}
+        downloader = statistics.get("downloader") or {}
+        queue = statistics.get("queue") or {}
+        downloader_status = str(downloader.get("status") or "idle")
+        services["event_stream"] = {
+            "healthy": bool(event_state.get("connected")),
+            "detail": (
+                f"已连接，最后事件 {event_state.get('last_event_at') or '尚无'}"
+                if event_state.get("connected")
+                else str(event_state.get("last_error") or "未连接")
+            ),
+        }
+        services["downloader"] = {
+            "healthy": downloader_status not in {"circuit_open", "error"},
+            "detail": downloader_status,
+        }
+        services["queue"] = {
+            "healthy": int(queue.get("oldest_age_seconds") or 0) < 7200,
+            "detail": (
+                f"{int(queue.get('depth') or 0)} 张，"
+                f"最老 {int(queue.get('oldest_age_seconds') or 0)} 秒"
+            ),
+        }
+        services["circuit"] = {
+            "healthy": downloader_status != "circuit_open",
+            "detail": str(downloader.get("reason") or "未熔断"),
+        }
         groups = self.repository.list_groups()
         return {
             "timestamp": int(time.time()),
@@ -92,7 +112,7 @@ class AppContext:
             "account": health.get("account"),
             "action": self.supervisor.action(),
             "migration": self.migration.state(),
-            "statistics": self.repository.stats(),
+            "statistics": statistics,
             "groups": groups,
             "jobs": self.repository.list_jobs(30),
             "setup": self.repository.setup_status(),
@@ -104,30 +124,30 @@ class AppContext:
         }
 
     def public_snapshot(self) -> dict[str, Any]:
-        health = self.health.snapshot()
-        services = dict(health["services"])
-        services["worker"] = self.supervisor.worker_status()
+        complete = self.status()
+        health = {"account": complete.get("account")}
+        services = complete["services"]
         groups = self.repository.list_groups()
         action = self.supervisor.action()
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "generated_at": int(time.time()),
             "account": health.get("account"),
             "services": {
                 key: {"healthy": bool(value.get("healthy"))}
                 for key, value in services.items()
             },
-            "statistics": self.repository.stats(),
+            "statistics": complete["statistics"],
             "groups": [
                 {
                     "group_id": row.get("group_id"),
                     "display_name": row.get("display_name"),
                     "enabled": bool(row.get("enabled")),
-                    "recent_status": row.get("recent_status"),
-                    "recent_last_success": row.get("recent_last_success"),
-                    "backfill_status": row.get("backfill_status"),
-                    "backfill_cursor_time": row.get("backfill_cursor_time"),
-                    "backfill_completed": bool(row.get("backfill_completed")),
+                    "event_status": row.get("event_status"),
+                    "last_event_at": row.get("last_event_at"),
+                    "last_image_at": row.get("last_image_at"),
+                    "gap_status": row.get("gap_status"),
+                    "queued": int(row.get("queued") or 0),
                     "accepted": int(row.get("accepted") or 0),
                     "duplicates": int(row.get("duplicates") or 0),
                     "rejected": int(row.get("rejected") or 0),
@@ -519,10 +539,22 @@ def create_app(
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         return {"disabled": True}
 
-    @app.post("/api/v1/groups/{group_id}/backfill", status_code=201, dependencies=[Depends(require_mutation)])
-    def start_backfill(group_id: str, request: BackfillRequest) -> dict[str, int]:
+    @app.post("/api/v1/groups/{group_id}/backfill", dependencies=[Depends(require_mutation)])
+    def retired_backfill(group_id: str) -> JSONResponse:
+        del group_id
+        return JSONResponse(
+            status_code=status.HTTP_410_GONE,
+            content={"detail": "任意历史回填已永久停用；只能恢复本次 WebSocket 断档。"},
+        )
+
+    @app.post(
+        "/api/v1/groups/{group_id}/recover-gap",
+        status_code=201,
+        dependencies=[Depends(require_mutation)],
+    )
+    def recover_gap(group_id: str) -> dict[str, int]:
         try:
-            job_id = context.repository.create_job(group_id, request.mode)
+            job_id = context.repository.create_job(group_id, "gap_recovery")
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {"job_id": job_id}
@@ -542,12 +574,12 @@ def create_app(
         values = context.repository.get_app_settings()
         if auth.mode == "remote":
             allowed = {
-                "poll_interval_seconds",
-                "catchup_page_size",
-                "backfill_page_size",
+                "download_interval_seconds",
+                "download_jitter_seconds",
+                "daily_download_limit",
+                "history_hourly_limit",
+                "history_daily_limit",
                 "collector_paused",
-                "backfill_paused",
-                "deep_backfill_enabled",
             }
             return {key: value for key, value in values.items() if key in allowed} | {
                 "remote_restricted": True
@@ -562,11 +594,12 @@ def create_app(
         values = request.model_dump(exclude_none=True)
         if auth.mode == "remote":
             allowed = {
-                "poll_interval_seconds",
-                "catchup_page_size",
-                "backfill_page_size",
+                "download_interval_seconds",
+                "download_jitter_seconds",
+                "daily_download_limit",
+                "history_hourly_limit",
+                "history_daily_limit",
                 "collector_paused",
-                "backfill_paused",
             }
             forbidden = sorted(set(values) - allowed)
             if forbidden:
@@ -590,7 +623,10 @@ def create_app(
             and not Path(values["shell_launcher"]).is_file()
         ):
             raise HTTPException(status_code=400, detail="Shell 启动器路径不存在")
-        updated = context.repository.patch_app_settings(values)
+        try:
+            updated = context.repository.patch_app_settings(values)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         if auth.mode == "remote":
             return {key: updated[key] for key in allowed} | {"remote_restricted": True}
         return updated

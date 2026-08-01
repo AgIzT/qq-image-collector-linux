@@ -115,7 +115,7 @@ def main() -> int:
     )
     print(
         "No token value was printed. If OneBot was not initialized during "
-        "login, restart napcat-qce once after the QQ session is persisted."
+        "login, restart napcat once after the QQ session is persisted."
     )
     return 0
 

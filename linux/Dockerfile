@@ -3,12 +3,8 @@ FROM node:22-alpine AS frontend-build
 WORKDIR /build/frontend
 COPY frontend/package.json frontend/package-lock.json ./
 RUN npm ci --no-audit --no-fund
-COPY frontend/index.html \
-     frontend/tsconfig.json \
-     frontend/tsconfig.app.json \
-     frontend/tsconfig.node.json \
-     frontend/vite.config.ts \
-     ./
+COPY frontend/index.html frontend/tsconfig.json frontend/tsconfig.app.json \
+     frontend/tsconfig.node.json frontend/vite.config.ts ./
 COPY frontend/src ./src
 RUN npm run build
 
@@ -23,16 +19,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     TZ=Asia/Shanghai
 
 WORKDIR /app
-
 COPY requirements-console.txt /app/requirements-console.txt
 RUN python -m pip install --no-cache-dir -r /app/requirements-console.txt
 
-COPY collector.py collector_control.py metadata_reader.py console_entry.py linux_compat_probe.py /app/
+COPY collector.py collector_control.py metadata_reader.py /app/
+COPY qq_image_collector /app/qq_image_collector
 COPY qq_image_console /app/qq_image_console
+COPY linux/cache_cleanup.py linux/event_probe.py linux/diagnostic_compare.py /app/linux/
 COPY --from=frontend-build /build/frontend/dist /app/frontend/dist
 
 STOPSIGNAL SIGTERM
-
-CMD ["python", "-m", "qq_image_console.main", \
-     "--config", "/data/manager/manager_config.json", \
-     "--autostart", "--no-browser"]
+CMD ["python", "-m", "qq_image_console.main", "--config", "/data/manager/manager_config.json", "--autostart", "--no-browser"]

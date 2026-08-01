@@ -77,6 +77,6 @@ if command -v ufw >/dev/null 2>&1; then
   ufw allow "$PUBLIC_PORT/tcp" comment "napcat-token-webui" >/dev/null
 fi
 
-docker compose up -d --force-recreate napcat-qce collector-console
+docker compose up -d --force-recreate napcat collector-console
 docker compose ps
-ss -lnt | grep -E ":(${PUBLIC_PORT}|16099|40653|17890)\\b" || true
+ss -lnt | grep -E ":(${PUBLIC_PORT}|16099|17890)\\b" || true

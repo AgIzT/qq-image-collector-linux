@@ -4,34 +4,58 @@ export type ServiceState = {
   pid?: number | null;
 };
 
+export type QueueState = {
+  depth: number;
+  oldest_age_seconds: number;
+};
+
+export type DailyCounters = {
+  events: number;
+  images_seen: number;
+  cdn_downloads: number;
+  cdn_bytes: number;
+  cdn_403: number;
+  cdn_429: number;
+  history_calls: number;
+  get_image_blocked: number;
+  accepted: number;
+  rejected: number;
+  duplicates: number;
+  failed: number;
+  filtered_gif: number;
+};
+
 export type GroupRuntime = {
   group_id: string;
   display_name: string | null;
   enabled: number;
-  recent_status: string | null;
-  recent_last_success: number | null;
-  recent_last_error: string | null;
-  recent_cursor_time: number | null;
-  backfill_status: string | null;
-  backfill_cursor_time: number | null;
-  backfill_completed: number;
-  backfill_last_success: number | null;
-  backfill_last_error: string | null;
+  event_status: string | null;
+  last_message_id: string | null;
+  last_message_time: number | null;
+  last_event_at: number | null;
+  last_image_at: number | null;
+  gap_status: string | null;
+  gap_started_at: number | null;
+  gap_finished_at: number | null;
+  gap_error: string | null;
   accepted: number;
   duplicates: number;
   rejected: number;
   failed: number;
+  queued: number;
 };
 
 export type Job = {
   id: number;
-  kind: "page" | "continuous" | "rescan";
+  kind: "gap_recovery";
   group_id: string;
   status: string;
   progress_pages: number;
   cancel_requested: number;
   created_at: number;
+  started_at: number | null;
   updated_at: number;
+  finished_at: number | null;
   error: string | null;
 };
 
@@ -60,37 +84,22 @@ export type DashboardStatus = {
     comfyui: number;
     novelai_unreadable: number;
     other_models: number;
-    today_new: number;
     disk_bytes: number;
-    gif_excluded: number;
-    failed: number;
-    rejected: number;
-    resolving: number;
-    assets: number;
-    provenance_missing: number;
-    provenance_complete: number;
+    queue: QueueState;
+    today: DailyCounters;
+    events: Record<string, unknown>;
+    downloader: Record<string, unknown>;
   };
   groups: GroupRuntime[];
   jobs: Job[];
   setup: {
     completed: boolean;
-    ready: boolean;
     checks: { key: string; label: string; ok: boolean; detail: string }[];
-    links: Record<string, string>;
   };
   access: {
-    mode: "local" | "remote";
+    mode: "local" | "remote" | "direct";
     identity: { email: string } | null;
     permissions: string[];
-  };
-  remote: {
-    enabled: boolean;
-    public_origin: string | null;
-    snapshot: {
-      enabled: boolean;
-      last_success?: number | null;
-      last_error?: string | null;
-    };
   };
 };
 
@@ -98,16 +107,12 @@ export type Settings = {
   storage_root?: string;
   deployment_mode?: "linux-docker";
   external_services?: boolean;
-  qq_path?: string;
-  napcat_root?: string;
-  launcher_kind?: "framework" | "shell" | "external";
-  shell_launcher?: string | null;
-  poll_interval_seconds: number;
-  catchup_page_size: number;
-  backfill_page_size: number;
+  download_interval_seconds: number;
+  download_jitter_seconds: number;
+  daily_download_limit: number;
+  history_hourly_limit: number;
+  history_daily_limit: number;
   collector_paused: boolean;
-  backfill_paused: boolean;
-  deep_backfill_enabled?: boolean;
   remote_restricted?: boolean;
 };
 

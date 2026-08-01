@@ -7,92 +7,75 @@ cd "$ROOT"
 runtime_root() {
   local value="${QQAI_RUNTIME_ROOT:-}"
   if [[ -z "$value" && -f .env ]]; then
-    value="$(
-      awk -F= '
-        /^[[:space:]]*QQAI_RUNTIME_ROOT[[:space:]]*=/ {
-          sub(/^[^=]*=/, "")
-          gsub(/^[[:space:]]+|[[:space:]]+$/, "")
-          gsub(/^["'"'"']|["'"'"']$/, "")
-          print
-          exit
-        }
-      ' .env
-    )"
+    value="$(awk -F= '/^[[:space:]]*QQAI_RUNTIME_ROOT[[:space:]]*=/ {sub(/^[^=]*=/, ""); gsub(/^[[:space:]]+|[[:space:]]+$/, ""); gsub(/^['"'"']|['"'"']$/, ""); print; exit}' .env)"
   fi
   value="${value:-./runtime}"
-  if [[ "$value" != /* ]]; then
-    value="$ROOT/${value#./}"
-  fi
+  [[ "$value" == /* ]] || value="$ROOT/${value#./}"
   printf '%s\n' "$value"
 }
 
 usage() {
-  echo "Usage: ./manage.sh prepare|start|stop|status|logs|login|activate-account [qq]|qce-token|console-url|probe [group-id]|purge-cache [--apply]"
+  echo "Usage: ./manage.sh prepare|start|stop|restart|status|logs|login|activate-account [qq]|console-url|probe-event [group-id]|diagnose-original <filename> [group-id]|purge-cache"
 }
 
-command="${1:-}"
-case "$command" in
+case "${1:-}" in
   prepare)
     python3 bootstrap.py --runtime-root "$(runtime_root)"
     ;;
   start)
     python3 bootstrap.py --runtime-root "$(runtime_root)"
-    docker compose up -d --build
+    docker compose up -d --build --remove-orphans
     ;;
   stop)
-    docker compose down
+    docker compose down --remove-orphans
+    ;;
+  restart)
+    python3 bootstrap.py --runtime-root "$(runtime_root)"
+    docker compose up -d --build --force-recreate --remove-orphans
     ;;
   status)
     docker compose ps
+    echo
+    ss -lnt | grep -E ':(10058|16099|17890|18080|3000|3001|40653)\b' || true
     ;;
   logs)
-    docker compose logs --tail 200 collector-console
+    docker compose logs --tail 250 collector-console cache-cleaner
     ;;
   login)
-    docker compose logs -f napcat-qce
+    docker compose logs -f napcat
     ;;
   activate-account)
     if [[ -n "${2:-}" ]]; then
-      python3 activate_account.py \
-        --runtime-root "$(runtime_root)" \
-        --account "$2"
+      python3 activate_account.py --runtime-root "$(runtime_root)" --account "$2"
     else
-      python3 activate_account.py \
-        --runtime-root "$(runtime_root)"
+      python3 activate_account.py --runtime-root "$(runtime_root)"
     fi
-    ;;
-  qce-token)
-    docker compose exec -T napcat-qce sh -lc \
-      'for f in /app/.qq-chat-exporter/security.json /root/.qq-chat-exporter/security.json; do if [ -f "$f" ]; then cat "$f"; exit 0; fi; done; exit 1'
+    docker compose restart napcat
     ;;
   console-url)
     token="$(docker compose exec -T collector-console sh -lc 'cat /data/manager/manager.token')"
-    printf 'Use an SSH tunnel, then open:\nhttp://127.0.0.1:%s/?session_token=%s\n' \
-      "${COLLECTOR_LOCAL_FORWARD_PORT:-17891}" "$token"
+    printf 'Open through the existing Nginx public endpoint:\nhttp://<server>:18080/?session_token=%s\n' "$token"
     ;;
-  probe)
-    group="${2:-}"
-    if [[ -n "$group" ]]; then
-      docker compose exec -T collector-console \
-        python /app/linux_compat_probe.py --group "$group"
-    else
-      docker compose exec -T collector-console \
-        python /app/linux_compat_probe.py
-    fi
+  probe-event)
+    args=()
+    [[ -z "${2:-}" ]] || args+=(--group "$2")
+    docker compose exec -T collector-console python /app/linux/event_probe.py "${args[@]}"
+    ;;
+  diagnose-original)
+    [[ -n "${2:-}" ]] || { echo "diagnostic source filename is required" >&2; exit 2; }
+    args=(--source "/diagnostics/$2" --allow-get-image-diagnostic)
+    [[ -z "${3:-}" ]] || args+=(--group "$3")
+    docker compose exec -T collector-console python /app/linux/diagnostic_compare.py "${args[@]}"
     ;;
   purge-cache)
-    if [[ "${2:-}" == "--apply" ]]; then
-      python3 cache_cleanup.py \
-        --session-root "$(runtime_root)/qq-session" \
-        --keep-days "${QQAI_CACHE_KEEP_DAYS:-1}" \
-        --thumbnail-keep-days "${QQAI_CACHE_THUMBNAIL_KEEP_DAYS:-1}" \
-        --apply
-    else
-      python3 cache_cleanup.py \
-        --session-root "$(runtime_root)/qq-session" \
-        --keep-days "${QQAI_CACHE_KEEP_DAYS:-1}" \
-        --thumbnail-keep-days "${QQAI_CACHE_THUMBNAIL_KEEP_DAYS:-1}"
-    fi
+    docker compose exec -T cache-cleaner python /app/linux/cache_cleanup.py \
+      --session-root /cleanup/qq-session \
+      --napcat-log-root /cleanup/napcat-logs \
+      --collector-temp-root /cleanup/repository/temp \
+      --collector-state-root /cleanup/repository/state \
+      --legacy-qce-root /cleanup/qce-data \
+      --short-keep-hours 2 --media-keep-hours 24 --log-keep-hours 48 \
+      --legacy-keep-hours 168 --apply
     ;;
   *)
     usage

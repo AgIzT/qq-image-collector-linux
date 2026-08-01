@@ -3,3 +3,5 @@ uvicorn>=0.34,<1
 psutil>=6,<8
 Pillow>=10,<13
 PyJWT[crypto]>=2.8,<2.9
+httpx>=0.27,<1
+websockets>=14,<17

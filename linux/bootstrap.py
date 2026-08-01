@@ -8,7 +8,6 @@ from pathlib import Path
 from typing import Any
 
 
-# No groups are monitored until they are added with --group or from the console.
 DEFAULT_GROUPS: list[str] = []
 
 
@@ -26,9 +25,7 @@ def env_value(path: Path, key: str) -> str | None:
 
 
 def configured_runtime_root(root: Path, explicit: Path | None = None) -> Path:
-    value: str | Path | None = explicit
-    if value is None:
-        value = os.environ.get("QQAI_RUNTIME_ROOT")
+    value: str | Path | None = explicit or os.environ.get("QQAI_RUNTIME_ROOT")
     if value is None:
         value = env_value(root / ".env", "QQAI_RUNTIME_ROOT")
     candidate = Path(value) if value else Path("runtime")
@@ -40,12 +37,26 @@ def configured_runtime_root(root: Path, explicit: Path | None = None) -> Path:
 def atomic_json(path: Path, payload: dict[str, Any], *, force: bool = False) -> bool:
     if path.exists() and not force:
         return False
+    serialized = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+    if path.is_file() and path.read_text(encoding="utf-8") == serialized:
+        return False
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    temporary.write_text(serialized, encoding="utf-8")
+    os.replace(temporary, path)
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
+    return True
+
+
+def atomic_text(path: Path, value: str, *, replace: bool = False) -> bool:
+    if path.is_file() and not replace:
+        return False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(value, encoding="utf-8")
     os.replace(temporary, path)
     try:
         path.chmod(0o600)
@@ -60,24 +71,37 @@ def onebot_config(token: str) -> dict[str, Any]:
             "httpServers": [
                 {
                     "enable": True,
-                    "name": "qq-image-collector-local",
-                    "host": "127.0.0.1",
+                    "name": "qq-image-collector-http",
+                    "host": "0.0.0.0",
                     "port": 3000,
                     "enableCors": False,
                     "enableWebsocket": False,
                     "messagePostFormat": "array",
                     "token": token,
-                    "debug": False,
+                    "debug": True,
                 }
             ],
             "httpSseServers": [],
             "httpClients": [],
-            "websocketServers": [],
+            "websocketServers": [
+                {
+                    "enable": True,
+                    "name": "qq-image-collector-events",
+                    "host": "0.0.0.0",
+                    "port": 3001,
+                    "messagePostFormat": "array",
+                    "reportSelfMessage": False,
+                    "token": token,
+                    "enableForcePushEvent": True,
+                    "debug": True,
+                    "heartInterval": 30000,
+                }
+            ],
             "websocketClients": [],
             "plugins": [],
         },
         "musicSignUrl": "",
-        "enableLocalFile2Url": True,
+        "enableLocalFile2Url": False,
         "parseMultMsg": False,
         "imageDownloadProxy": "",
         "timeout": {
@@ -92,38 +116,37 @@ def onebot_config(token: str) -> dict[str, Any]:
 def collector_config(groups: list[str]) -> dict[str, Any]:
     return {
         "onebot": {
-            "config_dir": "/app/napcat/config",
-            "server_name": "qq-image-collector-local",
-            "timeout_seconds": 180,
-        },
-        "qce": {
-            "base_url": "http://127.0.0.1:40653",
-            "security_config": "/app/.qq-chat-exporter/security.json",
-            "security_configs": [
-                "/app/.qq-chat-exporter/security.json",
-                "/root/.qq-chat-exporter/security.json",
-            ],
-            "timeout_seconds": 180,
+            "base_url": "http://napcat:3000",
+            "ws_url": "ws://napcat:3001",
+            "webui_url": "http://napcat:6099",
+            "token_file": "/app/napcat/config/collector.onebot.token",
+            "timeout_seconds": 20,
         },
         "groups": groups,
         "storage": {
             "root": "/data/qq-image-collector",
             "database": "/data/qq-image-collector/state/collector_state.sqlite3",
-            "legacy_roots": [],
-            "keep_rejected": False,
-            "migrate_existing_accepted_on_start": False,
         },
         "runtime": {
             "pid_file": "/data/qq-image-collector/state/collector.pid",
-            "poll_interval_seconds": 90,
-            "poll_jitter_seconds": 20,
-            "catchup_page_size": 20,
-            "catchup_initial_lookback_seconds": 3600,
-            "backfill_page_size": 20,
-            "backfill_pages_per_cycle": 1,
-            "backfill_paused": False,
-            "retry_limit_per_cycle": 3,
-            "deep_backfill_enabled": False,
+            "collector_paused": False,
+            "download_interval_seconds": 15,
+            "download_jitter_seconds": 3,
+            "accelerated_interval_seconds": 5,
+            "accelerate_queue_age_seconds": 1800,
+            "resume_normal_queue_age_seconds": 900,
+            "daily_download_limit": 600,
+            "max_download_bytes": 128 * 1024 * 1024,
+            "ws_ping_interval_seconds": 30,
+            "ws_disconnect_gap_seconds": 3,
+            "history_page_size": 20,
+            "history_max_pages_per_gap": 5,
+            "history_hourly_limit": 6,
+            "history_daily_limit": 20,
+            "cdn_403_window_seconds": 600,
+            "cdn_403_trip_count": 3,
+            "cdn_circuit_seconds": 3600,
+            "cdn_429_pause_seconds": 3600,
         },
     }
 
@@ -132,7 +155,7 @@ def manager_config() -> dict[str, Any]:
     return {
         "data_dir": "/data/manager",
         "collector_config": "/data/qq-image-collector/config/collector_config.json",
-        "qq_path": "/app/QQ/qq",
+        "qq_path": "/opt/QQ/qq",
         "napcat_root": "/app/napcat",
         "deployment_mode": "linux-docker",
         "launcher_kind": "external",
@@ -148,17 +171,58 @@ def manager_config() -> dict[str, Any]:
         "snapshot_ingest_url": None,
         "snapshot_secret_file": None,
         "snapshot_interval_seconds": 60,
-        "trusted_proxy_cidrs": [
-            "127.0.0.0/8",
-            "::1/128",
-            "172.16.0.0/12",
-        ],
-        "local_forward_ports": [17891],
+        "trusted_proxy_cidrs": ["127.0.0.0/8", "::1/128", "172.16.0.0/12"],
+        "local_forward_ports": [],
         "direct_public_enabled": False,
         "direct_public_hosts": [],
-        "direct_public_port": 17891,
-        "external_service_detail": "NapCat/QCE 由 Docker Compose 管理",
+        "direct_public_port": 17890,
+        "external_service_detail": "NapCat 与事件采集器由 Docker Compose 管理",
     }
+
+
+def _load_object(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        return {}
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def reconcile_collector(path: Path, requested_groups: list[str]) -> bool:
+    existing = _load_object(path)
+    groups = requested_groups or [str(value) for value in existing.get("groups", [])]
+    payload = collector_config(groups)
+    existing_storage = existing.get("storage")
+    if isinstance(existing_storage, dict):
+        for key in ("root", "database"):
+            if existing_storage.get(key):
+                payload["storage"][key] = existing_storage[key]
+    existing_runtime = existing.get("runtime")
+    if isinstance(existing_runtime, dict):
+        for key in tuple(payload["runtime"]):
+            if key in existing_runtime:
+                payload["runtime"][key] = existing_runtime[key]
+    return atomic_json(path, payload, force=True)
+
+
+def reconcile_manager(path: Path) -> bool:
+    payload = manager_config()
+    existing = _load_object(path)
+    if existing:
+        payload.update(existing)
+        payload.update(
+            {
+                "collector_config": "/data/qq-image-collector/config/collector_config.json",
+                "deployment_mode": "linux-docker",
+                "launcher_kind": "external",
+                "host": "0.0.0.0",
+                "port": 17890,
+                "external_service_detail": "NapCat 与事件采集器由 Docker Compose 管理",
+            }
+        )
+    return atomic_json(path, payload, force=True)
 
 
 def prepare(
@@ -168,10 +232,13 @@ def prepare(
     force: bool = False,
     runtime_root: Path | None = None,
 ) -> dict[str, bool]:
+    del force
     runtime = configured_runtime_root(root, runtime_root)
     for relative in (
         "qq-session",
         "napcat-config",
+        "napcat-logs",
+        "diagnostics",
         "qce-data",
         "repository/config",
         "repository/final/NovelAI",
@@ -185,31 +252,40 @@ def prepare(
     ):
         (runtime / relative).mkdir(parents=True, exist_ok=True)
 
-    token = secrets.token_urlsafe(24)
+    token_path = runtime / "napcat-config" / "collector.onebot.token"
+    if token_path.is_file():
+        token = token_path.read_text(encoding="utf-8").strip()
+        if len(token) < 24:
+            raise ValueError("existing OneBot token is unexpectedly short")
+        token_created = False
+    else:
+        token = secrets.token_urlsafe(32)
+        token_created = atomic_text(token_path, token + "\n")
+
+    onebot = onebot_config(token)
+    onebot_changed = atomic_json(
+        runtime / "napcat-config" / "onebot11.json", onebot, force=True
+    )
+    account_changed = False
+    for account_config in (runtime / "napcat-config").glob("onebot11_[0-9]*.json"):
+        account_changed = atomic_json(account_config, onebot, force=True) or account_changed
+
+    plugins_path = runtime / "napcat-config" / "plugins.json"
+    plugins_changed = False
+    if plugins_path.is_file():
+        plugins = _load_object(plugins_path)
+        if "napcat-plugin-qce" in plugins:
+            plugins.pop("napcat-plugin-qce", None)
+            plugins_changed = atomic_json(plugins_path, plugins, force=True)
+
     results = {
-        "onebot": atomic_json(
-            runtime / "napcat-config" / "onebot11.json",
-            onebot_config(token),
-            force=force,
+        "onebot_token": token_created,
+        "onebot": onebot_changed or account_changed,
+        "plugins": plugins_changed,
+        "collector": reconcile_collector(
+            runtime / "repository" / "config" / "collector_config.json", groups
         ),
-        "plugins": atomic_json(
-            runtime / "napcat-config" / "plugins.json",
-            {
-                "napcat-plugin-builtin": True,
-                "napcat-plugin-qce": True,
-            },
-            force=force,
-        ),
-        "collector": atomic_json(
-            runtime / "repository" / "config" / "collector_config.json",
-            collector_config(groups),
-            force=force,
-        ),
-        "manager": atomic_json(
-            runtime / "manager" / "manager_config.json",
-            manager_config(),
-            force=force,
-        ),
+        "manager": reconcile_manager(runtime / "manager" / "manager_config.json"),
     }
     env_file = root / ".env"
     env_example = root / ".env.example"
@@ -227,47 +303,23 @@ def prepare(
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Initialize the isolated Linux NapCat/QCE collector deployment."
+        description="Initialize or migrate the event-driven NapCat deployment."
     )
-    parser.add_argument(
-        "--root",
-        type=Path,
-        default=Path(__file__).resolve().parent,
-        help="Directory containing docker-compose.yml",
-    )
+    parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parent)
     parser.add_argument("--group", action="append", default=[])
-    parser.add_argument(
-        "--runtime-root",
-        type=Path,
-        help=(
-            "Host persistence directory. Defaults to QQAI_RUNTIME_ROOT from "
-            ".env, then ./runtime."
-        ),
-    )
-    parser.add_argument(
-        "--force",
-        action="store_true",
-        help="Replace generated configuration. Never use after production cutover.",
-    )
+    parser.add_argument("--runtime-root", type=Path)
+    parser.add_argument("--force", action="store_true", help="Compatibility flag; secrets are never rotated.")
     args = parser.parse_args()
     root = args.root.resolve()
-    runtime_root = configured_runtime_root(root, args.runtime_root)
     groups = [str(value) for value in args.group] or list(DEFAULT_GROUPS)
     invalid = [value for value in groups if not value.isdigit()]
     if invalid:
         parser.error("Group IDs must be numeric: " + ", ".join(invalid))
-    result = prepare(
-        root,
-        groups,
-        force=args.force,
-        runtime_root=runtime_root,
-    )
-    print(
-        "Linux runtime initialized. Generated files: "
-        + ", ".join(key for key, created in result.items() if created)
-    )
-    print(f"Runtime root: {runtime_root}")
-    print("No service was started and no credential value was printed.")
+    runtime = configured_runtime_root(root, args.runtime_root)
+    result = prepare(root, groups, force=args.force, runtime_root=runtime)
+    print("Runtime reconciled: " + ", ".join(key for key, changed in result.items() if changed))
+    print(f"Runtime root: {runtime}")
+    print("No credential value was printed.")
     return 0
 
 

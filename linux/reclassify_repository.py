@@ -19,7 +19,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from collector import ASSET_PARSER_VERSION, category_for_source
+from collector import category_for_source
+from qq_image_collector.database import ASSET_PARSER_VERSION
 from metadata_reader import inspect_image
 
 
