@@ -205,7 +205,17 @@ amd64 子清单为
 `sha256:11d72e50b6edc01b20f1a7611a250720e61412fe96184e3c70c3b8cf976744e1`，
 SLSA 构建上下文指向官方 `NapNeko/NapCat-Docker` 提交
 `f0599fb2eef4e9007aed72501849e2ca3eeaccdf`（2026-07-19）。这只能证明 Docker
-封装来源，不能替代对镜像内 NapCatQQ 版本/源码提交的登录后核验。
+封装来源。镜像内 `NapCat.Shell.zip` 的 SHA-256
+`85bb5b889caa61a5e671bf1b07ddb27d8b0a69f5a68016a3480aeff2ae220d03` 已与官方
+NapCatQQ `v4.18.13` 发布资产比对一致，对应标签源码提交为
+`216d0c7c6b60474298394044b9114074b8f131cf`。登录后仍须用 `get_version_info`
+确认实际运行构建。
+
+精确源码显示，debug raw 是在标准 OneBot 消息构造完成后附加的；标准图片段生成
+`data.url` 时仍会调用 NapCat `FileApi.getImageUrl()`。NTV2 图片会先尝试缓存的原生
+`FetchRkey`，失败后尝试两个第三方 rkey 服务，再回退。因此 Test F 不只是验证域名
+阻断，也要观察原生 rkey 刷新；不能把“使用事件 URL”简化成“NapCat 内部绝无账号
+动作”。这条不改变生产禁令：Worker 仍不得逐图调用 `get_image`，稳态历史调用仍为 0。
 
 ## Test G：单群 72 小时稳态门禁
 

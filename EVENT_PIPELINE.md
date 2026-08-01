@@ -94,7 +94,18 @@ NapCat 镜像固定摘要，Compose 将当前已知的两个第三方 rkey 域�
 当前固定多架构摘要的 SLSA provenance 已确认来自官方
 `NapNeko/NapCat-Docker@f0599fb2eef4e9007aed72501849e2ca3eeaccdf`，amd64
 子清单为 `sha256:11d72e50b6edc01b20f1a7611a250720e61412fe96184e3c70c3b8cf976744e1`。
-这只是 Docker 封装级映射；镜像内 NapCatQQ 版本/源码仍属于 Test F 的登录后门禁。
+镜像内 `NapCat.Shell.zip` 的 SHA-256 为
+`85bb5b889caa61a5e671bf1b07ddb27d8b0a69f5a68016a3480aeff2ae220d03`，与官方
+NapCatQQ `v4.18.13` 发布资产一致；该标签源码提交为
+`216d0c7c6b60474298394044b9114074b8f131cf`。登录后仍须用 `get_version_info` 确认
+实际运行构建没有偏离持久卷中的内容。
+
+该精确源码还确认：debug 模式是在 OneBot 消息构造完成后附加完整 raw；标准图片段
+生成 `data.url` 时会调用 `FileApi.getImageUrl()`。若 raw URL 为 NTV2，NapCat 会先
+尝试带缓存的原生 `FetchRkey`，失败后才尝试两个第三方 rkey 服务，再使用 fallback。
+因此“收到事件完全不产生任何账号动作”不是可假定的事实。生产仍严禁逐图
+`get_image` 和连续历史调用；NapCat 内部 rkey 刷新行为必须由 Test F 的源码、日志及
+网络窗口共同验收，第三方服务始终保持阻断。
 
 最终文件按 SHA-256 去重并原子移动。清理容器每 6 小时仅遍历白名单：Pic、Emoji、
 `nt_temp`、`.part` 保留 2 小时；Video、File、Ptt 保留 24 小时；QQ/NapCat 日志
