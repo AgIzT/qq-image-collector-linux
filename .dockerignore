@@ -1,0 +1,16 @@
+.git
+.agents
+.venv
+__pycache__
+*.pyc
+build
+dist
+data
+state
+logs
+runtime
+linux/runtime
+frontend/node_modules
+collector_state.sqlite3
+*.token
+*.secret

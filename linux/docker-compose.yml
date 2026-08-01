@@ -1,0 +1,72 @@
+name: qq-ai-image-collector-linux
+
+services:
+  napcat-qce:
+    image: ${NAPCAT_QCE_IMAGE:-ghcr.io/shuakami/napcat-qce@sha256:2fa905fe7c4676f8a3324ba1155a250d28e73d6ed7c3fce50a3986235c63c649}
+    container_name: qqai-napcat-qce
+    platform: linux/amd64
+    restart: unless-stopped
+    init: true
+    shm_size: "256m"
+    environment:
+      ACCOUNT: ${QQ_ACCOUNT:-}
+      NAPCAT_QUICK_PASSWORD: ${NAPCAT_QUICK_PASSWORD:-}
+      NAPCAT_QUICK_PASSWORD_MD5: ${NAPCAT_QUICK_PASSWORD_MD5:-}
+      DOCKER_CONTAINER: "true"
+      TZ: Asia/Shanghai
+    ports:
+      - "127.0.0.1:${NAPCAT_WEBUI_PORT:-16099}:6099"
+      - "${NAPCAT_PUBLIC_BIND:-127.0.0.1}:${NAPCAT_PUBLIC_WEBUI_PORT:-10058}:6099"
+      - "127.0.0.1:${QCE_WEB_PORT:-40653}:40653"
+      - "127.0.0.1:${COLLECTOR_CONSOLE_PORT:-17890}:17890"
+      - "${COLLECTOR_PUBLIC_BIND:-127.0.0.1}:${COLLECTOR_PUBLIC_PORT:-17891}:17890"
+    volumes:
+      - ${QQAI_RUNTIME_ROOT:-./runtime}/qq-session:/app/.config/QQ
+      - ${QQAI_RUNTIME_ROOT:-./runtime}/napcat-config:/app/napcat/config
+      - ${QQAI_RUNTIME_ROOT:-./runtime}/qce-data:/app/.qq-chat-exporter
+      - ${QQAI_RUNTIME_ROOT:-./runtime}/qce-data:/root/.qq-chat-exporter
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  collector-console:
+    build:
+      context: ..
+      dockerfile: linux/Dockerfile
+    image: qq-ai-image-collector-console:0.6.1-linux
+    container_name: qqai-collector-console
+    network_mode: "service:napcat-qce"
+    depends_on:
+      napcat-qce:
+        condition: service_started
+    restart: unless-stopped
+    init: true
+    environment:
+      QQ_IMAGE_CONSOLE_HOME: /data/manager
+      QQ_IMAGE_COLLECTOR_CONFIG: /data/qq-image-collector/config/collector_config.json
+      TZ: Asia/Shanghai
+    volumes:
+      - ${QQAI_RUNTIME_ROOT:-./runtime}/repository:/data/qq-image-collector
+      - ${QQAI_RUNTIME_ROOT:-./runtime}/manager:/data/manager
+      - ${QQAI_RUNTIME_ROOT:-./runtime}/qq-session:/app/.config/QQ:ro
+      - ${QQAI_RUNTIME_ROOT:-./runtime}/napcat-config:/app/napcat/config:ro
+      - ${QQAI_RUNTIME_ROOT:-./runtime}/qce-data:/app/.qq-chat-exporter:ro
+      - ${QQAI_RUNTIME_ROOT:-./runtime}/qce-data:/root/.qq-chat-exporter:ro
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:17890/health', timeout=3).read()"
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

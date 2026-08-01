@@ -1,0 +1,35 @@
+{
+  "onebot": {
+    "config_dir": "/app/napcat/config",
+    "server_name": "qq-image-collector-local",
+    "timeout_seconds": 180
+  },
+  "qce": {
+    "base_url": "http://127.0.0.1:40653",
+    "security_config": "/app/.qq-chat-exporter/security.json",
+    "security_configs": [
+      "/app/.qq-chat-exporter/security.json",
+      "/root/.qq-chat-exporter/security.json"
+    ],
+    "timeout_seconds": 180
+  },
+  "groups": [],
+  "storage": {
+    "root": "/data/qq-image-collector",
+    "database": "/data/qq-image-collector/state/collector_state.sqlite3",
+    "legacy_roots": [],
+    "keep_rejected": false,
+    "migrate_existing_accepted_on_start": false
+  },
+  "runtime": {
+    "pid_file": "/data/qq-image-collector/state/collector.pid",
+    "poll_interval_seconds": 90,
+    "poll_jitter_seconds": 20,
+    "catchup_page_size": 20,
+    "catchup_initial_lookback_seconds": 3600,
+    "backfill_page_size": 20,
+    "backfill_pages_per_cycle": 1,
+    "retry_limit_per_cycle": 3,
+    "deep_backfill_enabled": false
+  }
+}

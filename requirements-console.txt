@@ -1,0 +1,5 @@
+fastapi>=0.115,<1
+uvicorn>=0.34,<1
+psutil>=6,<8
+Pillow>=10,<13
+PyJWT[crypto]>=2.8,<2.9
