@@ -135,8 +135,10 @@ def collector_config(groups: list[str]) -> dict[str, Any]:
             "accelerated_interval_seconds": 5,
             "accelerate_queue_age_seconds": 1800,
             "resume_normal_queue_age_seconds": 900,
-            "daily_download_limit": 600,
+            "daily_download_limit": 3000,
             "max_download_bytes": 128 * 1024 * 1024,
+            "url_preference": "data",
+            "url_expiry_urgent_seconds": 3600,
             "ws_ping_interval_seconds": 30,
             "ws_disconnect_gap_seconds": 3,
             "history_page_size": 20,
@@ -147,6 +149,7 @@ def collector_config(groups: list[str]) -> dict[str, Any]:
             "cdn_403_trip_count": 3,
             "cdn_circuit_seconds": 3600,
             "cdn_429_pause_seconds": 3600,
+            "allow_403_history_refresh": False,
         },
     }
 
@@ -203,7 +206,10 @@ def reconcile_collector(path: Path, requested_groups: list[str]) -> bool:
     if isinstance(existing_runtime, dict):
         for key in tuple(payload["runtime"]):
             if key in existing_runtime:
-                payload["runtime"][key] = existing_runtime[key]
+                value = existing_runtime[key]
+                if key == "daily_download_limit" and value == 600:
+                    value = 3000
+                payload["runtime"][key] = value
     return atomic_json(path, payload, force=True)
 
 

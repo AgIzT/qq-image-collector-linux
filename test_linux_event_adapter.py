@@ -1,15 +1,21 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+from collector_control import set_setting
 from linux.bootstrap import prepare
 from linux.cache_cleanup import cleanup_once
+from linux.event_probe import receive_sample
+from linux.telemetry_report import report as telemetry_report
+from qq_image_collector.database import connect_database
 
 
 class LinuxEventAdapterTests(unittest.TestCase):
@@ -25,8 +31,8 @@ class LinuxEventAdapterTests(unittest.TestCase):
     def test_bootstrap_reconciles_http_ws_and_preserves_manager_access(self) -> None:
         results = prepare(self.root, ["100000001"], runtime_root=self.runtime)
         self.assertTrue(results["onebot_token"])
-        token = (self.runtime / "napcat-config" / "collector.onebot.token").read_text().strip()
-        config = json.loads((self.runtime / "napcat-config" / "onebot11.json").read_text())
+        token = (self.runtime / "napcat-config" / "collector.onebot.token").read_text(encoding="utf-8").strip()
+        config = json.loads((self.runtime / "napcat-config" / "onebot11.json").read_text(encoding="utf-8"))
         http = config["network"]["httpServers"][0]
         ws = config["network"]["websocketServers"][0]
         self.assertEqual((http["host"], http["port"], http["debug"]), ("0.0.0.0", 3000, True))
@@ -35,13 +41,18 @@ class LinuxEventAdapterTests(unittest.TestCase):
         self.assertEqual(ws["token"], token)
 
         collector_path = self.runtime / "repository" / "config" / "collector_config.json"
-        collector = json.loads(collector_path.read_text())
+        collector = json.loads(collector_path.read_text(encoding="utf-8"))
         self.assertNotIn("qce", collector)
         self.assertEqual(collector["groups"], ["100000001"])
-        self.assertEqual(collector["runtime"]["daily_download_limit"], 600)
+        self.assertEqual(collector["runtime"]["daily_download_limit"], 3000)
+
+        # 600 was the old production default.  A second prepare must upgrade
+        # that exact value without requiring a fresh runtime directory.
+        collector["runtime"]["daily_download_limit"] = 600
+        collector_path.write_text(json.dumps(collector), encoding="utf-8")
 
         manager_path = self.runtime / "manager" / "manager_config.json"
-        manager = json.loads(manager_path.read_text())
+        manager = json.loads(manager_path.read_text(encoding="utf-8"))
         manager["direct_public_enabled"] = True
         manager["direct_public_hosts"] = ["status.example.invalid"]
         manager_path.write_text(json.dumps(manager), encoding="utf-8")
@@ -51,11 +62,13 @@ class LinuxEventAdapterTests(unittest.TestCase):
             json.dumps({"napcat-plugin-qce": True, "other": True}), encoding="utf-8"
         )
         prepare(self.root, [], runtime_root=self.runtime)
-        manager_after = json.loads(manager_path.read_text())
+        collector_after = json.loads(collector_path.read_text(encoding="utf-8"))
+        self.assertEqual(collector_after["runtime"]["daily_download_limit"], 3000)
+        manager_after = json.loads(manager_path.read_text(encoding="utf-8"))
         self.assertTrue(manager_after["direct_public_enabled"])
         self.assertEqual(manager_after["direct_public_hosts"], ["status.example.invalid"])
-        self.assertEqual(json.loads(account_config.read_text()), config)
-        plugins = json.loads((self.runtime / "napcat-config" / "plugins.json").read_text())
+        self.assertEqual(json.loads(account_config.read_text(encoding="utf-8")), config)
+        plugins = json.loads((self.runtime / "napcat-config" / "plugins.json").read_text(encoding="utf-8"))
         self.assertNotIn("napcat-plugin-qce", plugins)
         self.assertTrue(plugins["other"])
 
@@ -118,6 +131,105 @@ class LinuxEventAdapterTests(unittest.TestCase):
         )
         self.assertNotIn('call("get_image"', production)
         self.assertNotIn("QCEClient", production)
+
+    def test_event_probe_counts_unmatched_standard_and_raw_as_union(self) -> None:
+        config = self.root / "collector.json"
+        output = self.root / "probe.json"
+        config.write_text(
+            json.dumps(
+                {
+                    "onebot": {"ws_url": "ws://synthetic.invalid", "token": "test"},
+                    "storage": {
+                        "root": str(self.root / "repository"),
+                        "database": str(self.root / "repository" / "state.sqlite3"),
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        event = {
+            "post_type": "message",
+            "message_type": "group",
+            "group_id": 100000001,
+            "message": [
+                {
+                    "type": "image",
+                    "data": {
+                        "file": "standard-only.png",
+                        "url": "https://gchat.qpic.cn/standard?rkey=x",
+                    },
+                }
+            ],
+            "raw": {
+                "elements": [
+                    {
+                        "picElement": {
+                            "fileName": "raw-only.png",
+                            "originImageUrl": "https://gchat.qpic.cn/raw?rkey=y",
+                        }
+                    }
+                ]
+            },
+        }
+
+        class FakeWebSocket:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            async def recv(self):
+                return json.dumps(event)
+
+        with patch("linux.event_probe.websockets.connect", return_value=FakeWebSocket()):
+            code = asyncio.run(receive_sample(config, None, 2, 5, output))
+
+        payload = json.loads(output.read_text(encoding="utf-8"))
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["independently_matched_pairs"], 0)
+        self.assertEqual(payload["captured_estimated_image_slots"], 2)
+        self.assertEqual(payload["standard_without_raw_match"], 1)
+        self.assertEqual(payload["raw_without_standard_match"], 1)
+
+    def test_telemetry_cannot_pass_before_full_observation_window(self) -> None:
+        database = self.root / "telemetry.sqlite3"
+        config = self.root / "telemetry.json"
+        config.write_text(
+            json.dumps(
+                {
+                    "storage": {
+                        "root": str(self.root / "repository"),
+                        "database": str(database),
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        now = 2_000_000_000
+        with connect_database(database) as connection:
+            set_setting(connection, "rollout_started_at", now - 3600)
+
+        with patch("linux.telemetry_report.time.time", return_value=now):
+            payload, gate = telemetry_report(config, 72)
+
+        self.assertFalse(gate)
+        self.assertEqual(payload["steady_state_gate"], "fail")
+        self.assertFalse(payload["duration_requirement_met"])
+        self.assertEqual(payload["observation_seconds"], 3600)
+        self.assertEqual(payload["required_observation_seconds"], 72 * 3600)
+
+    def test_get_image_diagnostic_consumes_sentinel_before_request(self) -> None:
+        source = (Path(__file__).parent / "linux" / "diagnostic_compare.py").read_text(
+            encoding="utf-8"
+        )
+        guarded = source.index("if args.allow_get_image_diagnostic:")
+        exists_check = source.index("if sentinel.exists():", guarded)
+        sentinel_write = source.index("atomic_private_json(", exists_check)
+        outbound_call = source.index("await raw_onebot_get_image(", sentinel_write)
+        self.assertLess(exists_check, sentinel_write)
+        self.assertLess(sentinel_write, outbound_call)
+        self.assertIn("one-time get_image diagnostic has already been consumed", source)
 
 
 if __name__ == "__main__":

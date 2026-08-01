@@ -7,11 +7,15 @@ export type ServiceState = {
 export type QueueState = {
   depth: number;
   oldest_age_seconds: number;
+  expiring: number;
+  expiry_urgent: number;
 };
 
 export type DailyCounters = {
   events: number;
   images_seen: number;
+  image_segments: number;
+  cdn_requests: number;
   cdn_downloads: number;
   cdn_bytes: number;
   cdn_403: number;
@@ -22,6 +26,7 @@ export type DailyCounters = {
   rejected: number;
   duplicates: number;
   failed: number;
+  expired: number;
   filtered_gif: number;
 };
 
@@ -42,6 +47,7 @@ export type GroupRuntime = {
   duplicates: number;
   rejected: number;
   failed: number;
+  expired: number;
   queued: number;
 };
 
@@ -110,6 +116,7 @@ export type Settings = {
   download_interval_seconds: number;
   download_jitter_seconds: number;
   daily_download_limit: number;
+  url_preference: "data" | "raw";
   history_hourly_limit: number;
   history_daily_limit: number;
   collector_paused: boolean;

@@ -126,6 +126,11 @@ class WorkerIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_403_refreshes_url_once_then_expires(self) -> None:
         config = write_config(self.root, "ws://127.0.0.1:9")
         worker = CollectorWorker(config)
+        worker.connection.execute(
+            "INSERT INTO app_settings(key, value_json, updated_at) VALUES ('allow_403_history_refresh', 'true', ?)",
+            (int(time.time()),),
+        )
+        worker.connection.commit()
 
         async def forbidden(_request: httpx.Request) -> httpx.Response:
             return httpx.Response(403)
@@ -158,6 +163,36 @@ class WorkerIntegrationTests(unittest.IsolatedAsyncioTestCase):
             worker.connection.execute("SELECT sum(history_calls) FROM hourly_counters").fetchone()[0],
             1,
         )
+        await worker.downloader.close()
+        worker.connection.close()
+
+    async def test_403_default_never_calls_history(self) -> None:
+        worker = CollectorWorker(write_config(self.root, "ws://127.0.0.1:9"))
+
+        async def forbidden(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(403)
+
+        await worker.downloader.client.aclose()
+        worker.downloader.client = httpx.AsyncClient(transport=httpx.MockTransport(forbidden))
+        _cursor, items = parse_group_event(
+            image_event(url="https://gchat.qpic.cn/expired-default?rkey=old")
+        )
+        enqueue_image(worker.connection, items[0])
+        history_calls = 0
+
+        async def history(_action: str, _params: dict) -> dict:
+            nonlocal history_calls
+            history_calls += 1
+            return {"messages": []}
+
+        worker.onebot.call_async = history  # type: ignore[method-assign]
+        await worker._process_claimed(claim_next_image(worker.connection))
+        self.assertEqual(history_calls, 0)
+        status, expired = worker.connection.execute(
+            "SELECT status, (SELECT sum(expired) FROM hourly_counters) FROM images"
+        ).fetchone()
+        self.assertEqual(status, "expired")
+        self.assertEqual(expired, 1)
         await worker.downloader.close()
         worker.connection.close()
 
@@ -206,11 +241,63 @@ class WorkerIntegrationTests(unittest.IsolatedAsyncioTestCase):
         await worker.downloader.close()
         worker.connection.close()
 
+    async def test_transient_cdn_status_retries_twice_then_stops(self) -> None:
+        for status_code in (408, 503):
+            with self.subTest(status_code=status_code):
+                case_root = self.root / str(status_code)
+                case_root.mkdir()
+                worker = CollectorWorker(write_config(case_root, "ws://127.0.0.1:9"))
+                calls = 0
+
+                async def transient(_request: httpx.Request) -> httpx.Response:
+                    nonlocal calls
+                    calls += 1
+                    return httpx.Response(status_code)
+
+                await worker.downloader.client.aclose()
+                worker.downloader.client = httpx.AsyncClient(
+                    transport=httpx.MockTransport(transient)
+                )
+                event = image_event(
+                    url=f"https://gchat.qpic.cn/transient-{status_code}?rkey=temporary"
+                )
+                _cursor, items = parse_group_event(event)
+                enqueue_image(worker.connection, items[0])
+
+                for expected_attempt in (1, 2, 3):
+                    row = claim_next_image(worker.connection)
+                    self.assertIsNotNone(row)
+                    await worker._process_claimed(row)
+                    status, attempts = worker.connection.execute(
+                        "SELECT status, attempts FROM images"
+                    ).fetchone()
+                    self.assertEqual(attempts, expected_attempt)
+                    self.assertEqual(
+                        status,
+                        "failed_terminal" if expected_attempt == 3 else "deferred",
+                    )
+                    worker.connection.execute(
+                        "UPDATE images SET next_retry_at=0 WHERE status='deferred'"
+                    )
+                    worker.connection.commit()
+
+                self.assertEqual(calls, 3)
+                self.assertIsNone(claim_next_image(worker.connection))
+                failed = worker.connection.execute(
+                    "SELECT sum(failed) FROM hourly_counters"
+                ).fetchone()[0]
+                self.assertEqual(failed, 1)
+                await worker.downloader.close()
+                worker.connection.close()
+
     async def test_gap_recovery_is_bounded_to_five_pages(self) -> None:
         worker = CollectorWorker(write_config(self.root, "ws://127.0.0.1:9"))
         worker.connection.execute(
-            "UPDATE group_runtime SET last_message_id=?, last_message_time=? WHERE group_id=?",
-            (MESSAGE, 1_704_067_200, GROUP),
+            """
+            UPDATE group_runtime SET last_message_id=?, last_message_seq=?,
+                last_message_time=? WHERE group_id=?
+            """,
+            (MESSAGE, "12345", 1_704_067_200, GROUP),
         )
         worker.connection.commit()
         calls = 0
@@ -224,6 +311,7 @@ class WorkerIntegrationTests(unittest.IsolatedAsyncioTestCase):
                     url=f"https://gchat.qpic.cn/gap-{calls}-{offset}?rkey=short-lived"
                 )
                 event["raw"]["msgId"] = str(int(MESSAGE) + calls * 100 + offset)
+                event["raw"]["msgSeq"] = str(12345 + calls * 100 + offset)
                 event["raw"]["msgTime"] = 1_704_067_200 + calls * 100 + offset
                 messages.append(event)
             return {"messages": messages}
@@ -244,6 +332,11 @@ class WorkerIntegrationTests(unittest.IsolatedAsyncioTestCase):
             worker.connection.execute("SELECT count(*) FROM images WHERE status='queued'").fetchone()[0],
             100,
         )
+        durable = worker.connection.execute(
+            "SELECT last_message_id, last_message_seq FROM group_runtime WHERE group_id=?",
+            (GROUP,),
+        ).fetchone()
+        self.assertEqual(tuple(durable), (MESSAGE, "12345"))
         await worker.downloader.close()
         worker.connection.close()
 

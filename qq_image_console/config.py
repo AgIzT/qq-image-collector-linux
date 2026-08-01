@@ -156,8 +156,10 @@ def _create_collector_config(path: Path, napcat_root: Path, data_dir: Path) -> N
             "accelerated_interval_seconds": 5,
             "accelerate_queue_age_seconds": 1800,
             "resume_normal_queue_age_seconds": 900,
-            "daily_download_limit": 600,
+            "daily_download_limit": 3000,
             "max_download_bytes": 134217728,
+            "url_preference": "data",
+            "url_expiry_urgent_seconds": 3600,
             "ws_ping_interval_seconds": 30,
             "ws_disconnect_gap_seconds": 3,
             "history_page_size": 20,
@@ -168,6 +170,7 @@ def _create_collector_config(path: Path, napcat_root: Path, data_dir: Path) -> N
             "cdn_403_window_seconds": 600,
             "cdn_circuit_seconds": 3600,
             "cdn_429_pause_seconds": 3600,
+            "allow_403_history_refresh": False,
         },
     }
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")

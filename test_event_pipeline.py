@@ -11,6 +11,7 @@ import unittest
 from pathlib import Path
 
 import httpx
+import websockets
 from PIL import Image
 from PIL.PngImagePlugin import PngInfo
 
@@ -19,10 +20,11 @@ from qq_image_collector.database import (
     connect_database,
     enqueue_image,
     finish_image,
+    get_runtime_state,
     queue_snapshot,
 )
 from qq_image_collector.downloader import CdnDownloader, validate_cdn_url
-from qq_image_collector.events import parse_group_event
+from qq_image_collector.events import EventListener, parse_group_event, record_group_cursor
 from qq_image_collector.onebot import OneBotClient, OneBotPolicyError
 
 
@@ -52,6 +54,7 @@ def image_event(*, url: str, original: object = True, two: bool = False) -> dict
                 "picHeight": 768,
                 "fileSize": 204800,
                 "md5HexStr": "00" * 16,
+                "fileName": "sample.png",
                 "originImageUrl": url,
             }
         }
@@ -69,7 +72,16 @@ def image_event(*, url: str, original: object = True, two: bool = False) -> dict
                 },
             }
         )
-        raw_pictures.append({"picElement": {"original": None, "fileSize": 1024}})
+        raw_pictures.append(
+            {
+                "picElement": {
+                    "original": None,
+                    "fileSize": 1024,
+                    "fileName": "second.gif",
+                    "originImageUrl": url + "&second=1",
+                }
+            }
+        )
     return {
         "post_type": "message",
         "message_type": "group",
@@ -133,6 +145,33 @@ class EventPipelineTests(unittest.TestCase):
         self.assertTrue(items[1]["resolver_data"]["emoji_signal"])
         self.assertIsNone(items[1]["original_flag"])
 
+    def test_process_local_short_ids_never_replace_durable_raw_cursor(self) -> None:
+        durable, _items = parse_group_event(
+            image_event(url="https://gchat.qpic.cn/durable")
+        )
+        self.assertTrue(durable["durable_raw"])
+        record_group_cursor(self.connection, durable)
+
+        short_event = image_event(url="https://gchat.qpic.cn/short")
+        short_event.pop("raw")
+        short_event["message_id"] = 77
+        short_event["message_seq"] = 88
+        short_event["real_seq"] = 99
+        short, _items = parse_group_event(short_event)
+        self.assertFalse(short["durable_raw"])
+        short["event_at"] = int(durable["event_at"]) + 10
+        record_group_cursor(self.connection, short)
+
+        row = self.connection.execute(
+            "SELECT last_message_id, last_message_seq, last_message_time, last_event_at "
+            "FROM group_runtime WHERE group_id=?",
+            (GROUP,),
+        ).fetchone()
+        self.assertEqual(row[0], MESSAGE)
+        self.assertEqual(row[1], "12345")
+        self.assertEqual(row[2], durable["sent_at"])
+        self.assertEqual(row[3], short["event_at"])
+
     def test_standard_original_fallback_and_priority(self) -> None:
         event = image_event(url="https://gchat.qpic.cn/path?rkey=secret", original=None)
         event["raw"]["elements"][0]["picElement"].pop("original")
@@ -145,6 +184,24 @@ class EventPipelineTests(unittest.TestCase):
         self.assertEqual(stored["priority"], 2)
         self.assertEqual(queue_snapshot(self.connection)["depth"], 1)
 
+    def test_raw_pictures_match_by_filename_and_unmatched_raw_is_not_lost(self) -> None:
+        event = image_event(url="https://gchat.qpic.cn/first", two=True)
+        event["raw"]["elements"].reverse()
+        _cursor, items = parse_group_event(event)
+        self.assertEqual(len(items), 2)
+        self.assertEqual(items[0]["resolver_data"]["raw_match"], "filename")
+        self.assertEqual(items[0]["resolver_data"]["summary"], "[图片]")
+        self.assertEqual(items[1]["resolver_data"]["raw_match"], "filename")
+
+        event = image_event(url="https://gchat.qpic.cn/standard")
+        event["message"][0]["data"]["file"] = "market-face-token"
+        _cursor, items = parse_group_event(event)
+        self.assertEqual(len(items), 2)
+        self.assertEqual(items[0]["resolver_data"]["raw_match"], "mismatch")
+        self.assertEqual(items[0]["resolver_data"]["origin_url"], "")
+        self.assertEqual(items[1]["resolver_data"]["raw_match"], "raw-only")
+        self.assertTrue(items[1]["resolver_data"]["origin_url"])
+
     def test_terminal_result_removes_rkey_and_raw_url(self) -> None:
         _cursor, items = parse_group_event(
             image_event(url="https://gchat.qpic.cn/path?rkey=super-secret")
@@ -155,9 +212,32 @@ class EventPipelineTests(unittest.TestCase):
         finish_image(self.connection, row, status="rejected_no_metadata")
         resolver = self.connection.execute("SELECT resolver_json FROM images").fetchone()[0]
         self.assertNotIn("super-secret", resolver)
-        self.assertNotIn("origin_url", resolver)
-        self.assertNotIn('"url"', resolver)
-        self.assertEqual(json.loads(resolver)["url_host"], "gchat.qpic.cn")
+        redacted = json.loads(resolver)
+        self.assertNotIn("origin_url", redacted)
+        self.assertNotIn("url", redacted)
+        self.assertEqual(redacted["url_host"], "gchat.qpic.cn")
+
+    def test_expired_row_revives_only_when_event_supplies_a_new_url(self) -> None:
+        _cursor, items = parse_group_event(
+            image_event(url="https://gchat.qpic.cn/path?rkey=old")
+        )
+        self.assertTrue(enqueue_image(self.connection, items[0]))
+        row = claim_next_image(self.connection)
+        finish_image(self.connection, row, status="expired", http_status=403)
+        self.assertFalse(enqueue_image(self.connection, items[0]))
+        self.assertEqual(
+            self.connection.execute("SELECT status FROM images").fetchone()[0], "expired"
+        )
+
+        _cursor, refreshed = parse_group_event(
+            image_event(url="https://gchat.qpic.cn/path?rkey=fresh")
+        )
+        self.assertTrue(enqueue_image(self.connection, refreshed[0]))
+        status, resolver = self.connection.execute(
+            "SELECT status, resolver_json FROM images"
+        ).fetchone()
+        self.assertEqual(status, "queued")
+        self.assertIn("fresh", resolver)
 
     def test_cdn_allowlist_is_fail_closed(self) -> None:
         self.assertEqual(
@@ -197,17 +277,77 @@ class EventPipelineTests(unittest.TestCase):
             "INSERT INTO images VALUES (?, ?, 0, 'failed', 'onebot', ?)",
             (GROUP, MESSAGE, int(time.time())),
         )
+        legacy.execute(
+            "INSERT INTO images VALUES (?, ?, 0, 'queued', 'qce', ?)",
+            (GROUP, str(int(MESSAGE) + 1), int(time.time())),
+        )
+        legacy.execute(
+            "INSERT INTO images VALUES (?, ?, 0, 'downloading', 'onebot', ?)",
+            (GROUP, str(int(MESSAGE) + 2), int(time.time())),
+        )
+        legacy.execute(
+            "INSERT INTO images VALUES (?, ?, 0, 'queued', 'event-cdn', ?)",
+            (GROUP, str(int(MESSAGE) + 3), int(time.time())),
+        )
+        legacy.execute(
+            "INSERT INTO images VALUES (?, ?, 0, 'accepted', 'onebot', ?)",
+            (GROUP, str(int(MESSAGE) + 4), int(time.time())),
+        )
         legacy.execute("CREATE TABLE group_cursors(group_id TEXT)")
         legacy.execute("CREATE TABLE deep_history_cursors(group_id TEXT)")
         legacy.execute("CREATE TABLE qce_recent_cursors(group_id TEXT)")
+        legacy.execute(
+            """
+            CREATE TABLE jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL,
+                group_id TEXT NOT NULL, status TEXT NOT NULL,
+                progress_pages INTEGER NOT NULL DEFAULT 0,
+                cancel_requested INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL, started_at INTEGER,
+                updated_at INTEGER NOT NULL, finished_at INTEGER, error TEXT
+            )
+            """
+        )
+        legacy.execute(
+            """
+            INSERT INTO jobs(kind, group_id, status, created_at, updated_at)
+            VALUES ('continuous', ?, 'running', ?, ?)
+            """,
+            (GROUP, int(time.time()), int(time.time())),
+        )
+        legacy.execute(
+            """
+            INSERT INTO jobs(kind, group_id, status, created_at, updated_at)
+            VALUES ('single_page', ?, 'queued', ?, ?)
+            """,
+            (GROUP, int(time.time()), int(time.time())),
+        )
+        legacy.execute(
+            """
+            INSERT INTO jobs(kind, group_id, status, created_at, updated_at)
+            VALUES ('gap_recovery', ?, 'running', ?, ?)
+            """,
+            (GROUP, int(time.time()), int(time.time())),
+        )
         legacy.commit()
         legacy.close()
         migrated = connect_database(database)
-        self.assertEqual(migrated.execute("SELECT status FROM images").fetchone()[0], "legacy_failed")
+        statuses = dict(
+            migrated.execute("SELECT message_id, status FROM images ORDER BY message_id")
+        )
+        self.assertEqual(statuses[MESSAGE], "legacy_failed")
+        self.assertEqual(statuses[str(int(MESSAGE) + 1)], "legacy_failed")
+        self.assertEqual(statuses[str(int(MESSAGE) + 2)], "legacy_failed")
+        self.assertEqual(statuses[str(int(MESSAGE) + 3)], "queued")
+        self.assertEqual(statuses[str(int(MESSAGE) + 4)], "accepted")
         tables = {row[0] for row in migrated.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         self.assertNotIn("group_cursors", tables)
         self.assertNotIn("deep_history_cursors", tables)
         self.assertNotIn("qce_recent_cursors", tables)
+        jobs = dict(migrated.execute("SELECT kind, status FROM jobs ORDER BY id"))
+        self.assertEqual(jobs["continuous"], "cancelled")
+        self.assertEqual(jobs["single_page"], "cancelled")
+        self.assertEqual(jobs["gap_recovery"], "running")
         migrated.close()
         self.connection = connect_database(self.root / "state.sqlite3")
 
@@ -232,9 +372,14 @@ class EventPipelineTests(unittest.TestCase):
             self.assertEqual(stored[0:2], ("accepted", "a1111-compatible"))
             self.assertNotIn("secret", stored[2])
             self.assertEqual(len(list((self.root / "final" / "其他模型生成").glob("*.png"))), 1)
+            counters = self.connection.execute(
+                "SELECT sum(cdn_requests), sum(cdn_downloads) FROM hourly_counters"
+            ).fetchone()
+            self.assertEqual(tuple(counters), (1, 1))
 
             event = image_event(url="https://gchat.qpic.cn/gif?rkey=hidden")
             event["raw"]["msgId"] = str(int(MESSAGE) + 1)
+            event["raw"]["msgSeq"] = "12346"
             _cursor, gif_items = parse_group_event(event)
             enqueue_image(self.connection, gif_items[0])
             gif_row = claim_next_image(self.connection)
@@ -254,6 +399,97 @@ class EventPipelineTests(unittest.TestCase):
             ).fetchone()[0]
             self.assertEqual(status, "filtered_gif")
             self.assertFalse(any((self.root / "temp").glob("*.part")))
+
+        asyncio.run(scenario())
+
+    def test_cdn_falls_back_to_second_allowed_event_url(self) -> None:
+        async def scenario() -> None:
+            event = image_event(url="https://gchat.qpic.cn/expired?rkey=old")
+            event["raw"]["elements"][0]["picElement"]["originImageUrl"] = (
+                "https://multimedia.nt.qq.com.cn/fresh?rkey=new"
+            )
+            _cursor, items = parse_group_event(event)
+            enqueue_image(self.connection, items[0])
+            row = claim_next_image(self.connection)
+
+            async def handler(request: httpx.Request) -> httpx.Response:
+                if request.url.host == "gchat.qpic.cn":
+                    return httpx.Response(403)
+                return httpx.Response(200, content=a1111_png())
+
+            downloader = CdnDownloader(
+                self.connection, self.root, max_bytes=1024 * 1024, daily_limit=10
+            )
+            await downloader.client.aclose()
+            downloader.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+            self.assertEqual(await downloader.process(row), "accepted")
+            counters = self.connection.execute(
+                "SELECT sum(cdn_requests), sum(cdn_downloads), sum(cdn_403) FROM hourly_counters"
+            ).fetchone()
+            self.assertEqual(tuple(counters), (2, 1, 1))
+            await downloader.close()
+
+        asyncio.run(scenario())
+
+    def test_cdn_skips_invalid_preferred_url_and_uses_allowed_fallback(self) -> None:
+        async def scenario() -> None:
+            event = image_event(url="https://example.invalid/not-qq?rkey=bad")
+            event["raw"]["elements"][0]["picElement"]["originImageUrl"] = (
+                "https://multimedia.nt.qq.com.cn/valid?rkey=good"
+            )
+            _cursor, items = parse_group_event(event)
+            enqueue_image(self.connection, items[0])
+            row = claim_next_image(self.connection)
+            requested_hosts: list[str] = []
+
+            async def handler(request: httpx.Request) -> httpx.Response:
+                requested_hosts.append(str(request.url.host))
+                return httpx.Response(200, content=a1111_png())
+
+            downloader = CdnDownloader(
+                self.connection, self.root, max_bytes=1024 * 1024, daily_limit=10
+            )
+            await downloader.client.aclose()
+            downloader.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+            self.assertEqual(await downloader.process(row), "accepted")
+            self.assertEqual(requested_hosts, ["multimedia.nt.qq.com.cn"])
+            await downloader.close()
+
+        asyncio.run(scenario())
+
+    def test_normal_websocket_close_is_recorded_as_disconnect(self) -> None:
+        async def scenario() -> None:
+            async def handler(_connection) -> None:
+                return
+
+            async with websockets.serve(handler, "127.0.0.1", 0) as server:
+                port = server.sockets[0].getsockname()[1]
+
+                async def event_handler(_event: dict) -> None:
+                    return
+
+                async def reconnect_handler(_seconds: float) -> None:
+                    return
+
+                listener = EventListener(
+                    self.connection,
+                    f"ws://127.0.0.1:{port}",
+                    "",
+                    event_handler,
+                    reconnect_handler,
+                )
+                task = asyncio.create_task(listener.run())
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline:
+                    state = get_runtime_state(self.connection, "event_stream", {})
+                    if str(state.get("last_error") or "").startswith("ConnectionError"):
+                        break
+                    await asyncio.sleep(0.05)
+                listener.stop()
+                await asyncio.wait_for(task, timeout=3)
+                self.assertTrue(
+                    str(state.get("last_error") or "").startswith("ConnectionError")
+                )
 
         asyncio.run(scenario())
 

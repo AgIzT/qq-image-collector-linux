@@ -85,6 +85,7 @@ def make_config(root: Path) -> ConsoleConfig:
                     "download_interval_seconds": 15,
                     "download_jitter_seconds": 3,
                     "daily_download_limit": 600,
+                    "url_preference": "data",
                     "history_hourly_limit": 6,
                     "history_daily_limit": 20,
                     "collector_paused": False,
@@ -152,7 +153,10 @@ class ConsoleEventApiTests(unittest.TestCase):
 
         with sqlite3.connect(self.config.database_path()) as connection:
             connection.execute(
-                "UPDATE group_runtime SET last_message_id='9000000000000000001' WHERE group_id=?",
+                """
+                UPDATE group_runtime SET last_message_id='9000000000000000001',
+                    last_message_seq='12345' WHERE group_id=?
+                """,
                 (GROUP,),
             )
             connection.commit()
@@ -162,12 +166,14 @@ class ConsoleEventApiTests(unittest.TestCase):
         self.assertEqual(jobs[0]["kind"], "gap_recovery")
 
     def test_safe_runtime_settings(self) -> None:
+        self.assertEqual(self.client.get("/api/v1/settings").json()["daily_download_limit"], 3000)
         updated = self.client.patch(
             "/api/v1/settings",
             json={
                 "download_interval_seconds": 20,
                 "download_jitter_seconds": 2,
                 "daily_download_limit": 500,
+                "url_preference": "raw",
                 "history_hourly_limit": 4,
                 "history_daily_limit": 12,
                 "collector_paused": True,
@@ -175,7 +181,13 @@ class ConsoleEventApiTests(unittest.TestCase):
         )
         self.assertEqual(updated.status_code, 200)
         self.assertEqual(updated.json()["download_interval_seconds"], 20)
+        self.assertEqual(updated.json()["url_preference"], "raw")
         self.assertTrue(updated.json()["collector_paused"])
+
+        rejected = self.client.patch(
+            "/api/v1/settings", json={"url_preference": "unverified"}
+        )
+        self.assertEqual(rejected.status_code, 422)
 
 
 if __name__ == "__main__":

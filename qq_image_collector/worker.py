@@ -161,6 +161,7 @@ class CollectorWorker:
 
         for item in items:
             increment_counter(self.connection, "images_seen")
+            increment_counter(self.connection, "image_segments")
             enqueue_image(self.connection, item)
             mark_group_image(self.connection, item["group_id"], int(time.time()))
 
@@ -223,23 +224,19 @@ class CollectorWorker:
         job_id: int | None = None,
     ) -> int:
         row = self.connection.execute(
-            "SELECT last_message_id, last_message_time FROM group_runtime WHERE group_id=?",
+            "SELECT last_message_id, last_message_seq, last_message_time FROM group_runtime WHERE group_id=?",
             (str(group_id),),
         ).fetchone()
-        anchor = str(row[0] or "") if row else ""
-        if not anchor:
-            raise ValueError("group has no durable event cursor")
+        live_raw_anchor = str(row[0] or "") if row else ""
+        anchor_seq = str(row[1] or "") if row else ""
+        if not live_raw_anchor or not anchor_seq:
+            raise ValueError("group has no durable live raw message cursor yet")
         self._set_gap(group_id, "recovering", started=True)
         page_size = int(self.runtime("history_page_size"))
         max_pages = 1 if automatic else int(self.runtime("history_max_pages_per_gap"))
         discovered = 0
-        current = anchor
-        best_cursor: dict[str, Any] = {
-            "group_id": str(group_id),
-            "message_id": anchor,
-            "sent_at": int(row[1] or 0),
-            "event_at": int(time.time()),
-        }
+        current_seq = anchor_seq
+        newest_time = int(row[2] or 0)
         from .database import enqueue_image
 
         for page_index in range(max_pages):
@@ -252,7 +249,7 @@ class CollectorWorker:
             payload = await self._history_call(
                 {
                     "group_id": str(group_id),
-                    "message_seq": current,
+                    "message_seq": current_seq,
                     "count": page_size,
                     "reverse_order": True,
                     "disable_get_url": False,
@@ -262,20 +259,21 @@ class CollectorWorker:
             messages = list(history_events(payload))
             if not messages:
                 break
-            page_best = dict(best_cursor)
+            page_newest_seq = current_seq
+            page_newest_time = newest_time
             for event in messages:
                 event.setdefault("post_type", "message")
                 event.setdefault("message_type", "group")
                 event.setdefault("group_id", str(group_id))
                 cursor, items = parse_group_event(event)
-                if (
-                    cursor
-                    and cursor.get("message_id")
-                    and int(cursor.get("sent_at") or 0) >= int(page_best.get("sent_at") or 0)
-                ):
-                    page_best = cursor
+                if cursor and cursor.get("message_seq"):
+                    event_time = int(cursor.get("sent_at") or 0)
+                    if event_time >= page_newest_time:
+                        page_newest_seq = str(cursor["message_seq"])
+                        page_newest_time = event_time
                 for item in items:
                     increment_counter(self.connection, "images_seen")
+                    increment_counter(self.connection, "image_segments")
                     enqueue_image(self.connection, item)
                     discovered += 1
             if job_id is not None:
@@ -284,19 +282,16 @@ class CollectorWorker:
                     (page_index + 1, int(time.time()), job_id),
                 )
                 self.connection.commit()
-            newest = str(page_best.get("message_id") or current)
-            if int(page_best.get("sent_at") or 0) >= int(best_cursor.get("sent_at") or 0):
-                best_cursor = page_best
-            if len(messages) < page_size or newest == current:
+            if len(messages) < page_size or page_newest_seq == current_seq:
                 break
-            current = newest
+            current_seq = page_newest_seq
+            newest_time = page_newest_time
         else:
-            if str(best_cursor.get("message_id") or "") != anchor:
-                record_group_cursor(self.connection, best_cursor)
             self._set_gap(group_id, "partial", "bounded recovery reached its page limit", finished=True)
             return discovered
-        if str(best_cursor.get("message_id") or "") != anchor:
-            record_group_cursor(self.connection, best_cursor)
+        # History results intentionally never overwrite last_message_id or
+        # last_message_seq.  Those are durable live-WS anchors; NapCat history
+        # message_id values are process-local short IDs.
         self._set_gap(group_id, "complete", None, finished=True)
         return discovered
 
@@ -304,7 +299,9 @@ class CollectorWorker:
         data = resolver_data(row)
         if data.get("url_refresh_attempted") or data.get("url_refreshed"):
             return False
-        raw_id = str(data.get("raw_message_id") or row["message_id"] or "")
+        raw_seq = str(data.get("raw_message_seq") or row["message_seq"] or "")
+        if not raw_seq:
+            return False
         async with self._history_lock:
             self._history_budget()
             data["url_refresh_attempted"] = True
@@ -326,7 +323,7 @@ class CollectorWorker:
                 "get_group_msg_history",
                 {
                     "group_id": str(row["group_id"]),
-                    "message_seq": raw_id,
+                    "message_seq": raw_seq,
                     "count": 1,
                     "reverse_order": False,
                     "disable_get_url": False,
@@ -353,6 +350,17 @@ class CollectorWorker:
             return False
         data["url"] = url
         data["origin_url"] = str(refreshed.get("origin_url") or data.get("origin_url") or "")
+        for key in (
+            "url_host",
+            "origin_url_host",
+            "data_url_has_rkey",
+            "origin_url_has_rkey",
+            "url_expires_at",
+            "url_expiry_basis",
+            "raw_match",
+        ):
+            if key in refreshed:
+                data[key] = refreshed[key]
         data["url_refreshed"] = True
         self.connection.execute(
             """
@@ -387,7 +395,6 @@ class CollectorWorker:
         window = int(self.runtime("cdn_403_window_seconds"))
         self.recent_403 = [value for value in self.recent_403 if value >= now - window]
         self.recent_403.append(now)
-        increment_counter(self.connection, "cdn_403")
         if len(self.recent_403) >= int(self.runtime("cdn_403_trip_count")):
             self._trip_circuit(int(self.runtime("cdn_circuit_seconds")), "three CDN 403 responses within the safety window")
         else:
@@ -405,6 +412,16 @@ class CollectorWorker:
         except CdnHttpError as exc:
             if exc.status_code == 403:
                 self._note_403()
+                if not bool(self.runtime("allow_403_history_refresh")):
+                    finish_image(
+                        self.connection,
+                        row,
+                        status="expired",
+                        error="CDN URL returned 403; account-session URL refresh is disabled",
+                        http_status=403,
+                    )
+                    increment_counter(self.connection, "expired")
+                    return
                 try:
                     refreshed = await self.refresh_url(row)
                 except HistoryBudgetExceeded as budget_error:
@@ -424,13 +441,41 @@ class CollectorWorker:
                     error="CDN URL expired and one bounded refresh failed",
                     http_status=403,
                 )
-                increment_counter(self.connection, "failed")
+                increment_counter(self.connection, "expired")
                 return
             if exc.status_code == 429:
-                increment_counter(self.connection, "cdn_429")
                 pause = int(self.runtime("cdn_429_pause_seconds"))
                 self._trip_circuit(pause, "QQ CDN returned HTTP 429")
                 defer_image(self.connection, row, delay_seconds=pause, error=str(exc))
+                return
+            if exc.status_code in {404, 410}:
+                finish_image(
+                    self.connection,
+                    row,
+                    status="expired",
+                    error=f"all event CDN candidates returned HTTP {exc.status_code}",
+                    http_status=exc.status_code,
+                )
+                increment_counter(self.connection, "expired")
+                return
+            if exc.status_code in {408, 425} or 500 <= exc.status_code <= 599:
+                attempts = int(row["attempts"] or 0) + 1
+                if attempts >= 3:
+                    finish_image(
+                        self.connection,
+                        row,
+                        status="failed_terminal",
+                        error=f"transient CDN HTTP {exc.status_code} persisted after {attempts} attempts",
+                        http_status=exc.status_code,
+                    )
+                    increment_counter(self.connection, "failed")
+                else:
+                    defer_image(
+                        self.connection,
+                        row,
+                        delay_seconds=min(3600, 300 * (2 ** max(0, attempts - 1))),
+                        error=f"transient CDN HTTP {exc.status_code}",
+                    )
                 return
             finish_image(
                 self.connection,
@@ -446,7 +491,7 @@ class CollectorWorker:
             else:
                 finish_image(self.connection, row, status="failed_terminal", error=str(exc))
                 increment_counter(self.connection, "failed")
-        except (httpx.HTTPError, OSError, TimeoutError) as exc:
+        except (httpx.HTTPError, OSError, asyncio.TimeoutError, TimeoutError) as exc:
             attempts = int(row["attempts"] or 0) + 1
             safe_error = type(exc).__name__
             if attempts >= 3:
@@ -477,6 +522,7 @@ class CollectorWorker:
         runtime = self.settings["runtime"]
         while not self.stop_event.is_set():
             self.downloader.daily_limit = int(self.runtime("daily_download_limit"))
+            self.downloader.url_preference = str(self.runtime("url_preference") or "data")
             if bool(self.runtime("collector_paused")):
                 self._persist_downloader_state(status="paused", last_error=None)
                 await asyncio.sleep(2)
@@ -490,7 +536,10 @@ class CollectorWorker:
                 self._persist_downloader_state(status="daily_quota", last_error=None)
                 await asyncio.sleep(60)
                 continue
-            row = claim_next_image(self.connection)
+            row = claim_next_image(
+                self.connection,
+                expiry_urgent_seconds=int(self.runtime("url_expiry_urgent_seconds")),
+            )
             if row is None:
                 self.accelerated = False
                 self._persist_downloader_state(status="idle", last_error=None)

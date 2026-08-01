@@ -66,12 +66,19 @@ class Repository:
                 "download_interval_seconds",
                 "download_jitter_seconds",
                 "daily_download_limit",
+                "url_preference",
                 "history_hourly_limit",
                 "history_daily_limit",
                 "collector_paused",
             ):
-                if get_setting(connection, key, None) is None:
-                    set_setting(connection, key, runtime.get(key, DEFAULT_RUNTIME[key]))
+                current = get_setting(connection, key, None)
+                if current is None:
+                    value = runtime.get(key, DEFAULT_RUNTIME[key])
+                    if key == "daily_download_limit" and value == 600:
+                        value = 3000
+                    set_setting(connection, key, value)
+                elif key == "daily_download_limit" and current == 600:
+                    set_setting(connection, key, 3000)
             if get_setting(connection, "setup_completed", None) is None:
                 set_setting(connection, "setup_completed", bool(settings.get("groups")))
 
@@ -86,6 +93,7 @@ class Repository:
                        coalesce(s.accepted, 0) AS accepted,
                        coalesce(s.rejected, 0) AS rejected,
                        coalesce(s.failed, 0) AS failed,
+                       coalesce(s.expired, 0) AS expired,
                        coalesce(s.queued, 0) AS queued,
                        coalesce(s.accepted - s.unique_accepted, 0) AS duplicates
                 FROM monitored_groups g
@@ -95,7 +103,8 @@ class Repository:
                            sum(CASE WHEN status='accepted' THEN 1 ELSE 0 END) AS accepted,
                            count(DISTINCT CASE WHEN status='accepted' THEN sha256 END) AS unique_accepted,
                            sum(CASE WHEN status IN ('rejected_no_metadata','filtered_gif') THEN 1 ELSE 0 END) AS rejected,
-                           sum(CASE WHEN status IN ('failed_terminal','expired','legacy_failed') THEN 1 ELSE 0 END) AS failed,
+                           sum(CASE WHEN status IN ('failed_terminal','legacy_failed') THEN 1 ELSE 0 END) AS failed,
+                           sum(CASE WHEN status='expired' THEN 1 ELSE 0 END) AS expired,
                            sum(CASE WHEN status IN ('queued','deferred','downloading') THEN 1 ELSE 0 END) AS queued
                     FROM images GROUP BY group_id
                 ) s ON s.group_id=g.group_id
@@ -106,7 +115,14 @@ class Repository:
 
     def upsert_group(self, group_id: str, display_name: str | None = None) -> None:
         with closing(self.connect()) as connection:
+            enabled_before = int(
+                connection.execute(
+                    "SELECT count(*) FROM monitored_groups WHERE enabled=1"
+                ).fetchone()[0]
+            )
             set_group_enabled(connection, group_id, True, display_name)
+            if enabled_before == 0:
+                set_setting(connection, "rollout_started_at", int(time.time()))
 
     def disable_group(self, group_id: str) -> None:
         with closing(self.connect()) as connection:
@@ -116,6 +132,13 @@ class Repository:
             if not exists:
                 raise ValueError("group is not configured")
             set_group_enabled(connection, str(group_id), False)
+            enabled_after = int(
+                connection.execute(
+                    "SELECT count(*) FROM monitored_groups WHERE enabled=1"
+                ).fetchone()[0]
+            )
+            if enabled_after == 0:
+                set_setting(connection, "rollout_started_at", None)
 
     def update_group_names(self, rows: list[dict[str, Any]]) -> None:
         now = int(time.time())
@@ -134,7 +157,7 @@ class Repository:
         with closing(self.connect()) as connection:
             configured = connection.execute(
                 """
-                SELECT g.enabled, r.last_message_id
+                SELECT g.enabled, r.last_message_id, r.last_message_seq
                 FROM monitored_groups g
                 LEFT JOIN group_runtime r ON r.group_id=g.group_id
                 WHERE g.group_id=?
@@ -143,7 +166,7 @@ class Repository:
             ).fetchone()
             if not configured or not int(configured[0]):
                 raise ValueError("group is not enabled")
-            if not str(configured[1] or ""):
+            if not str(configured[1] or "") or not str(configured[2] or ""):
                 raise ValueError("group has not received an event cursor yet")
             return enqueue_job(connection, "gap_recovery", str(group_id))
 
@@ -173,6 +196,7 @@ class Repository:
                     "download_interval_seconds",
                     "download_jitter_seconds",
                     "daily_download_limit",
+                    "url_preference",
                     "history_hourly_limit",
                     "history_daily_limit",
                     "collector_paused",
@@ -189,6 +213,7 @@ class Repository:
             "download_interval_seconds",
             "download_jitter_seconds",
             "daily_download_limit",
+            "url_preference",
             "history_hourly_limit",
             "history_daily_limit",
             "collector_paused",
@@ -223,6 +248,8 @@ class Repository:
                 for key in (
                     "events",
                     "images_seen",
+                    "image_segments",
+                    "cdn_requests",
                     "cdn_downloads",
                     "cdn_bytes",
                     "cdn_403",
@@ -233,6 +260,7 @@ class Repository:
                     "rejected",
                     "duplicates",
                     "failed",
+                    "expired",
                     "filtered_gif",
                 )
             }

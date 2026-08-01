@@ -34,10 +34,12 @@ COUNTER_COLUMNS = frozenset(
         "events",
         "group_messages",
         "images_seen",
+        "image_segments",
         "queued_high",
         "queued_medium",
         "queued_low",
         "filtered_gif",
+        "cdn_requests",
         "cdn_downloads",
         "cdn_bytes",
         "cdn_403",
@@ -48,6 +50,7 @@ COUNTER_COLUMNS = frozenset(
         "rejected",
         "duplicates",
         "failed",
+        "expired",
     }
 )
 
@@ -216,6 +219,7 @@ def connect_database(
             group_id TEXT PRIMARY KEY,
             event_status TEXT NOT NULL DEFAULT 'idle',
             last_message_id TEXT,
+            last_message_seq TEXT,
             last_message_time INTEGER,
             last_event_at INTEGER,
             last_image_at INTEGER,
@@ -233,6 +237,7 @@ def connect_database(
         {
             "event_status": "TEXT NOT NULL DEFAULT 'idle'",
             "last_message_id": "TEXT",
+            "last_message_seq": "TEXT",
             "last_message_time": "INTEGER",
             "last_event_at": "INTEGER",
             "last_image_at": "INTEGER",
@@ -284,10 +289,12 @@ def connect_database(
             events INTEGER NOT NULL DEFAULT 0,
             group_messages INTEGER NOT NULL DEFAULT 0,
             images_seen INTEGER NOT NULL DEFAULT 0,
+            image_segments INTEGER NOT NULL DEFAULT 0,
             queued_high INTEGER NOT NULL DEFAULT 0,
             queued_medium INTEGER NOT NULL DEFAULT 0,
             queued_low INTEGER NOT NULL DEFAULT 0,
             filtered_gif INTEGER NOT NULL DEFAULT 0,
+            cdn_requests INTEGER NOT NULL DEFAULT 0,
             cdn_downloads INTEGER NOT NULL DEFAULT 0,
             cdn_bytes INTEGER NOT NULL DEFAULT 0,
             cdn_403 INTEGER NOT NULL DEFAULT 0,
@@ -298,25 +305,50 @@ def connect_database(
             rejected INTEGER NOT NULL DEFAULT 0,
             duplicates INTEGER NOT NULL DEFAULT 0,
             failed INTEGER NOT NULL DEFAULT 0,
+            expired INTEGER NOT NULL DEFAULT 0,
             updated_at INTEGER NOT NULL
         )
         """
     )
+    _ensure_columns(
+        connection,
+        "hourly_counters",
+        {
+            "image_segments": "INTEGER NOT NULL DEFAULT 0",
+            "cdn_requests": "INTEGER NOT NULL DEFAULT 0",
+            "expired": "INTEGER NOT NULL DEFAULT 0",
+        },
+    )
     connection.execute("CREATE INDEX IF NOT EXISTS idx_images_status_queue ON images(status, next_retry_at, discovered_at)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_images_sha256 ON images(sha256)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_images_group_sent ON images(group_id, sent_at)")
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_images_group_seq ON images(group_id, message_seq, image_index)"
+    )
     connection.execute("CREATE INDEX IF NOT EXISTS idx_jobs_active ON jobs(status, created_at)")
     connection.execute("DROP VIEW IF EXISTS occurrences")
     connection.execute("CREATE VIEW occurrences AS SELECT * FROM images")
 
-    # The event-driven collector never retries legacy OneBot/QCE failures.
+    # The event-driven collector never retries any non-terminal work item from
+    # the legacy OneBot/QCE resolver.  This also catches queued/downloading rows
+    # left behind by an abrupt cutover, not just the six known `failed` rows.
     connection.execute(
         """
         UPDATE images SET status='legacy_failed', next_retry_at=0, updated_at=?
-        WHERE status IN ('failed', 'resolving', 'superseded_by_qce')
-          AND resolver IN ('onebot', 'qce')
+        WHERE status NOT IN ('accepted','rejected_no_metadata','filtered_gif',
+                             'failed_terminal','expired','legacy_failed')
+          AND (coalesce(resolver, '') <> 'event-cdn' OR status='failed')
         """,
         (int(time.time()),),
+    )
+    now = int(time.time())
+    connection.execute(
+        """
+        UPDATE jobs SET status='cancelled', cancel_requested=1, finished_at=?,
+            updated_at=?, error=coalesce(error, 'cancelled during event-pipeline migration')
+        WHERE kind<>'gap_recovery' AND status IN ('queued','running')
+        """,
+        (now, now),
     )
     for table in ("group_cursors", "deep_history_cursors", "qce_recent_cursors"):
         connection.execute(f"DROP TABLE IF EXISTS {table}")
@@ -393,9 +425,17 @@ def _priority(item: dict[str, Any]) -> int:
     size = int(item.get("declared_size") or 0)
     resolver = item.get("resolver_data") or {}
     emoji_signal = bool(resolver.get("emoji_signal"))
+    width = int(resolver.get("width") or 0)
+    height = int(resolver.get("height") or 0)
+    filename = str(item.get("file") or "").casefold()
     if original in (1, True):
         return 0
-    if original is None and size >= 128 * 1024 and not emoji_signal:
+    # NapCat versions differ in whether they expose picElement.original.  When
+    # it is absent, dimensions and extension keep substantial PNG/JPEG images
+    # ahead of tiny emoji without treating the signal as a rejection rule.
+    substantial = size >= 128 * 1024 or (width >= 512 and height >= 512)
+    likely_still = not filename.endswith(".gif")
+    if original is None and substantial and not emoji_signal and likely_still:
         return 1
     return 2
 
@@ -405,15 +445,82 @@ def enqueue_image(connection: sqlite3.Connection, item: dict[str, Any]) -> bool:
     priority = _priority(item)
     resolver_data = dict(item.get("resolver_data") or {})
     resolver_data["priority"] = priority
-    key = (
-        str(item["group_id"]),
-        str(item["message_id"]),
-        int(item.get("image_index") or 0),
+    url_material = "\0".join(
+        str(resolver_data.get(key) or "") for key in ("url", "origin_url")
     )
+    if url_material.strip("\0"):
+        resolver_data["url_fingerprint"] = hashlib.sha256(
+            url_material.encode("utf-8")
+        ).hexdigest()
+    group_id = str(item["group_id"])
+    message_id = str(item["message_id"])
+    message_seq = str(item.get("message_seq") or "")
+    image_index = int(item.get("image_index") or 0)
+    # History responses use NapCat's process-local short message ID, while
+    # live debug events carry the durable NT msgId.  A stable real_seq/msgSeq
+    # match keeps both paths in one row without ever replacing the live cursor.
+    if message_seq:
+        same_sequence = connection.execute(
+            """
+            SELECT message_id FROM images
+            WHERE group_id=? AND message_seq=? AND image_index=?
+            ORDER BY discovered_at LIMIT 1
+            """,
+            (group_id, message_seq, image_index),
+        ).fetchone()
+        if same_sequence:
+            message_id = str(same_sequence[0])
+    key = (group_id, message_id, image_index)
     existed = connection.execute(
-        "SELECT status FROM images WHERE group_id=? AND message_id=? AND image_index=?",
+        "SELECT status, resolver_json FROM images WHERE group_id=? AND message_id=? AND image_index=?",
         key,
     ).fetchone()
+    if existed and str(existed[0]) == "expired" and resolver_data.get("url_fingerprint"):
+        try:
+            previous_resolver = json.loads(str(existed[1] or "{}"))
+        except (TypeError, ValueError):
+            previous_resolver = {}
+        if previous_resolver.get("url_fingerprint") != resolver_data["url_fingerprint"]:
+            connection.execute(
+                """
+                UPDATE images SET message_seq=?, sent_at=?, file_token=?, declared_size=?,
+                    status='queued', sha256=NULL, local_path=NULL, metadata_source=NULL,
+                    metadata_json=NULL, error=NULL, updated_at=?, attempts=0,
+                    next_retry_at=0, resolver='event-cdn', resolver_json=?,
+                    group_uin=coalesce(?, group_uin), group_name=coalesce(?, group_name),
+                    sender_uin=coalesce(?, sender_uin), sender_uid=coalesce(?, sender_uid),
+                    sender_member_name=coalesce(?, sender_member_name),
+                    sender_nickname=coalesce(?, sender_nickname),
+                    sender_remark_name=coalesce(?, sender_remark_name),
+                    message_text=coalesce(?, message_text), is_imported=0, is_online=1,
+                    original_flag=coalesce(?, original_flag), discovered_at=?, collected_at=NULL
+                WHERE group_id=? AND message_id=? AND image_index=?
+                """,
+                (
+                    message_seq,
+                    int(item.get("sent_at") or 0),
+                    str(item.get("file") or ""),
+                    int(item.get("declared_size") or 0),
+                    now,
+                    json.dumps(resolver_data, ensure_ascii=False),
+                    str(item.get("group_uin") or group_id),
+                    item.get("group_name"),
+                    item.get("sender_uin"),
+                    item.get("sender_uid"),
+                    item.get("sender_member_name"),
+                    item.get("sender_nickname"),
+                    item.get("sender_remark_name"),
+                    item.get("message_text"),
+                    item.get("original_flag"),
+                    int(item.get("discovered_at") or now),
+                    group_id,
+                    message_id,
+                    image_index,
+                ),
+            )
+            connection.commit()
+            increment_counter(connection, ("queued_high", "queued_medium", "queued_low")[priority])
+            return True
     connection.execute(
         """
         INSERT INTO images (
@@ -454,10 +561,10 @@ def enqueue_image(connection: sqlite3.Connection, item: dict[str, Any]) -> bool:
             updated_at=excluded.updated_at
         """,
         (
-            str(item["group_id"]),
-            str(item["message_id"]),
-            str(item.get("message_seq") or ""),
-            int(item.get("image_index") or 0),
+            group_id,
+            message_id,
+            message_seq,
+            image_index,
             int(item.get("sent_at") or 0),
             str(item.get("file") or ""),
             int(item.get("declared_size") or 0),
@@ -491,7 +598,11 @@ def recover_inflight(connection: sqlite3.Connection) -> int:
     return int(cursor.rowcount or 0)
 
 
-def claim_next_image(connection: sqlite3.Connection) -> sqlite3.Row | None:
+def claim_next_image(
+    connection: sqlite3.Connection,
+    *,
+    expiry_urgent_seconds: int = 3600,
+) -> sqlite3.Row | None:
     connection.row_factory = sqlite3.Row
     now = int(time.time())
     connection.execute("BEGIN IMMEDIATE")
@@ -501,16 +612,14 @@ def claim_next_image(connection: sqlite3.Connection) -> sqlite3.Row | None:
             SELECT * FROM images
             WHERE status IN ('queued','deferred') AND next_retry_at<=?
             ORDER BY
-                CASE
-                    WHEN original_flag=1 THEN 0
-                    WHEN original_flag IS NULL AND declared_size>=131072
-                         AND coalesce(json_extract(resolver_json, '$.emoji_signal'), 0)=0 THEN 1
-                    ELSE 2
-                END,
+                CASE WHEN coalesce(CAST(json_extract(resolver_json, '$.url_expires_at') AS INTEGER), 0)
+                               BETWEEN 1 AND ? THEN 0 ELSE 1 END,
+                coalesce(CAST(json_extract(resolver_json, '$.priority') AS INTEGER), 2),
+                coalesce(CAST(json_extract(resolver_json, '$.url_expires_at') AS INTEGER), 9223372036854775807),
                 discovered_at, sent_at, group_id, message_id, image_index
             LIMIT 1
             """,
-            (now,),
+            (now, now + max(0, int(expiry_urgent_seconds))),
         ).fetchone()
         if row:
             connection.execute(
@@ -620,11 +729,15 @@ def queue_snapshot(connection: sqlite3.Connection) -> dict[str, Any]:
     row = connection.execute(
         """
         SELECT count(*), min(discovered_at),
-               sum(CASE WHEN original_flag=1 THEN 1 ELSE 0 END),
-               sum(CASE WHEN original_flag IS NULL THEN 1 ELSE 0 END),
-               sum(CASE WHEN original_flag=0 THEN 1 ELSE 0 END)
+               sum(CASE WHEN coalesce(CAST(json_extract(resolver_json, '$.priority') AS INTEGER), 2)=0 THEN 1 ELSE 0 END),
+               sum(CASE WHEN coalesce(CAST(json_extract(resolver_json, '$.priority') AS INTEGER), 2)=1 THEN 1 ELSE 0 END),
+               sum(CASE WHEN coalesce(CAST(json_extract(resolver_json, '$.priority') AS INTEGER), 2)=2 THEN 1 ELSE 0 END),
+               sum(CASE WHEN coalesce(CAST(json_extract(resolver_json, '$.url_expires_at') AS INTEGER), 0)>0 THEN 1 ELSE 0 END),
+               sum(CASE WHEN coalesce(CAST(json_extract(resolver_json, '$.url_expires_at') AS INTEGER), 0)
+                              BETWEEN 1 AND ? THEN 1 ELSE 0 END)
         FROM images WHERE status IN ('queued','deferred','downloading')
-        """
+        """,
+        (now + 3600,),
     ).fetchone()
     oldest = int(row[1] or 0)
     return {
@@ -632,8 +745,10 @@ def queue_snapshot(connection: sqlite3.Connection) -> dict[str, Any]:
         "oldest_at": oldest or None,
         "oldest_age_seconds": max(0, now - oldest) if oldest else 0,
         "high": int(row[2] or 0),
-        "unknown": int(row[3] or 0),
+        "medium": int(row[3] or 0),
         "low": int(row[4] or 0),
+        "expiring": int(row[5] or 0),
+        "expiry_urgent": int(row[6] or 0),
     }
 
 

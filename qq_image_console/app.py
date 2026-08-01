@@ -50,6 +50,7 @@ class SettingsPatch(BaseModel):
     download_interval_seconds: int | None = Field(default=None, ge=5, le=3600)
     download_jitter_seconds: int | None = Field(default=None, ge=0, le=60)
     daily_download_limit: int | None = Field(default=None, ge=1, le=10000)
+    url_preference: Literal["data", "raw"] | None = None
     history_hourly_limit: int | None = Field(default=None, ge=0, le=100)
     history_daily_limit: int | None = Field(default=None, ge=0, le=1000)
     collector_paused: bool | None = None
@@ -577,6 +578,7 @@ def create_app(
                 "download_interval_seconds",
                 "download_jitter_seconds",
                 "daily_download_limit",
+                "url_preference",
                 "history_hourly_limit",
                 "history_daily_limit",
                 "collector_paused",
@@ -597,6 +599,7 @@ def create_app(
                 "download_interval_seconds",
                 "download_jitter_seconds",
                 "daily_download_limit",
+                "url_preference",
                 "history_hourly_limit",
                 "history_daily_limit",
                 "collector_paused",

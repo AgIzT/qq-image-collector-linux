@@ -112,7 +112,7 @@ function GroupCard({ group, onRecover, onDisable, onEnable }: {
       </div>
       <div className="group-counts">
         <span><b>{group.queued}</b> 排队</span><span><b>{group.accepted}</b> 有效</span>
-        <span><b>{group.rejected}</b> 淘汰</span><span><b>{group.duplicates}</b> 重复</span><span><b>{group.failed}</b> 失败</span>
+        <span><b>{group.rejected}</b> 淘汰</span><span><b>{group.duplicates}</b> 重复</span><span><b>{group.expired}</b> URL失效</span><span><b>{group.failed}</b> 失败</span>
       </div>
       <div className="button-row compact">
         {group.enabled ? <>
@@ -222,6 +222,7 @@ export default function App() {
         download_interval_seconds: settings.download_interval_seconds,
         download_jitter_seconds: settings.download_jitter_seconds,
         daily_download_limit: settings.daily_download_limit,
+        url_preference: settings.url_preference,
         history_hourly_limit: settings.history_hourly_limit,
         history_daily_limit: settings.history_daily_limit,
         collector_paused: settings.collector_paused,
@@ -271,13 +272,14 @@ export default function App() {
             <ServiceCard title="OneBot WS" state={dashboard.services.event_stream} /><ServiceCard title="持久队列" state={dashboard.services.queue} />
             <ServiceCard title="CDN 下载器" state={dashboard.services.downloader} /><ServiceCard title="接口断路器" state={dashboard.services.circuit} />
           </section>
-          <section className="section-heading"><div><p className="eyebrow">TODAY</p><h2>低频链路</h2></div></section>
+          <section className="section-heading"><div><p className="eyebrow">TODAY</p><h2>事件与 CDN 链路</h2></div></section>
           <section className="metric-grid">
-            <Metric label="今日事件" value={today.events} note={`${today.images_seen} 个图片段`} />
-            <Metric label="队列深度" value={queue.depth} note={`最老 ${formatDuration(queue.oldest_age_seconds)}`} />
-            <Metric label="CDN 下载" value={today.cdn_downloads} note={formatBytes(today.cdn_bytes)} />
+            <Metric label="今日事件" value={today.events} note={`${today.image_segments} 个图片段`} />
+            <Metric label="队列深度" value={queue.depth} note={`最老 ${formatDuration(queue.oldest_age_seconds)} · ${queue.expiry_urgent} 条临期`} />
+            <Metric label="CDN 请求 / 完整下载" value={`${today.cdn_requests} / ${today.cdn_downloads}`} note={formatBytes(today.cdn_bytes)} />
             <Metric label="有效新增" value={today.accepted} note={`${today.duplicates} 个重复`} />
             <Metric label="CDN 403 / 429" value={`${today.cdn_403} / ${today.cdn_429}`} />
+            <Metric label="URL 已失效" value={today.expired} note="独立告警，不并入普通失败" />
             <Metric label="历史调用" value={today.history_calls} note="稳态应为 0" />
             <Metric label="拦截 get_image" value={today.get_image_blocked} note="必须始终为 0" />
             <Metric label="下载器状态" value={String(downloader.status ?? "idle")} />
@@ -304,11 +306,12 @@ export default function App() {
           <form className="panel settings-form" onSubmit={(event) => void saveSettings(event)}><div className="section-heading"><div><p className="eyebrow">RATE LIMITS</p><h2>下载与历史调用上限</h2></div><button className="primary" type="submit">保存设置</button></div><div className="form-grid">
             <label><span>图片间隔（秒）</span><input type="number" min={5} max={3600} value={settings.download_interval_seconds} onChange={(event) => setSettings({ ...settings, download_interval_seconds: Number(event.target.value) })} /></label>
             <label><span>随机抖动（秒）</span><input type="number" min={0} max={60} value={settings.download_jitter_seconds} onChange={(event) => setSettings({ ...settings, download_jitter_seconds: Number(event.target.value) })} /></label>
-            <label><span>每日 CDN 配额</span><input type="number" min={1} max={10000} value={settings.daily_download_limit} onChange={(event) => setSettings({ ...settings, daily_download_limit: Number(event.target.value) })} /></label>
+            <label><span>每日 CDN 请求防失控上限</span><input type="number" min={1} max={10000} value={settings.daily_download_limit} onChange={(event) => setSettings({ ...settings, daily_download_limit: Number(event.target.value) })} /></label>
+            <label><span>CDN 首选通道</span><select value={settings.url_preference} onChange={(event) => setSettings({ ...settings, url_preference: event.target.value as "data" | "raw" })}><option value="data">标准 data.url</option><option value="raw">raw originImageUrl</option></select></label>
             <label><span>每小时历史调用</span><input type="number" min={0} max={100} value={settings.history_hourly_limit} onChange={(event) => setSettings({ ...settings, history_hourly_limit: Number(event.target.value) })} /></label>
             <label><span>每日历史调用</span><input type="number" min={0} max={1000} value={settings.history_daily_limit} onChange={(event) => setSettings({ ...settings, history_daily_limit: Number(event.target.value) })} /></label>
           </div><div className="toggle-grid"><label><input type="checkbox" checked={settings.collector_paused} onChange={(event) => setSettings({ ...settings, collector_paused: event.target.checked })} /><span><strong>暂停下载</strong><small>事件仍持久化，队列保留</small></span></label></div></form>
-          <section className="panel storage-panel"><div><p className="eyebrow">SAFETY</p><h2>生产断路器</h2><p>当前仓库：<code>{settings.storage_root}</code></p></div><small className="muted">生产 Worker 永不调用 get_image；403 每图最多刷新一次 URL，429 和连续 403 会熔断一小时。</small></section>
+          <section className="panel storage-panel"><div><p className="eyebrow">SAFETY</p><h2>账号会话断路器</h2><p>当前仓库：<code>{settings.storage_root}</code></p></div><small className="muted">生产 Worker 永不调用 get_image；403 默认不会触发历史接口，429 和连续 403 会熔断一小时。真正的风控边界是账号会话 API，而不是 CDN 字节量。</small></section>
         </>}
 
         {view === "logs" && <section className="panel logs-panel"><div className="section-heading"><div><p className="eyebrow">DIAGNOSTICS</p><h2>最近运行日志</h2></div><button className="secondary" onClick={() => void api<{ files: { path: string; lines: string[] }[] }>("/api/v1/logs?lines=250").then((value) => setLogs(value.files))}>刷新</button></div>{logs.map((file) => <div className="log-file" key={file.path}><strong>{file.path}</strong><pre>{file.lines.join("\n") || "（空）"}</pre></div>)}{!logs.length && <div className="empty">尚无日志</div>}</section>}

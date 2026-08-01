@@ -25,7 +25,8 @@ RUN python -m pip install --no-cache-dir -r /app/requirements-console.txt
 COPY collector.py collector_control.py metadata_reader.py /app/
 COPY qq_image_collector /app/qq_image_collector
 COPY qq_image_console /app/qq_image_console
-COPY linux/cache_cleanup.py linux/event_probe.py linux/diagnostic_compare.py /app/linux/
+COPY linux/cache_cleanup.py linux/event_probe.py linux/diagnostic_compare.py \
+     linux/url_lifecycle_probe.py linux/telemetry_report.py /app/linux/
 COPY --from=frontend-build /build/frontend/dist /app/frontend/dist
 
 STOPSIGNAL SIGTERM

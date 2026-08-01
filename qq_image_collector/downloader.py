@@ -54,13 +54,27 @@ def resolver_data(row: sqlite3.Row) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
-def selected_url(row: sqlite3.Row, preference: str = "data") -> str:
+def candidate_urls(row: sqlite3.Row, preference: str = "data") -> list[str]:
     data = resolver_data(row)
     if preference == "raw":
         candidates = (data.get("origin_url"), data.get("url"))
     else:
         candidates = (data.get("url"), data.get("origin_url"))
-    return next((str(value) for value in candidates if str(value or "").strip()), "")
+    result: list[str] = []
+    for value in candidates:
+        url = str(value or "").strip()
+        if not url or url in result:
+            continue
+        try:
+            result.append(validate_cdn_url(url))
+        except DownloadPolicyError:
+            continue
+    return result
+
+
+def selected_url(row: sqlite3.Row, preference: str = "data") -> str:
+    candidates = candidate_urls(row, preference)
+    return candidates[0] if candidates else ""
 
 
 def validate_cdn_url(url: str) -> str:
@@ -102,7 +116,7 @@ class CdnDownloader:
         await self.client.aclose()
 
     def daily_remaining(self) -> int:
-        used = counter_sum(self.connection, "cdn_downloads", local_day_start())
+        used = counter_sum(self.connection, "cdn_requests", local_day_start())
         return max(0, self.daily_limit - used)
 
     async def _stream_to_temp(self, url: str) -> tuple[Path, int, bytes]:
@@ -114,12 +128,17 @@ class CdnDownloader:
         path = Path(name)
         size = 0
         prefix = bytearray()
-        increment_counter(self.connection, "cdn_downloads")
+        # Count every outbound CDN request, including 403/429/timeouts.  The
+        # daily guard is an operational runaway limiter, while cdn_downloads
+        # below counts only complete non-empty 200 responses.
+        increment_counter(self.connection, "cdn_requests")
         try:
             async with self.client.stream("GET", url) as response:
-                if response.status_code in {403, 429}:
-                    raise CdnHttpError(response.status_code, f"QQ CDN returned HTTP {response.status_code}")
                 if response.status_code != 200:
+                    if response.status_code == 403:
+                        increment_counter(self.connection, "cdn_403")
+                    elif response.status_code == 429:
+                        increment_counter(self.connection, "cdn_429")
                     raise CdnHttpError(response.status_code, f"QQ CDN returned HTTP {response.status_code}")
                 length = int(response.headers.get("content-length") or 0)
                 if length > self.max_bytes:
@@ -149,6 +168,7 @@ class CdnDownloader:
                             write_chunk(handle, chunk)
             if size <= 0:
                 raise DownloadError("QQ CDN returned an empty body")
+            increment_counter(self.connection, "cdn_downloads")
             increment_counter(self.connection, "cdn_bytes", size)
             return path, size, bytes(prefix)
         except BaseException:
@@ -158,21 +178,28 @@ class CdnDownloader:
     async def process(self, row: sqlite3.Row) -> str:
         if self.daily_remaining() <= 0:
             raise DownloadPolicyError("daily CDN download limit reached")
-        url = selected_url(row, self.url_preference)
-        if not url:
+        urls = candidate_urls(row, self.url_preference)
+        if not urls:
             finish_image(
                 self.connection,
                 row,
                 status="expired",
-                error="image event contains no usable CDN URL",
+                error="image event contains no allowed CDN URL",
             )
-            increment_counter(self.connection, "failed")
+            increment_counter(self.connection, "expired")
             return "expired"
 
         temp_path: Path | None = None
         try:
             try:
-                temp_path, _size, _prefix = await self._stream_to_temp(url)
+                for index, url in enumerate(urls):
+                    try:
+                        temp_path, _size, _prefix = await self._stream_to_temp(url)
+                        break
+                    except CdnHttpError as exc:
+                        if exc.status_code in {403, 404, 410} and index + 1 < len(urls):
+                            continue
+                        raise
             except GifDetected:
                 finish_image(
                     self.connection,
