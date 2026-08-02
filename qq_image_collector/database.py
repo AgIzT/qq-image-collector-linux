@@ -332,6 +332,7 @@ def connect_database(
             group_id TEXT NOT NULL,
             not_before INTEGER NOT NULL,
             not_after INTEGER NOT NULL,
+            anchor_mode TEXT NOT NULL DEFAULT 'legacy-forward',
             start_anchor_id TEXT NOT NULL,
             start_anchor_seq TEXT NOT NULL,
             start_anchor_time INTEGER NOT NULL,
@@ -357,6 +358,11 @@ def connect_database(
             UNIQUE(group_id, not_before, not_after)
         )
         """
+    )
+    _ensure_columns(
+        connection,
+        "window_recovery_jobs",
+        {"anchor_mode": "TEXT NOT NULL DEFAULT 'legacy-forward'"},
     )
     connection.execute(
         """

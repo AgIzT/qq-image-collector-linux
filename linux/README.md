@@ -355,8 +355,9 @@ WINDOW_RECOVERY_NOT_AFTER=<生产切换时间>
 ./manage.sh window-recovery-stop
 ```
 
-恢复器每群首屏先完整验证方向，验证前不入队，通过后才处理同一响应，不重复拉取探测
-页。随后每 10 分钟最多一页、每小时 6 次、每天 20 次；
+恢复器优先从切换点之后的当前 WS raw `msgId` 向旧消息翻页；安静群没有当前锚点时只用
+最新一页建立起点。旧 QCE `msgId` 不会复用。每群首屏先完整验证后退方向，验证前不
+入队，通过后才处理同一响应，不重复拉取探测页。随后每 10 分钟最多一页、每小时 6 次、每天 20 次；
 全局下载队列不为空时等待。只有硬时间窗内图片会进入原有事件 CDN 队列。它不更新
 实时游标、不调用 `get_image`、不提高常驻历史预算。脱敏汇总写入
 `repository/state/diagnostics/window-recovery-report.json`，完整群号与锚点只留在 SQLite。

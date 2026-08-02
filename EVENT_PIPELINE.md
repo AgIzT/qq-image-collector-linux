@@ -105,24 +105,26 @@ Range 只作为辅助证据。
 回填功能，也没有公网创建接口。上下界必须与 SQLite 的
 `production_history_floor`、`production_live_only_started_at` 完全一致，否则失败关闭。
 
-每群起点是窗口下界之前最后一条旧 QCE 图片记录中的 19 位 raw NT `msgId`，不是
-raw `msgSeq`。固定 NapCat 的 `get_group_msg_history.message_seq` 参数实际接受 short
-message ID 或 raw `msgId`；返回的稳定持久身份是 `real_seq`。恢复器使用
-`reverse_order=false` 从旧 raw msgId 向当前时间移动，每页 20 条且包含锚点：
+每群优先使用切换点之后、由当前 debug WS 会话记录的最早 raw NT `msgId` 作为上界
+锚点；安静群没有当前锚点时，只拉最新一页建立起点。旧 QCE `msgId` 已实机证明会被
+当前 NapCat 会话拒绝，因此不得复用。固定 NapCat 的
+`get_group_msg_history.message_seq` 参数实际接受 short message ID 或 raw `msgId`，不是
+raw `msgSeq`；返回的稳定持久身份是 `real_seq`。恢复器使用 `reverse_order=true` 从
+当前上界向更旧消息移动，每页 20 条且包含锚点：
 
-1. 第一页先完整验证 `real_seq`、时间、群边界、包含锚点和前进方向；验证完成前不入队，
+1. 第一页先完整验证 `real_seq`、时间、群边界、包含锚点和后退方向；验证完成前不入队，
    通过后才处理同一响应，禁止为“探测”重复请求一遍；
-2. 后续锚点取本页最大 `real_seq` 对应的 short `message_id`；入队去重仍使用
+2. 后续锚点取本页最小 `real_seq` 对应的 short `message_id`；入队去重仍使用
    `(group_id, real_seq, image_index)`；
 3. 只在 `not_before <= time <= not_after` 时才调用共享事件解析和入队，并在解析后再次
    校验图片时间；页外消息从不下载；
 4. 历史中的 `message_sent` 强制规范化为 `message`，避免漏掉登录账号自己发送的图；
-5. `real_seq` 前进且时间随序号不倒退时，首个 `max(page_time)>not_after` 的跨界页处理
+5. 时间随递增 `real_seq` 不倒退时，首个 `min(page_time)<not_before` 的跨界页处理
    完成后即可结束；短页、空页、锚点不进、方向异常或字段缺失均不能伪装完成；
 6. 每 10 分钟至多一页、每小时 6 次、每天 20 次、每群最多 200 次；全局图片队列未
    清空时不取下一页，避免历史 URL 等待过久失效；
-7. NapCat short ID 映射失效时回到不可变 raw 起点重扫，依赖 `real_seq` 去重；绝不把
-   raw `msgSeq` 冒充 API 锚点；
+7. NapCat short ID 映射失效时回到当前 raw 上界重扫；该 raw ID 也不可用时退回最新页
+   引导，依赖 `real_seq` 去重；绝不把 raw `msgSeq` 冒充 API 锚点；
 8. 普通 history 预算始终为 0，恢复调用另计 `window_history_calls`；完成后停止并移除
    profile 容器，实时 WS 采集全程继续。
 

@@ -2,8 +2,10 @@
 
 This runner is deliberately separate from the always-on worker.  The worker's
 normal history budgets must remain zero while this process is active.  History
-pagination starts at a frozen raw NT ``msgId`` already stored by the legacy QCE
-collector, moves towards newer messages, and never changes the live WS cursor.
+pagination starts at a current-session raw NT ``msgId`` at or after the fixed
+upper bound, moves towards older messages, and never changes the live WS cursor.
+If a quiet group has no current-session anchor, one latest-history page is used
+only to bootstrap the same backwards traversal.
 """
 
 from __future__ import annotations
@@ -33,6 +35,8 @@ from .onebot import OneBotClient, OneBotError
 
 
 NONTERMINAL_STATUSES = ("probe", "queued", "deferred")
+CURRENT_UPPER = "current-upper"
+LATEST_BOOTSTRAP = "latest-bootstrap"
 TERMINAL_STATUSES = (
     "completed",
     "partial_source_exhausted",
@@ -244,55 +248,101 @@ class WindowRecoveryRunner:
         now = int(time.time())
         self.connection.execute("BEGIN IMMEDIATE")
         try:
+            # 1.1.4 briefly created legacy-forward jobs before production
+            # proved that QCE-era msgIds are not valid anchors in the current
+            # QQ session.  Replace only those jobs; retain their call records
+            # so rate limits and telemetry still account for every request.
+            self.connection.execute(
+                """
+                DELETE FROM window_recovery_jobs
+                WHERE not_before=? AND not_after=?
+                  AND anchor_mode NOT IN (?, ?)
+                """,
+                (self.not_before, self.not_after, CURRENT_UPPER, LATEST_BOOTSTRAP),
+            )
             for group_id in groups:
                 anchor = self.connection.execute(
                     """
                     SELECT message_id, message_seq, sent_at
                     FROM images
-                    WHERE group_id=? AND resolver='qce' AND sent_at<?
+                    WHERE group_id=? AND resolver='event-cdn' AND is_online=1
+                      AND sent_at>=?
                       AND length(message_id)>=15
                       AND message_id<>''
                       AND message_id NOT GLOB '*[^0-9]*'
                       AND message_seq<>''
                       AND message_seq NOT GLOB '*[^0-9]*'
-                    ORDER BY sent_at DESC, CAST(message_seq AS INTEGER) DESC
+                    ORDER BY sent_at ASC, CAST(message_seq AS INTEGER) ASC
                     LIMIT 1
                     """,
-                    (group_id, self.not_before),
+                    (group_id, self.not_after),
                 ).fetchone()
                 if not anchor:
-                    raise WindowPolicyError("a production group has no pre-window raw anchor")
-                anchor_id, anchor_id_number = _positive_decimal(
-                    anchor[0], label="start msgId"
+                    anchor = self.connection.execute(
+                        """
+                        SELECT last_message_id, last_message_seq, last_message_time
+                        FROM group_runtime
+                        WHERE group_id=? AND last_message_time>=?
+                          AND length(last_message_id)>=15
+                          AND last_message_id<>''
+                          AND last_message_id NOT GLOB '*[^0-9]*'
+                          AND last_message_seq<>''
+                          AND last_message_seq NOT GLOB '*[^0-9]*'
+                        """,
+                        (group_id, self.not_after),
+                    ).fetchone()
+                if anchor:
+                    anchor_id, anchor_id_number = _positive_decimal(
+                        anchor[0], label="start msgId"
+                    )
+                    anchor_seq, _anchor_seq_number = _positive_decimal(
+                        anchor[1], label="start msgSeq"
+                    )
+                    anchor_time = int(anchor[2] or 0)
+                    if len(anchor_id) < 15 or anchor_id_number <= 0:
+                        raise WindowPolicyError("upper anchor is not a raw NT msgId")
+                    if anchor_time < self.not_after:
+                        raise WindowPolicyError("upper anchor time precedes policy bound")
+                    anchor_mode = CURRENT_UPPER
+                else:
+                    # Omitting message_seq asks NapCat for the latest page.  It
+                    # is a positioning request only: the hard time filter below
+                    # still prevents post-window images from entering the queue.
+                    anchor_id = "0"
+                    anchor_seq = "0"
+                    anchor_time = 0
+                    anchor_mode = LATEST_BOOTSTRAP
+                prior_calls = int(
+                    self.connection.execute(
+                        """
+                        SELECT count(*) FROM window_recovery_calls
+                        WHERE group_id=? AND not_before=? AND not_after=?
+                        """,
+                        (group_id, self.not_before, self.not_after),
+                    ).fetchone()[0]
                 )
-                anchor_seq, _anchor_seq_number = _positive_decimal(
-                    anchor[1], label="start msgSeq"
-                )
-                anchor_time = int(anchor[2] or 0)
-                if len(anchor_id) < 15 or anchor_id_number <= 0:
-                    raise WindowPolicyError("pre-window anchor is not a raw NT msgId")
-                if anchor_time <= 0 or anchor_time >= self.not_before:
-                    raise WindowPolicyError("pre-window anchor time is outside policy")
                 self.connection.execute(
                     """
                     INSERT INTO window_recovery_jobs (
-                        group_id, not_before, not_after,
+                        group_id, not_before, not_after, anchor_mode,
                         start_anchor_id, start_anchor_seq, start_anchor_time,
                         next_anchor_id, next_anchor_seq, next_anchor_time,
-                        status, probe_ok, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'probe', 0, ?, ?)
+                        status, probe_ok, history_calls, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'probe', 0, ?, ?, ?)
                     ON CONFLICT(group_id, not_before, not_after) DO NOTHING
                     """,
                     (
                         group_id,
                         self.not_before,
                         self.not_after,
+                        anchor_mode,
                         anchor_id,
                         anchor_seq,
                         anchor_time,
                         anchor_id,
                         anchor_seq,
                         anchor_time,
+                        prior_calls,
                         now,
                         now,
                     ),
@@ -404,22 +454,21 @@ class WindowRecoveryRunner:
         # budget or mutate the immutable-anchor replay state.
         self._ensure_onebot_ready()
         call_id, _called_at = self._record_call(str(job["group_id"]))
+        params: dict[str, Any] = {
+            "group_id": str(job["group_id"]),
+            "count": self.page_size,
+            # true walks from a current-session upper anchor towards older
+            # messages.  Every anchored page includes its anchor.
+            "reverse_order": True,
+            "disable_get_url": False,
+            "parse_mult_msg": False,
+        }
+        if str(job["next_anchor_id"]) != "0":
+            # NapCat interprets this field as a short message ID when mapped,
+            # otherwise as a raw NT msgId.  It is not msgSeq.
+            params["message_seq"] = str(job["next_anchor_id"])
         try:
-            payload = self.onebot.call(
-                "get_group_msg_history",
-                {
-                    "group_id": str(job["group_id"]),
-                    # NapCat interprets this field as a short message ID when
-                    # mapped, otherwise as a raw NT msgId.  It is not msgSeq.
-                    "message_seq": str(job["next_anchor_id"]),
-                    "count": self.page_size,
-                    # false walks from the old QCE raw msgId towards current
-                    # messages.  Every page includes its anchor.
-                    "reverse_order": False,
-                    "disable_get_url": False,
-                    "parse_mult_msg": False,
-                },
-            )
+            payload = self.onebot.call("get_group_msg_history", params)
         except Exception as exc:
             self._finish_call(call_id, "error", type(exc).__name__)
             raise
@@ -484,6 +533,32 @@ class WindowRecoveryRunner:
                     int(job["id"]),
                 ),
             )
+        elif str(job["anchor_mode"]) == CURRENT_UPPER:
+            # A current raw msgId may still be unavailable to the history API
+            # (for example after a QQ account/session change).  Falling back to
+            # one latest-page bootstrap is bounded and safer than retrying a
+            # known-invalid raw anchor.
+            self.connection.execute(
+                """
+                UPDATE window_recovery_jobs
+                SET anchor_mode=?, status='probe', probe_ok=0,
+                    start_anchor_id='0', start_anchor_seq='0', start_anchor_time=0,
+                    next_anchor_id='0', next_anchor_seq='0', next_anchor_time=0,
+                    last_page_fingerprint=NULL,
+                    retry_count=?, replay_count=0,
+                    history_calls=history_calls+1,
+                    next_retry_at=?, last_error=?, updated_at=?
+                WHERE id=?
+                """,
+                (
+                    LATEST_BOOTSTRAP,
+                    retries,
+                    now + self.interval_seconds,
+                    f"upper anchor switched to latest bootstrap after {type(exc).__name__}",
+                    now,
+                    int(job["id"]),
+                ),
+            )
         elif retries < 3:
             self.connection.execute(
                 """
@@ -495,7 +570,7 @@ class WindowRecoveryRunner:
                 (
                     retries,
                     now + 1800,
-                    f"raw anchor retry after {type(exc).__name__}",
+                    f"latest bootstrap retry after {type(exc).__name__}",
                     now,
                     int(job["id"]),
                 ),
@@ -511,7 +586,7 @@ class WindowRecoveryRunner:
                 """,
                 (
                     retries,
-                    f"raw anchor failed: {type(exc).__name__}",
+                    f"latest bootstrap failed: {type(exc).__name__}",
                     now,
                     now,
                     int(job["id"]),
@@ -560,11 +635,11 @@ class WindowRecoveryRunner:
             )
             sequences = [int(row["real_seq_number"]) for row in page]
             current_sequence = int(str(job["next_anchor_seq"]))
-            if min(sequences) < current_sequence:
-                raise WindowDirectionError("history page moved before its forward anchor")
-            if current_sequence not in sequences:
+            if current_sequence > 0 and max(sequences) > current_sequence:
+                raise WindowDirectionError("history page moved after its backward anchor")
+            if current_sequence > 0 and current_sequence not in sequences:
                 raise WindowDirectionError("history page omitted its inclusive anchor")
-            if max(sequences) == current_sequence:
+            if current_sequence > 0 and min(sequences) == current_sequence:
                 now = int(time.time())
                 self.connection.execute(
                     """
@@ -625,7 +700,7 @@ class WindowRecoveryRunner:
             self._publish_state("running")
             return True
 
-        newest = max(page, key=lambda value: value["real_seq_number"])
+        oldest = min(page, key=lambda value: value["real_seq_number"])
         now = int(time.time())
         fingerprint = _page_fingerprint(page)
         messages_in_window = 0
@@ -652,9 +727,9 @@ class WindowRecoveryRunner:
 
         page_times = [int(row["sent_at"]) for row in page]
         # Direction and non-decreasing message time were verified before any
-        # row was enqueued.  Once this page crosses the fixed upper bound, all
-        # later sequence pages are outside the outage window.
-        completed = max(page_times) > self.not_after
+        # row was enqueued.  Once a backwards page crosses the fixed lower
+        # bound, every subsequent page is older than the outage window.
+        completed = min(page_times) < self.not_before
         status = "completed" if completed else "queued"
         self.connection.execute(
             """
@@ -674,9 +749,9 @@ class WindowRecoveryRunner:
                 messages_in_window,
                 images_enqueued,
                 duplicates,
-                str(newest["message_id"]),
-                str(newest["real_seq"]),
-                int(newest["sent_at"]),
+                str(oldest["message_id"]),
+                str(oldest["real_seq"]),
+                int(oldest["sent_at"]),
                 now + self.interval_seconds,
                 fingerprint,
                 now,

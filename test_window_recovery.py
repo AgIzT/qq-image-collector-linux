@@ -17,6 +17,7 @@ SENDER = "200000002"
 NOT_BEFORE = 1_785_412_800
 NOT_AFTER = NOT_BEFORE + 3 * 86400
 RAW_ANCHOR = "9000000000000000100"
+ANCHOR_SEQUENCE = 104
 
 
 class FakeOneBot:
@@ -165,18 +166,19 @@ class WindowRecoveryTests(unittest.TestCase):
         connection: sqlite3.Connection,
         *,
         message_id: str = RAW_ANCHOR,
-        sequence: str = "100",
-        sent_at: int = NOT_BEFORE - 1,
-        resolver: str = "qce",
+        sequence: str = str(ANCHOR_SEQUENCE),
+        sent_at: int = NOT_AFTER + 1,
+        resolver: str = "event-cdn",
+        is_online: int = 1,
     ) -> None:
         connection.execute(
             """
             INSERT INTO images (
                 group_id, message_id, message_seq, image_index, sent_at,
-                status, updated_at, resolver
-            ) VALUES (?, ?, ?, 0, ?, 'accepted', ?, ?)
+                status, updated_at, resolver, is_online
+            ) VALUES (?, ?, ?, 0, ?, 'accepted', ?, ?, ?)
             """,
-            (GROUP, message_id, sequence, sent_at, sent_at, resolver),
+            (GROUP, message_id, sequence, sent_at, sent_at, resolver, is_online),
         )
         connection.commit()
 
@@ -191,33 +193,34 @@ class WindowRecoveryTests(unittest.TestCase):
         runner.connection.commit()
         runner._budget_wait_seconds = lambda _now: 0  # type: ignore[method-assign]
 
-    def test_initialize_uses_latest_valid_qce_raw_anchor(self) -> None:
+    def test_initialize_uses_earliest_current_session_upper_anchor(self) -> None:
         runner = self.make_runner(FakeOneBot())
         runner.connection.execute(
             "UPDATE images SET sent_at=? WHERE group_id=? AND message_id=?",
-            (NOT_BEFORE - 30, GROUP, RAW_ANCHOR),
+            (NOT_AFTER + 30, GROUP, RAW_ANCHOR),
         )
         runner.connection.commit()
         self.insert_anchor(
             runner.connection,
             message_id="9000000000000000101",
             sequence="101",
-            sent_at=NOT_BEFORE - 10,
+            sent_at=NOT_AFTER + 10,
         )
-        # A newer process-local short ID and a non-QCE row must not mask the
-        # latest valid raw QCE anchor.
+        # A process-local short ID and legacy/offline rows cannot become a
+        # current-session upper anchor.
         self.insert_anchor(
             runner.connection,
             message_id="12345",
             sequence="102",
-            sent_at=NOT_BEFORE - 2,
+            sent_at=NOT_AFTER + 2,
         )
         self.insert_anchor(
             runner.connection,
             message_id="9000000000000000999",
             sequence="999",
-            sent_at=NOT_BEFORE - 1,
-            resolver="event-cdn",
+            sent_at=NOT_AFTER + 1,
+            resolver="qce",
+            is_online=0,
         )
 
         runner.initialize()
@@ -227,14 +230,110 @@ class WindowRecoveryTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual(job["start_anchor_id"], "9000000000000000101")
         self.assertEqual(job["start_anchor_seq"], "101")
+        self.assertEqual(job["anchor_mode"], "current-upper")
         self.assertEqual(job["status"], "probe")
         self.assertEqual(job["probe_ok"], 0)
+
+    def test_quiet_group_bootstraps_from_latest_page_without_an_anchor(self) -> None:
+        fake = FakeOneBot(
+            page(
+                history_message(103, NOT_AFTER - 1, image=True),
+                history_message(104, NOT_AFTER + 1),
+            )
+        )
+        runner = self.make_runner(fake)
+        runner.connection.execute("DELETE FROM images")
+        runner.connection.commit()
+        runner.initialize()
+        runner._budget_wait_seconds = lambda _now: 0  # type: ignore[method-assign]
+
+        job = runner.connection.execute("SELECT * FROM window_recovery_jobs").fetchone()
+        self.assertEqual(job["anchor_mode"], "latest-bootstrap")
+        self.assertEqual(job["start_anchor_id"], "0")
+        self.assertEqual(job["start_anchor_seq"], "0")
+
+        self.assertTrue(runner.process_one_page())
+
+        self.assertEqual(len(fake.calls), 1)
+        action, params = fake.calls[0]
+        self.assertEqual(action, "get_group_msg_history")
+        self.assertNotIn("message_seq", params)
+        self.assertIs(params["reverse_order"], True)
+        job = runner.connection.execute("SELECT * FROM window_recovery_jobs").fetchone()
+        self.assertEqual(job["next_anchor_seq"], "103")
+        self.assertEqual(job["images_enqueued"], 1)
+
+    def test_invalid_current_upper_anchor_switches_once_to_latest_bootstrap(self) -> None:
+        fake = FakeOneBot(
+            OneBotError("current raw anchor is unavailable"),
+            page(
+                history_message(103, NOT_AFTER - 1, image=True),
+                history_message(104, NOT_AFTER + 1),
+            ),
+        )
+        runner = self.make_runner(fake)
+        runner.initialize()
+        runner._budget_wait_seconds = lambda _now: 0  # type: ignore[method-assign]
+
+        self.assertTrue(runner.process_one_page())
+
+        job = runner.connection.execute("SELECT * FROM window_recovery_jobs").fetchone()
+        self.assertEqual(job["anchor_mode"], "latest-bootstrap")
+        self.assertEqual(job["status"], "probe")
+        self.assertEqual(job["start_anchor_id"], "0")
+        self.assertEqual(job["next_anchor_id"], "0")
+        self.assertEqual(job["history_calls"], 1)
+
+        runner.connection.execute(
+            "UPDATE window_recovery_jobs SET next_retry_at=0"
+        )
+        runner.connection.commit()
+        self.assertTrue(runner.process_one_page())
+
+        self.assertIn("message_seq", fake.calls[0][1])
+        self.assertNotIn("message_seq", fake.calls[1][1])
+        job = runner.connection.execute("SELECT * FROM window_recovery_jobs").fetchone()
+        self.assertEqual(job["images_enqueued"], 1)
+
+    def test_legacy_forward_jobs_are_replaced_but_calls_remain_accounted(self) -> None:
+        runner = self.make_runner(FakeOneBot())
+        runner.initialize()
+        runner.connection.execute(
+            """
+            UPDATE window_recovery_jobs
+            SET anchor_mode='legacy-forward', start_anchor_id='999',
+                start_anchor_seq='999', next_anchor_id='999', next_anchor_seq='999'
+            """
+        )
+        runner.connection.execute(
+            """
+            INSERT INTO window_recovery_calls(
+                group_id, not_before, not_after, called_at, outcome
+            ) VALUES (?, ?, ?, ?, 'error')
+            """,
+            (GROUP, NOT_BEFORE, NOT_AFTER, NOT_AFTER + 5),
+        )
+        runner.connection.commit()
+
+        runner.initialize()
+
+        job = runner.connection.execute("SELECT * FROM window_recovery_jobs").fetchone()
+        self.assertEqual(job["anchor_mode"], "current-upper")
+        self.assertEqual(job["start_anchor_id"], RAW_ANCHOR)
+        self.assertEqual(job["start_anchor_seq"], str(ANCHOR_SEQUENCE))
+        self.assertEqual(job["history_calls"], 1)
+        self.assertEqual(
+            runner.connection.execute(
+                "SELECT count(*) FROM window_recovery_calls"
+            ).fetchone()[0],
+            1,
+        )
 
     def test_first_response_is_validated_enqueued_and_not_refetched(self) -> None:
         fake = FakeOneBot(
             page(
-                history_message(100, NOT_BEFORE - 1),
-                history_message(101, NOT_BEFORE + 1, image=True),
+                history_message(103, NOT_AFTER - 1, image=True),
+                history_message(104, NOT_AFTER + 1),
             )
         )
         runner = self.make_runner(fake)
@@ -245,22 +344,23 @@ class WindowRecoveryTests(unittest.TestCase):
 
         self.assertEqual(
             runner.connection.execute(
-                "SELECT count(*) FROM images WHERE resolver='event-cdn'"
+                "SELECT count(*) FROM images WHERE resolver='event-cdn' AND sent_at BETWEEN ? AND ?",
+                (NOT_BEFORE, NOT_AFTER),
             ).fetchone()[0],
             1,
         )
         job = runner.connection.execute("SELECT * FROM window_recovery_jobs").fetchone()
         self.assertEqual(job["status"], "queued")
         self.assertEqual(job["probe_ok"], 1)
-        self.assertEqual(job["next_anchor_id"], "800101")
-        self.assertEqual(job["next_anchor_seq"], "101")
+        self.assertEqual(job["next_anchor_id"], "800103")
+        self.assertEqual(job["next_anchor_seq"], "103")
         self.assertEqual(job["pages"], 1)
         self.assertEqual(job["images_enqueued"], 1)
         self.assertEqual(len(fake.calls), 1)
         action, params = fake.calls[0]
         self.assertEqual(action, "get_group_msg_history")
         self.assertEqual(params["message_seq"], RAW_ANCHOR)
-        self.assertIs(params["reverse_order"], False)
+        self.assertIs(params["reverse_order"], True)
 
     def test_hard_window_is_inclusive_and_message_sent_is_collected(self) -> None:
         fake = FakeOneBot(
@@ -281,7 +381,8 @@ class WindowRecoveryTests(unittest.TestCase):
         self.assertTrue(runner.process_one_page())
 
         rows = runner.connection.execute(
-            "SELECT message_seq, sent_at FROM images WHERE resolver='event-cdn' ORDER BY sent_at"
+            "SELECT message_seq, sent_at FROM images WHERE resolver='event-cdn' AND sent_at BETWEEN ? AND ? ORDER BY sent_at",
+            (NOT_BEFORE, NOT_AFTER),
         ).fetchall()
         self.assertEqual(
             [(row["message_seq"], row["sent_at"]) for row in rows],
@@ -295,14 +396,14 @@ class WindowRecoveryTests(unittest.TestCase):
     def test_overlapping_pages_deduplicate_by_real_sequence(self) -> None:
         fake = FakeOneBot(
             page(
-                history_message(100, NOT_BEFORE - 1),
-                history_message(101, NOT_BEFORE + 1, message_id=8101, image=True),
+                history_message(103, NOT_AFTER - 1, message_id=8103, image=True),
+                history_message(104, NOT_AFTER + 1),
             ),
             page(
-                history_message(101, NOT_BEFORE + 1, message_id=9101, image=True),
-                history_message(102, NOT_BEFORE + 2, message_id=9102, image=True),
+                history_message(102, NOT_AFTER - 2, message_id=9102, image=True),
+                history_message(103, NOT_AFTER - 1, message_id=9103, image=True),
                 # Duplicate real_seq in one response is ignored as well.
-                history_message(102, NOT_BEFORE + 2, message_id=9992, image=True),
+                history_message(102, NOT_AFTER - 2, message_id=9992, image=True),
             ),
         )
         runner = self.make_runner(fake, queue_threshold=10)
@@ -317,42 +418,21 @@ class WindowRecoveryTests(unittest.TestCase):
         self.assertTrue(runner.process_one_page())
 
         rows = runner.connection.execute(
-            "SELECT message_id, message_seq FROM images WHERE resolver='event-cdn' ORDER BY message_seq"
+            "SELECT message_id, message_seq FROM images WHERE resolver='event-cdn' AND sent_at BETWEEN ? AND ? ORDER BY message_seq",
+            (NOT_BEFORE, NOT_AFTER),
         ).fetchall()
-        self.assertEqual([(row["message_id"], row["message_seq"]) for row in rows], [("8101", "101"), ("9102", "102")])
+        self.assertEqual([(row["message_id"], row["message_seq"]) for row in rows], [("9102", "102"), ("8103", "103")])
         job = runner.connection.execute("SELECT * FROM window_recovery_jobs").fetchone()
         self.assertEqual(job["images_enqueued"], 2)
         self.assertEqual(job["duplicates"], 1)
-        self.assertEqual(fake.calls[1][1]["message_seq"], "8101")
+        self.assertEqual(fake.calls[1][1]["message_seq"], "8103")
 
     def test_wrong_direction_fails_before_any_enqueue(self) -> None:
         fake = FakeOneBot(
             page(
-                history_message(99, NOT_BEFORE + 1, image=True),
-                history_message(100, NOT_BEFORE + 2),
-                history_message(101, NOT_BEFORE + 3, image=True),
-            )
-        )
-        runner = self.make_runner(fake)
-        runner.initialize()
-        runner._budget_wait_seconds = lambda _now: 0  # type: ignore[method-assign]
-
-        self.assertTrue(runner.process_one_page())
-
-        self.assertEqual(
-            runner.connection.execute("SELECT count(*) FROM images WHERE resolver='event-cdn'").fetchone()[0],
-            0,
-        )
-        job = runner.connection.execute("SELECT * FROM window_recovery_jobs").fetchone()
-        self.assertEqual(job["status"], "failed_direction")
-        self.assertEqual(job["images_enqueued"], 0)
-
-    def test_time_must_not_move_backwards_as_sequence_advances(self) -> None:
-        fake = FakeOneBot(
-            page(
-                history_message(100, NOT_BEFORE - 1),
-                history_message(101, NOT_BEFORE + 20, image=True),
-                history_message(102, NOT_BEFORE + 10, image=True),
+                history_message(103, NOT_AFTER - 1, image=True),
+                history_message(104, NOT_AFTER + 1),
+                history_message(105, NOT_AFTER + 2, image=True),
             )
         )
         runner = self.make_runner(fake)
@@ -363,7 +443,33 @@ class WindowRecoveryTests(unittest.TestCase):
 
         self.assertEqual(
             runner.connection.execute(
-                "SELECT count(*) FROM images WHERE resolver='event-cdn'"
+                "SELECT count(*) FROM images WHERE resolver='event-cdn' AND sent_at BETWEEN ? AND ?",
+                (NOT_BEFORE, NOT_AFTER),
+            ).fetchone()[0],
+            0,
+        )
+        job = runner.connection.execute("SELECT * FROM window_recovery_jobs").fetchone()
+        self.assertEqual(job["status"], "failed_direction")
+        self.assertEqual(job["images_enqueued"], 0)
+
+    def test_time_must_not_move_backwards_as_sequence_advances(self) -> None:
+        fake = FakeOneBot(
+            page(
+                history_message(102, NOT_AFTER - 10, image=True),
+                history_message(103, NOT_AFTER - 20, image=True),
+                history_message(104, NOT_AFTER + 1),
+            )
+        )
+        runner = self.make_runner(fake)
+        runner.initialize()
+        runner._budget_wait_seconds = lambda _now: 0  # type: ignore[method-assign]
+
+        self.assertTrue(runner.process_one_page())
+
+        self.assertEqual(
+            runner.connection.execute(
+                "SELECT count(*) FROM images WHERE resolver='event-cdn' AND sent_at BETWEEN ? AND ?",
+                (NOT_BEFORE, NOT_AFTER),
             ).fetchone()[0],
             0,
         )
@@ -373,7 +479,7 @@ class WindowRecoveryTests(unittest.TestCase):
 
     def test_inclusive_anchor_only_marks_source_exhausted_without_replay(self) -> None:
         fake = FakeOneBot(
-            page(history_message(100, NOT_BEFORE - 1, image=True))
+            page(history_message(104, NOT_AFTER + 1, image=True))
         )
         runner = self.make_runner(fake)
         runner.initialize()
@@ -390,7 +496,8 @@ class WindowRecoveryTests(unittest.TestCase):
         self.assertIsNotNone(job["finished_at"])
         self.assertEqual(
             runner.connection.execute(
-                "SELECT count(*) FROM images WHERE resolver='event-cdn'"
+                "SELECT count(*) FROM images WHERE resolver='event-cdn' AND sent_at BETWEEN ? AND ?",
+                (NOT_BEFORE, NOT_AFTER),
             ).fetchone()[0],
             0,
         )
@@ -400,8 +507,8 @@ class WindowRecoveryTests(unittest.TestCase):
     def test_not_logged_in_waits_without_consuming_or_replaying_history(self) -> None:
         fake = FakeOneBot(
             page(
-                history_message(100, NOT_BEFORE - 1),
-                history_message(101, NOT_BEFORE + 1, image=True),
+                history_message(103, NOT_AFTER - 1, image=True),
+                history_message(104, NOT_AFTER + 1),
             ),
             login_responses=[
                 RuntimeError("OneBot is still starting"),
@@ -452,7 +559,7 @@ class WindowRecoveryTests(unittest.TestCase):
 
     def test_login_probe_without_an_account_is_not_history_ready(self) -> None:
         fake = FakeOneBot(
-            page(history_message(100, NOT_BEFORE - 1)),
+            page(history_message(104, NOT_AFTER + 1)),
             login_responses=[{"user_id": "0", "nickname": ""}],
         )
         runner = self.make_runner(fake)
@@ -479,7 +586,7 @@ class WindowRecoveryTests(unittest.TestCase):
         self.assertEqual(tuple(job), (0, 0, 0))
 
     def test_nonempty_download_queue_blocks_history_call(self) -> None:
-        fake = FakeOneBot(page(history_message(100, NOT_BEFORE - 1)))
+        fake = FakeOneBot(page(history_message(104, NOT_AFTER + 1)))
         runner = self.make_runner(fake)
         runner.initialize()
         runner.connection.execute(
@@ -500,7 +607,7 @@ class WindowRecoveryTests(unittest.TestCase):
         self.assertEqual(phases[-1], "waiting_queue")
 
     def test_interval_hourly_daily_and_per_group_budgets(self) -> None:
-        fake = FakeOneBot(page(history_message(100, NOT_BEFORE - 1)))
+        fake = FakeOneBot(page(history_message(104, NOT_AFTER + 1)))
         runner = self.make_runner(
             fake,
             interval_seconds=600,
@@ -577,11 +684,12 @@ class WindowRecoveryTests(unittest.TestCase):
             "partial_max_calls",
         )
 
-    def test_page_crossing_upper_bound_completes_without_an_extra_call(self) -> None:
+    def test_page_crossing_lower_bound_completes_without_an_extra_call(self) -> None:
         fake = FakeOneBot(
             page(
-                history_message(200, NOT_AFTER - 1, image=True),
-                history_message(201, NOT_AFTER + 2, image=True),
+                history_message(101, NOT_BEFORE - 1, image=True),
+                history_message(102, NOT_BEFORE + 2, image=True),
+                history_message(104, NOT_AFTER + 1),
             )
         )
         runner = self.make_runner(fake)
@@ -590,10 +698,10 @@ class WindowRecoveryTests(unittest.TestCase):
         runner.connection.execute(
             """
             UPDATE window_recovery_jobs
-            SET next_anchor_id='8200', next_anchor_seq='200',
+            SET next_anchor_id=?, next_anchor_seq='104',
                 next_anchor_time=?, next_retry_at=0
             """,
-            (NOT_AFTER - 1,),
+            (RAW_ANCHOR, NOT_AFTER + 1),
         )
         runner.connection.commit()
 
@@ -607,7 +715,7 @@ class WindowRecoveryTests(unittest.TestCase):
         self.assertFalse(runner._aggregate("test")["active"])
 
     def test_enabled_group_set_is_frozen_after_initialization(self) -> None:
-        fake = FakeOneBot(page(history_message(100, NOT_BEFORE - 1)))
+        fake = FakeOneBot(page(history_message(104, NOT_AFTER + 1)))
         runner = self.make_runner(fake)
         runner.initialize()
         now = NOT_AFTER + 10
@@ -636,11 +744,11 @@ class WindowRecoveryTests(unittest.TestCase):
         runner.connection.execute(
             """
             UPDATE window_recovery_jobs
-            SET status='queued', probe_ok=1, next_anchor_id='8101',
-                next_anchor_seq='101', next_anchor_time=?, replay_count=2,
+            SET status='queued', probe_ok=1, next_anchor_id='8103',
+                next_anchor_seq='103', next_anchor_time=?, replay_count=2,
                 next_retry_at=0
             """,
-            (NOT_BEFORE + 1,),
+            (NOT_AFTER - 1,),
         )
         runner.connection.commit()
 
@@ -650,7 +758,7 @@ class WindowRecoveryTests(unittest.TestCase):
         self.assertEqual(job["replay_count"], 3)
         self.assertEqual(job["next_anchor_id"], RAW_ANCHOR)
 
-        # Simulate making forward progress once more after the third raw replay;
+        # Simulate making backward progress once more after the third raw replay;
         # the next short-ID failure must terminate instead of starting replay 4.
         runner.connection.execute(
             """
@@ -658,7 +766,7 @@ class WindowRecoveryTests(unittest.TestCase):
             SET status='queued', probe_ok=1, next_anchor_id='8102',
                 next_anchor_seq='102', next_anchor_time=?, next_retry_at=0
             """,
-            (NOT_BEFORE + 2,),
+            (NOT_AFTER - 2,),
         )
         runner.connection.commit()
         self.assertTrue(runner.process_one_page())
