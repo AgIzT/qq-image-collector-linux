@@ -40,7 +40,7 @@ services:
     build:
       context: ..
       dockerfile: linux/Dockerfile
-    image: qq-ai-image-collector-console:1.1.0-event
+    image: qq-ai-image-collector-console:1.1.1-event
     container_name: qqai-collector-console
     restart: unless-stopped
     init: true
@@ -72,7 +72,7 @@ services:
       options: {max-size: "10m", max-file: "3"}
 
   cache-cleaner:
-    image: qq-ai-image-collector-console:1.1.0-event
+    image: qq-ai-image-collector-console:1.1.1-event
     container_name: qqai-cache-cleaner
     restart: unless-stopped
     init: true

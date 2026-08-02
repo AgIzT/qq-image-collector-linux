@@ -84,6 +84,18 @@ chmod 0600 的诊断文件，T+24h 后删除。Test E 只统计灰度开始后�
 `resolver='event-cdn'` 的记录。`telemetry_report.py --hours 72` 只有在实际观察时间
 达到 72 小时且 `history_calls=get_image_blocked=0` 时才返回通过。
 
+Test A 与主动发图诊断分开，以降低用户负担。它必须在 Worker 暂停、所有生产群停用
+时，对一个明确指定的目标群进行只读 WS 被动累计，直到取得不少于 200 个图片段；必须
+启用 group 过滤，只输出脱敏聚合，不调用 OneBot HTTP、不下载图片、不写生产数据库。
+账号加入的群较多，因此绝对禁止不带 group 过滤的全群普查。
+
+Test B、C、D、F 可以同时连接同一个隔离测试群并共享一次 10 张图片的发送窗口：前三
+张分别为勾选“原图”的 NovelAI tEXt、ComfyUI workflow、NAI Alpha stealth 已知源，
+另 7 张用于补足 Test D/F 的 URL 与网络样本，其中建议一部分不勾选“原图”。Test B/C
+按 MD5 独立匹配，Test D 捕获 10 条 URL，Test F 同步观察网络。并行不合并原始输出或
+降低门禁；Test B 的 `get_image` 仍然只能执行一次。Test E 另行发送三张已知源的原图
+与非原图各一轮，共 6 个图片实例。
+
 ## 镜像、rkey 与清理
 
 NapCat 镜像固定摘要，Compose 将当前已知的两个第三方 rkey 域名
@@ -105,7 +117,9 @@ NapCatQQ `v4.18.13` 发布资产一致；该标签源码提交为
 尝试带缓存的原生 `FetchRkey`，失败后才尝试两个第三方 rkey 服务，再使用 fallback。
 因此“收到事件完全不产生任何账号动作”不是可假定的事实。生产仍严禁逐图
 `get_image` 和连续历史调用；NapCat 内部 rkey 刷新行为必须由 Test F 的源码、日志及
-网络窗口共同验收，第三方服务始终保持阻断。
+网络窗口共同验收。两个第三方服务必须始终保持阻断，禁止为了制造“阻断前后对照”而
+临时解除；Test F 只接受固定阻断状态下的源码、域名解析、日志、socket 与 DNS/SYN
+观察证据，Test A 也只运行这一种网络状态。
 
 最终文件按 SHA-256 去重并原子移动。清理容器每 6 小时仅遍历白名单：Pic、Emoji、
 `nt_temp`、`.part` 保留 2 小时；Video、File、Ptt 保留 24 小时；QQ/NapCat 日志

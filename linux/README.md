@@ -52,19 +52,40 @@ chmod 600 .env
 `/diagnostics/`。每项测试必须保留命令的完整原始 JSON/终端输出，不能只记录结论。
 输出中不得补写账号、群号、文件名、完整 CDN URL、rkey 或 Prompt。
 
+### 低负担分组验收
+
+Test A 不要求用户集中发送 200 张图。它在 Worker 暂停、所有生产群停用时，对一个
+明确指定的目标群进行只读 WS 被动累计；账号加入的群较多，命令必须显式提供 group，
+绝对禁止无过滤监听全部群。该诊断只读取 WS，只输出脱敏聚合，不调用 OneBot HTTP、
+不下载图片、不写生产 SQLite。
+
+Test B、C、D、F 使用另一个隔离测试群，并共享一次 10 张图片的发送窗口。先准备三张
+已知 SHA-256 的源文件：NovelAI PNG `tEXt`、ComfyUI workflow、NAI Alpha stealth。
+运维方同时启动一次性 `diagnose-original`、三项 `diagnose-metadata`、
+`url-lifecycle-capture` 和 `audit-rkey-network`；用户随后发送 10 张图片：前三张是上述
+三张已知源且都勾选“原图”，另 7 张用于补足 URL/网络样本，其中建议一部分不勾选
+“原图”。可以批量发送，不要求塞进一条 QQ 消息。
+
+Test B/C 按源文件 MD5 独立匹配，Test D 捕获前 10 条 URL，Test F 同步观察网络。
+并行不合并原始输出，也不放宽任何通过条件；Test B 的隔离 `get_image` 仍然只允许
+一次。Test E 需要临时启用测试群验证接受率，必须另行发送 6 个图片实例。
+
 ## Test A：URL 形态普查
 
-保持生产 Worker 暂停。先运行命令，再在隔离测试群发送图片，直至独立采集至少
-200 个估算图片槽位。槽位数按标准段与 raw 图片候选的并集计算，即
+保持生产 Worker 暂停、所有生产群停用。选择一个明确指定的目标群，运行下列带 group
+过滤的命令并被动等待该群自然出现图片，直至独立采集至少 200 个估算图片槽位；用户
+无需为了 Test A 集中发送 200 张。槽位数按标准段与 raw 图片候选的并集计算，即
 `standard + raw - independently_matched_pairs`，不是取两边较大值，也不是把同一图片
 重复计数：
 
 ```bash
-./manage.sh probe-event <测试群号> 200
+./manage.sh probe-event <目标群号> 200
 ```
 
-脚本直接检查标准图片段与 raw `picElement`，不复用生产事件解析结果；输出同时保存到
-`repository/state/url_probe.json`。必须原样回报以下字段：
+`<目标群号>` 不得省略；禁止运行无 group 的全群普查。脚本只读 WS，直接检查标准
+图片段与 raw `picElement`，不复用生产事件解析结果，不调用 OneBot HTTP、不下载图片、
+不写生产数据库；唯一写入是脱敏诊断结果 `repository/state/url_probe.json`。必须原样
+回报以下字段：
 
 - `complete` 必须为 `true`，`captured_estimated_image_slots >= 200`；
 - `standard_image_segments`、`raw_pic_elements`、`independently_matched_pairs`；
@@ -167,8 +188,9 @@ Worker 下一循环生效并跨重启保留。
 ## Test E：original 分布与接受率
 
 Test A 的 `raw_original_flag_distribution` 是第一份原始证据。要验证真实字节的接受率，
-仅临时启用隔离测试群并解除暂停，投放一组原图/非原图/NULL 标志样本；采集完成后立即
-重新暂停并停用测试群。等待至少一小时后输出：
+仅临时启用隔离测试群并解除暂停：把 Test B/C 的三张已知源各勾选“原图”发送一次，
+再把同三张各不勾选“原图”发送一次，共 6 个图片实例。NULL 不能由用户主动制造，只
+观察 NapCat 是否返回。采集完成后立即重新暂停并停用测试群，等待至少一小时后输出：
 
 ```bash
 ./manage.sh telemetry 1
@@ -196,8 +218,11 @@ secret-service.bietiaop.com
 
 必须保留域名解析、NapCat 网络命名空间当前 TCP socket、以及可用时 300 秒 DNS/SYN
 观察的完整输出。短窗口未见外联只能写成“该窗口未观察到”，不能证明永远不会连接。
-还必须保留 Test A 屏蔽域名前后的 URL 分布对照，并用 `get_version_info`/构建信息确认
-固定镜像摘要对应的 NapCat 版本和源码提交；映射不明则门禁失败。
+两个第三方域名必须在整个测试和生产周期始终保持阻断，禁止为了对照临时解除。Test F
+只要求固定阻断状态下的源码审查、域名解析、NapCat 日志、socket 与 DNS/SYN 观察证据；
+Test A 也只在这一种网络状态下运行，不再要求或允许“屏蔽前后”两轮。还必须用
+`get_version_info`/构建信息确认固定镜像摘要对应的 NapCat 版本和源码提交；映射不明
+则门禁失败。
 
 当前已核验到的镜像级 provenance 为：多架构摘要
 `sha256:e66a6e52dc5dd63a2b8537651bafad50255d021584c113a8bbb2cc0ff94bd772`，

@@ -132,6 +132,31 @@ class LinuxEventAdapterTests(unittest.TestCase):
         self.assertNotIn('call("get_image"', production)
         self.assertNotIn("QCEClient", production)
 
+    def test_manage_container_python_commands_have_application_import_path(self) -> None:
+        manage = (Path(__file__).parent / "linux" / "manage.sh").read_text(
+            encoding="utf-8"
+        )
+        marker = "docker compose exec -T -e PYTHONPATH=/app"
+        expected_commands = (
+            "collector-console \\\n      python /app/linux/event_probe.py",
+            "collector-console \\\n      python /app/linux/diagnostic_compare.py",
+            "collector-console \\\n      python /app/linux/url_lifecycle_probe.py",
+            "collector-console \\\n      python /app/linux/telemetry_report.py",
+            "cache-cleaner python /app/linux/cache_cleanup.py",
+        )
+        for command in expected_commands:
+            with self.subTest(command=command):
+                self.assertIn(f"{marker} {command}", manage)
+
+        # Both diagnostic modes and both lifecycle modes share their scripts;
+        # the count locks every manage.sh branch, not just each distinct file.
+        self.assertEqual(manage.count(f"{marker} collector-console"), 6)
+        self.assertEqual(manage.count(f"{marker} cache-cleaner"), 1)
+        self.assertNotIn(
+            "docker compose exec -T collector-console python /app/linux/", manage
+        )
+        self.assertIn("./audit_rkey_network.sh qqai-napcat", manage)
+
     def test_event_probe_counts_unmatched_standard_and_raw_as_union(self) -> None:
         config = self.root / "collector.json"
         output = self.root / "probe.json"

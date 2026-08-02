@@ -60,41 +60,47 @@ case "${1:-}" in
     args=()
     [[ -z "${2:-}" ]] || args+=(--group "$2")
     args+=(--image-segments "${3:-200}")
-    docker compose exec -T collector-console python /app/linux/event_probe.py "${args[@]}"
+    docker compose exec -T -e PYTHONPATH=/app collector-console \
+      python /app/linux/event_probe.py "${args[@]}"
     ;;
   diagnose-original)
     [[ -n "${2:-}" ]] || { echo "diagnostic source filename is required" >&2; exit 2; }
     args=(--source "/diagnostics/$2" --allow-get-image-diagnostic)
     [[ -z "${3:-}" ]] || args+=(--group "$3")
     [[ -z "${4:-}" ]] || args+=(--sender "$4")
-    docker compose exec -T collector-console python /app/linux/diagnostic_compare.py "${args[@]}"
+    docker compose exec -T -e PYTHONPATH=/app collector-console \
+      python /app/linux/diagnostic_compare.py "${args[@]}"
     ;;
   diagnose-metadata)
     [[ -n "${2:-}" ]] || { echo "diagnostic source filename is required" >&2; exit 2; }
     args=(--source "/diagnostics/$2")
     [[ -z "${3:-}" ]] || args+=(--group "$3")
     [[ -z "${4:-}" ]] || args+=(--sender "$4")
-    docker compose exec -T collector-console python /app/linux/diagnostic_compare.py "${args[@]}"
+    docker compose exec -T -e PYTHONPATH=/app collector-console \
+      python /app/linux/diagnostic_compare.py "${args[@]}"
     ;;
   url-lifecycle-capture)
     args=(capture --urls 10)
     [[ -z "${2:-}" ]] || args+=(--group "$2")
-    docker compose exec -T collector-console python /app/linux/url_lifecycle_probe.py "${args[@]}"
+    docker compose exec -T -e PYTHONPATH=/app collector-console \
+      python /app/linux/url_lifecycle_probe.py "${args[@]}"
     ;;
   url-lifecycle-check)
     [[ -n "${2:-}" ]] || { echo "lifecycle label is required (for example T+1h)" >&2; exit 2; }
     args=(check --label "$2")
     [[ "${3:-}" != "--finalize" ]] || args+=(--finalize)
-    docker compose exec -T collector-console python /app/linux/url_lifecycle_probe.py "${args[@]}"
+    docker compose exec -T -e PYTHONPATH=/app collector-console \
+      python /app/linux/url_lifecycle_probe.py "${args[@]}"
     ;;
   telemetry)
-    docker compose exec -T collector-console python /app/linux/telemetry_report.py --hours "${2:-72}"
+    docker compose exec -T -e PYTHONPATH=/app collector-console \
+      python /app/linux/telemetry_report.py --hours "${2:-72}"
     ;;
   audit-rkey-network)
     ./audit_rkey_network.sh qqai-napcat "${2:-60}"
     ;;
   purge-cache)
-    docker compose exec -T cache-cleaner python /app/linux/cache_cleanup.py \
+    docker compose exec -T -e PYTHONPATH=/app cache-cleaner python /app/linux/cache_cleanup.py \
       --session-root /cleanup/qq-session \
       --napcat-log-root /cleanup/napcat-logs \
       --collector-temp-root /cleanup/repository/temp \
