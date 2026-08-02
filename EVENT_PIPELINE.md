@@ -68,9 +68,10 @@ PNG 原始 `tEXt/iTXt/zTXt` 扫描必须由八字节 PNG 魔数
 `get_image` 在网络前硬拒绝，递增 `get_image_blocked`、设置
 `collector_paused=true`、写 `critical_alarm` 并停止 Worker。400/403 默认不会刷新
 历史 URL；只有显式启用、且 400 同时具备 event-cdn、原始消息序号与 rkey/到期证据
-时才允许尝试。每图最多一次，并受每小时 6、每日 20 次历史总配额约束；404/410
-永不触发历史。WS 断线超过 3 秒只进行有限断档恢复；历史结果不能更新 live
-游标。任意日期回填、连续回填、启动轮询和 QCE 均不存在。
+时才允许尝试。生产 live-only 标记存在时，常驻 Worker 在预算检查的最前面硬拒绝
+所有普通 history 调用；手动 `recover-gap` 与任意 `backfill` API 都返回 410。即使误把
+小时/每日额度改成非零，WS 重连和过期 URL 也不能发出请求。历史结果不能更新 live
+游标。任意日期回填、连续回填、启动轮询和 QCE 运行时均不存在。
 
 `linux/diagnostic_compare.py` 与生产 Worker 隔离：Test B 只有显式危险参数才调用
 一次 `get_image`，并在请求前写入不可重复 sentinel；Test C 默认只比较源文件与
@@ -82,7 +83,7 @@ CDN 字节/元数据，不调用账号 API。
 
 - `events`、`image_segments`、`queued_high/medium/low`；
 - `cdn_requests`（所有尝试）、`cdn_downloads`（完整 200）、`cdn_bytes`、400/403/429；
-- `history_calls`、`get_image_blocked`；
+- `history_calls`、`window_history_calls`、`get_image_blocked`；
 - accepted、rejected、duplicates、failed、expired、filtered_gif。
 
 Test A 直接独立统计标准段与 raw，不依赖生产解析器；Test D 的完整 URL 只暂存在
@@ -97,6 +98,33 @@ MIME、是否 chunked、ETag SHA-256 与脱敏 Location 形态；不得记录任
 Location、Cookie、文件名、认证信息或正文。schema 1 的历史 Range-only check 可读取并
 标记为 legacy，但禁止伪造缺失的普通 GET 结果。TTL 与生产可用性主要依据普通 GET，
 Range 只作为辅助证据。
+
+## 一次性严格时间窗口恢复
+
+已经明确审计的生产断档可以使用内部 `window-recovery` 容器；它不是常驻 Worker 的
+回填功能，也没有公网创建接口。上下界必须与 SQLite 的
+`production_history_floor`、`production_live_only_started_at` 完全一致，否则失败关闭。
+
+每群起点是窗口下界之前最后一条旧 QCE 图片记录中的 19 位 raw NT `msgId`，不是
+raw `msgSeq`。固定 NapCat 的 `get_group_msg_history.message_seq` 参数实际接受 short
+message ID 或 raw `msgId`；返回的稳定持久身份是 `real_seq`。恢复器使用
+`reverse_order=false` 从旧 raw msgId 向当前时间移动，每页 20 条且包含锚点：
+
+1. 第一页先完整验证 `real_seq`、时间、群边界、包含锚点和前进方向；验证完成前不入队，
+   通过后才处理同一响应，禁止为“探测”重复请求一遍；
+2. 后续锚点取本页最大 `real_seq` 对应的 short `message_id`；入队去重仍使用
+   `(group_id, real_seq, image_index)`；
+3. 只在 `not_before <= time <= not_after` 时才调用共享事件解析和入队，并在解析后再次
+   校验图片时间；页外消息从不下载；
+4. 历史中的 `message_sent` 强制规范化为 `message`，避免漏掉登录账号自己发送的图；
+5. `real_seq` 前进且时间随序号不倒退时，首个 `max(page_time)>not_after` 的跨界页处理
+   完成后即可结束；短页、空页、锚点不进、方向异常或字段缺失均不能伪装完成；
+6. 每 10 分钟至多一页、每小时 6 次、每天 20 次、每群最多 200 次；全局图片队列未
+   清空时不取下一页，避免历史 URL 等待过久失效；
+7. NapCat short ID 映射失效时回到不可变 raw 起点重扫，依赖 `real_seq` 去重；绝不把
+   raw `msgSeq` 冒充 API 锚点；
+8. 普通 history 预算始终为 0，恢复调用另计 `window_history_calls`；完成后停止并移除
+   profile 容器，实时 WS 采集全程继续。
 
 Test A 与主动发图诊断分开，以降低用户负担。它必须在 Worker 暂停、所有生产群停用
 时，对一个明确指定的目标群进行只读 WS 被动累计，直到取得不少于 200 个图片段；必须

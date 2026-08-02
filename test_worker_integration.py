@@ -16,7 +16,7 @@ from PIL.PngImagePlugin import PngInfo
 
 from qq_image_collector.database import claim_next_image, connect_database, enqueue_image
 from qq_image_collector.events import parse_group_event
-from qq_image_collector.worker import CollectorWorker
+from qq_image_collector.worker import CollectorWorker, HistoryBudgetExceeded
 from test_event_pipeline import GROUP, MESSAGE, a1111_png, image_event
 
 
@@ -660,6 +660,41 @@ class WorkerIntegrationTests(unittest.IsolatedAsyncioTestCase):
             (GROUP,),
         ).fetchone()
         self.assertEqual(tuple(durable), (MESSAGE, "12345"))
+        await worker.downloader.close()
+        worker.connection.close()
+
+    async def test_live_only_marker_blocks_ordinary_history_before_network(self) -> None:
+        worker = CollectorWorker(write_config(self.root, "ws://127.0.0.1:9"))
+        now = int(time.time())
+        worker.connection.execute(
+            """
+            INSERT INTO app_settings(key, value_json, updated_at)
+            VALUES ('production_live_only_started_at', '1785670554', ?)
+            """,
+            (now,),
+        )
+        worker.connection.execute(
+            "UPDATE group_runtime SET last_message_id=?, last_message_seq=? WHERE group_id=?",
+            (MESSAGE, "12345", GROUP),
+        )
+        worker.connection.commit()
+        calls = 0
+
+        async def history(_action: str, _params: dict) -> dict:
+            nonlocal calls
+            calls += 1
+            return {"messages": []}
+
+        worker.onebot.call_async = history  # type: ignore[method-assign]
+        with self.assertRaisesRegex(HistoryBudgetExceeded, "live-only production policy"):
+            await worker.recover_gap(GROUP)
+        self.assertEqual(calls, 0)
+        self.assertEqual(
+            worker.connection.execute(
+                "SELECT coalesce(sum(history_calls),0) FROM hourly_counters"
+            ).fetchone()[0],
+            0,
+        )
         await worker.downloader.close()
         worker.connection.close()
 

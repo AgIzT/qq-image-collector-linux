@@ -22,6 +22,7 @@ export type DailyCounters = {
   cdn_403: number;
   cdn_429: number;
   history_calls: number;
+  window_history_calls: number;
   get_image_blocked: number;
   accepted: number;
   rejected: number;
@@ -96,6 +97,7 @@ export type DashboardStatus = {
     today: DailyCounters;
     events: Record<string, unknown>;
     downloader: Record<string, unknown>;
+    window_recovery: Record<string, unknown>;
   };
   groups: GroupRuntime[];
   jobs: Job[];

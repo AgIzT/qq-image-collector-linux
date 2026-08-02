@@ -256,6 +256,7 @@ class Repository:
                     "cdn_403",
                     "cdn_429",
                     "history_calls",
+                    "window_history_calls",
                     "get_image_blocked",
                     "accepted",
                     "rejected",
@@ -279,6 +280,7 @@ class Repository:
                 "today": counters,
                 "events": get_runtime_state(connection, "event_stream", {}),
                 "downloader": get_runtime_state(connection, "downloader", {}),
+                "window_recovery": get_runtime_state(connection, "window_recovery", {}),
             }
         with self._cache_lock:
             self._stats_cache = (time.time(), payload)

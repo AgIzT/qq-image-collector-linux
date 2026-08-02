@@ -147,7 +147,7 @@ class ConsoleEventApiTests(unittest.TestCase):
         self.assertEqual(retired.status_code, 410)
         self.assertEqual(
             self.client.post(f"/api/v1/groups/{GROUP}/recover-gap", json={}).status_code,
-            409,
+            410,
         )
         import sqlite3
 
@@ -161,9 +161,9 @@ class ConsoleEventApiTests(unittest.TestCase):
             )
             connection.commit()
         recovery = self.client.post(f"/api/v1/groups/{GROUP}/recover-gap", json={})
-        self.assertEqual(recovery.status_code, 201)
+        self.assertEqual(recovery.status_code, 410)
         jobs = self.client.get("/api/v1/jobs").json()
-        self.assertEqual(jobs[0]["kind"], "gap_recovery")
+        self.assertEqual(jobs, [])
 
     def test_safe_runtime_settings(self) -> None:
         self.assertEqual(self.client.get("/api/v1/settings").json()["daily_download_limit"], 3000)

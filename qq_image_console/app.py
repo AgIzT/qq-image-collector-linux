@@ -550,15 +550,14 @@ def create_app(
 
     @app.post(
         "/api/v1/groups/{group_id}/recover-gap",
-        status_code=201,
         dependencies=[Depends(require_mutation)],
     )
-    def recover_gap(group_id: str) -> dict[str, int]:
-        try:
-            job_id = context.repository.create_job(group_id, "gap_recovery")
-        except ValueError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-        return {"job_id": job_id}
+    def recover_gap(group_id: str) -> JSONResponse:
+        del group_id
+        return JSONResponse(
+            status_code=status.HTTP_410_GONE,
+            content={"detail": "普通断档恢复已停用；历史只允许内部限定时间窗口任务。"},
+        )
 
     @app.get("/api/v1/jobs", dependencies=[Depends(require_auth)])
     def jobs() -> list[dict[str, Any]]:

@@ -40,7 +40,7 @@ services:
     build:
       context: ..
       dockerfile: linux/Dockerfile
-    image: qq-ai-image-collector-console:1.1.3-event
+    image: qq-ai-image-collector-console:1.1.4-event
     container_name: qqai-collector-console
     restart: unless-stopped
     init: true
@@ -72,7 +72,7 @@ services:
       options: {max-size: "10m", max-file: "3"}
 
   cache-cleaner:
-    image: qq-ai-image-collector-console:1.1.3-event
+    image: qq-ai-image-collector-console:1.1.4-event
     container_name: qqai-cache-cleaner
     restart: unless-stopped
     init: true
@@ -109,6 +109,55 @@ services:
       - ${QQAI_RUNTIME_ROOT:-./runtime}/repository:/cleanup/repository
       - ${QQAI_RUNTIME_ROOT:-./runtime}/qce-data:/cleanup/qce-data
     networks: [collector-private]
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+
+  window-recovery:
+    profiles: ["window-recovery"]
+    image: qq-ai-image-collector-console:1.1.4-event
+    container_name: qqai-window-recovery
+    restart: unless-stopped
+    init: true
+    depends_on:
+      napcat:
+        condition: service_started
+      collector-console:
+        condition: service_healthy
+    command:
+      - python
+      - -m
+      - qq_image_collector.window_recovery
+      - --config
+      - /data/qq-image-collector/config/collector_config.json
+      - --not-before
+      - ${WINDOW_RECOVERY_NOT_BEFORE:-0}
+      - --not-after
+      - ${WINDOW_RECOVERY_NOT_AFTER:-0}
+      - --expected-groups
+      - "6"
+      - --page-size
+      - "20"
+      - --interval-seconds
+      - "600"
+      - --hourly-limit
+      - "6"
+      - --daily-limit
+      - "20"
+      - --max-calls-per-group
+      - "200"
+      - --queue-threshold
+      - "0"
+      - --poll-seconds
+      - "30"
+    environment:
+      QQ_IMAGE_COLLECTOR_CONFIG: /data/qq-image-collector/config/collector_config.json
+      TZ: Asia/Shanghai
+    volumes:
+      - ${QQAI_RUNTIME_ROOT:-./runtime}/repository:/data/qq-image-collector
+      - ${QQAI_RUNTIME_ROOT:-./runtime}/napcat-config:/app/napcat/config:ro
+    networks: [collector-private]
+    stop_grace_period: 30s
     logging:
       driver: json-file
       options: {max-size: "10m", max-file: "3"}

@@ -84,7 +84,10 @@ class LinuxEventAdapterTests(unittest.TestCase):
     def test_compose_is_private_and_pinned(self) -> None:
         compose = (Path(__file__).parent / "linux" / "docker-compose.yml").read_text(encoding="utf-8")
         self.assertIn("sha256:e66a6e52", compose)
-        self.assertEqual(compose.count("qq-ai-image-collector-console:1.1.3-event"), 2)
+        self.assertEqual(compose.count("qq-ai-image-collector-console:1.1.4-event"), 3)
+        self.assertIn('profiles: ["window-recovery"]', compose)
+        self.assertIn("WINDOW_RECOVERY_NOT_BEFORE", compose)
+        self.assertIn("WINDOW_RECOVERY_NOT_AFTER", compose)
         self.assertNotIn(":3000\"", compose)
         self.assertNotIn(":3001\"", compose)
         self.assertNotIn("40653", compose)

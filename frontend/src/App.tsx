@@ -94,9 +94,8 @@ function Metric({ label, value, note }: { label: string; value: string | number;
   return <article className="metric"><span>{label}</span><strong>{value}</strong>{note && <small>{note}</small>}</article>;
 }
 
-function GroupCard({ group, onRecover, onDisable, onEnable }: {
+function GroupCard({ group, onDisable, onEnable }: {
   group: GroupRuntime;
-  onRecover: (id: string) => void;
   onDisable: (id: string) => void;
   onEnable: (id: string, name?: string) => void;
 }) {
@@ -116,7 +115,6 @@ function GroupCard({ group, onRecover, onDisable, onEnable }: {
       </div>
       <div className="button-row compact">
         {group.enabled ? <>
-          <button className="secondary" onClick={() => onRecover(group.group_id)}>恢复本次断档</button>
           <button className="danger-ghost" onClick={() => onDisable(group.group_id)}>停止监听</button>
         </> : <button className="primary" onClick={() => onEnable(group.group_id, group.display_name ?? undefined)}>重新启用</button>}
       </div>
@@ -184,14 +182,6 @@ export default function App() {
     } catch (error) { notify(error instanceof Error ? error.message : "操作失败"); }
   };
 
-  const recoverGap = async (groupId: string) => {
-    try {
-      await api(`/api/v1/groups/${groupId}/recover-gap`, { method: "POST", body: "{}" });
-      notify("受限断档恢复已排队；最多 5 页，不追溯任意历史");
-      await refresh();
-    } catch (error) { notify(error instanceof Error ? error.message : "创建任务失败"); }
-  };
-
   const addGroup = async (groupId: string, displayName?: string) => {
     try {
       await api("/api/v1/groups", { method: "POST", body: JSON.stringify({ group_id: groupId.trim(), display_name: displayName || null }) });
@@ -246,6 +236,7 @@ export default function App() {
   const today = dashboard.statistics.today;
   const queue = dashboard.statistics.queue;
   const downloader = dashboard.statistics.downloader;
+  const windowRecovery = dashboard.statistics.window_recovery ?? {};
   const eventState = dashboard.statistics.events;
 
   return (
@@ -281,7 +272,12 @@ export default function App() {
             <Metric label="CDN 400 / 403" value={`${today.cdn_400} / ${today.cdn_403}`} note="URL 失效候选 / 拒绝" />
             <Metric label="CDN 429" value={today.cdn_429} note="触发一小时下载熔断" />
             <Metric label="URL 已失效" value={today.expired} note="独立告警，不并入普通失败" />
-            <Metric label="历史调用" value={today.history_calls} note="稳态应为 0" />
+            <Metric label="历史调用" value={today.history_calls} note={`窗口补漏 ${today.window_history_calls ?? 0}`} />
+            <Metric
+              label="限定窗口补漏"
+              value={`${Number(windowRecovery.groups_terminal ?? 0)} / ${Number(windowRecovery.groups_total ?? 0)}`}
+              note={`${String(windowRecovery.phase ?? "未启动")} · 新入队 ${Number(windowRecovery.images_enqueued ?? 0)}`}
+            />
             <Metric label="拦截 get_image" value={today.get_image_blocked} note="必须始终为 0" />
             <Metric label="下载器状态" value={String(downloader.status ?? "idle")} />
           </section>
@@ -298,10 +294,10 @@ export default function App() {
         {view === "groups" && <>
           <section className="panel add-panel"><div><p className="eyebrow">MONITOR TARGETS</p><h2>监听对象</h2><p>新群首次从当前时刻开始，不自动追溯历史。</p></div><form onSubmit={(event) => { event.preventDefault(); void addGroup(manualGroup); }}><input value={manualGroup} onChange={(event) => setManualGroup(event.target.value.replace(/\D/g, ""))} placeholder="输入 QQ 群号" /><button className="primary" disabled={!manualGroup}>加入监听</button></form><button className="secondary" onClick={() => void loadAvailable()}>读取当前 QQ 群列表</button></section>
           {available.length > 0 && <section className="panel available-panel"><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索群名或群号" /><div className="available-list">{filtered.slice(0, 100).map((row) => <div key={row.group_id}><div><strong>{row.group_name || "未命名群"}</strong><small>{row.group_id} · {row.member_count} 人</small></div><button className="secondary" onClick={() => void addGroup(row.group_id, row.group_name)}>监听</button></div>)}</div></section>}
-          <section className="group-list">{dashboard.groups.map((group) => <GroupCard key={group.group_id} group={group} onRecover={(id) => void recoverGap(id)} onDisable={(id) => void disableGroup(id)} onEnable={(id, name) => void addGroup(id, name)} />)}</section>
+          <section className="group-list">{dashboard.groups.map((group) => <GroupCard key={group.group_id} group={group} onDisable={(id) => void disableGroup(id)} onEnable={(id, name) => void addGroup(id, name)} />)}</section>
         </>}
 
-        {view === "jobs" && <section className="panel"><div className="section-heading"><div><p className="eyebrow">BOUNDED RECOVERY</p><h2>断档恢复任务</h2><p>仅从最后原始消息 ID 向后恢复；每群最多 5 页，每页 20 条。</p></div></div><div className="job-table"><div className="job-row header"><span>任务</span><span>群号</span><span>状态</span><span>发现图片</span><span>更新时间</span><span /></div>{dashboard.jobs.map((job) => <div className="job-row" key={job.id}><span>#{job.id} · 本次断档</span><code>{job.group_id}</code><StatusPill value={job.status} /><span>{job.progress_pages}</span><span>{formatTime(job.updated_at)}</span><span>{["queued", "running"].includes(job.status) && <button className="danger-ghost" onClick={() => void cancelJob(job)}>安全取消</button>}</span>{job.error && <small className="job-error">{job.error}</small>}</div>)}{!dashboard.jobs.length && <div className="empty">暂无断档恢复任务</div>}</div></section>}
+        {view === "jobs" && <section className="panel"><div className="section-heading"><div><p className="eyebrow">LIVE ONLY</p><h2>普通断档恢复已停用</h2><p>常驻 Worker 不允许调用历史；当前一次性时间窗口补漏进度请在运行总览查看。</p></div></div><div className="job-table"><div className="job-row header"><span>任务</span><span>群号</span><span>状态</span><span>发现图片</span><span>更新时间</span><span /></div>{dashboard.jobs.map((job) => <div className="job-row" key={job.id}><span>#{job.id} · 已有任务</span><code>{job.group_id}</code><StatusPill value={job.status} /><span>{job.progress_pages}</span><span>{formatTime(job.updated_at)}</span><span>{["queued", "running"].includes(job.status) && <button className="danger-ghost" onClick={() => void cancelJob(job)}>安全取消</button>}</span>{job.error && <small className="job-error">{job.error}</small>}</div>)}{!dashboard.jobs.length && <div className="empty">没有普通历史任务</div>}</div></section>}
 
         {view === "settings" && settings && <>
           <form className="panel settings-form" onSubmit={(event) => void saveSettings(event)}><div className="section-heading"><div><p className="eyebrow">RATE LIMITS</p><h2>下载与历史调用上限</h2></div><button className="primary" type="submit">保存设置</button></div><div className="form-grid">

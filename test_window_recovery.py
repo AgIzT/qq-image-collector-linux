@@ -1,0 +1,674 @@
+from __future__ import annotations
+
+import datetime as dt
+import json
+import sqlite3
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+from qq_image_collector.onebot import OneBotError
+from qq_image_collector.window_recovery import WindowPolicyError, WindowRecoveryRunner
+
+
+GROUP = "100000001"
+SENDER = "200000002"
+NOT_BEFORE = 1_785_412_800
+NOT_AFTER = NOT_BEFORE + 3 * 86400
+RAW_ANCHOR = "9000000000000000100"
+
+
+class FakeOneBot:
+    def __init__(
+        self,
+        *responses: object,
+        login_responses: list[object] | None = None,
+    ) -> None:
+        self.responses = list(responses)
+        self.calls: list[tuple[str, dict[str, object]]] = []
+        self.login_responses = list(login_responses or [])
+        self.login_calls: list[dict[str, object]] = []
+
+    def call(self, action: str, params: dict[str, object]) -> object:
+        if action == "get_login_info":
+            self.login_calls.append(dict(params))
+            response = (
+                self.login_responses.pop(0)
+                if self.login_responses
+                else {"user_id": SENDER, "nickname": "synthetic"}
+            )
+            if isinstance(response, Exception):
+                raise response
+            return response
+        self.calls.append((action, dict(params)))
+        if not self.responses:
+            raise AssertionError("unexpected OneBot call")
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+
+def history_message(
+    sequence: int,
+    sent_at: int,
+    *,
+    message_id: int | None = None,
+    image: bool = False,
+    post_type: str = "message",
+) -> dict[str, object]:
+    message: list[dict[str, object]] = []
+    if image:
+        message.append(
+            {
+                "type": "image",
+                "data": {
+                    "file": f"synthetic-{sequence}.png",
+                    "url": f"https://gchat.qpic.cn/synthetic/{sequence}?rkey=test",
+                    "file_size": "204800",
+                    "summary": "[图片]",
+                    "sub_type": 0,
+                },
+            }
+        )
+    return {
+        "post_type": post_type,
+        "message_type": "group",
+        "group_id": int(GROUP),
+        "user_id": int(SENDER),
+        "message_id": message_id if message_id is not None else 800000 + sequence,
+        "real_seq": sequence,
+        "time": sent_at,
+        "sender": {"user_id": int(SENDER), "nickname": "synthetic"},
+        "message": message,
+    }
+
+
+def page(*messages: dict[str, object]) -> dict[str, object]:
+    return {"messages": list(messages)}
+
+
+class WindowRecoveryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.config_path = self.root / "config.json"
+        self.database_path = self.root / "state" / "collector.sqlite3"
+        self.config_path.write_text(
+            json.dumps(
+                {
+                    "onebot": {},
+                    "groups": [],
+                    "storage": {
+                        "root": str(self.root / "storage"),
+                        "database": str(self.database_path),
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.runners: list[WindowRecoveryRunner] = []
+
+    def tearDown(self) -> None:
+        for runner in self.runners:
+            runner.close()
+        self.temporary.cleanup()
+
+    def make_runner(
+        self,
+        onebot: FakeOneBot,
+        **overrides: object,
+    ) -> WindowRecoveryRunner:
+        options: dict[str, object] = {
+            "not_before": NOT_BEFORE,
+            "not_after": NOT_AFTER,
+            "expected_groups": 1,
+            "page_size": 20,
+            "interval_seconds": 600,
+            "hourly_limit": 6,
+            "daily_limit": 20,
+            "max_calls_per_group": 200,
+            "queue_threshold": 0,
+            "onebot": onebot,
+        }
+        options.update(overrides)
+        runner = WindowRecoveryRunner(self.config_path, **options)
+        runner._publish_state = lambda _phase, **_extra: {}  # type: ignore[method-assign]
+        self.runners.append(runner)
+        self.seed_policy(runner.connection)
+        self.insert_anchor(runner.connection)
+        return runner
+
+    def seed_policy(self, connection: sqlite3.Connection) -> None:
+        now = NOT_AFTER + 1
+        connection.execute(
+            "INSERT INTO monitored_groups(group_id, enabled, created_at, updated_at) "
+            "VALUES (?, 1, ?, ?)",
+            (GROUP, now, now),
+        )
+        settings = {
+            "production_history_floor": NOT_BEFORE,
+            "production_live_only_started_at": NOT_AFTER,
+            "history_hourly_limit": 0,
+            "history_daily_limit": 0,
+            "allow_403_history_refresh": False,
+        }
+        connection.executemany(
+            "INSERT INTO app_settings(key, value_json, updated_at) VALUES (?, ?, ?)",
+            [(key, json.dumps(value), now) for key, value in settings.items()],
+        )
+        connection.commit()
+
+    def insert_anchor(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        message_id: str = RAW_ANCHOR,
+        sequence: str = "100",
+        sent_at: int = NOT_BEFORE - 1,
+        resolver: str = "qce",
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO images (
+                group_id, message_id, message_seq, image_index, sent_at,
+                status, updated_at, resolver
+            ) VALUES (?, ?, ?, 0, ?, 'accepted', ?, ?)
+            """,
+            (GROUP, message_id, sequence, sent_at, sent_at, resolver),
+        )
+        connection.commit()
+
+    @staticmethod
+    def mark_probe_complete(runner: WindowRecoveryRunner) -> None:
+        runner.connection.execute(
+            """
+            UPDATE window_recovery_jobs
+            SET status='queued', probe_ok=1, next_retry_at=0
+            """
+        )
+        runner.connection.commit()
+        runner._budget_wait_seconds = lambda _now: 0  # type: ignore[method-assign]
+
+    def test_initialize_uses_latest_valid_qce_raw_anchor(self) -> None:
+        runner = self.make_runner(FakeOneBot())
+        runner.connection.execute(
+            "UPDATE images SET sent_at=? WHERE group_id=? AND message_id=?",
+            (NOT_BEFORE - 30, GROUP, RAW_ANCHOR),
+        )
+        runner.connection.commit()
+        self.insert_anchor(
+            runner.connection,
+            message_id="9000000000000000101",
+            sequence="101",
+            sent_at=NOT_BEFORE - 10,
+        )
+        # A newer process-local short ID and a non-QCE row must not mask the
+        # latest valid raw QCE anchor.
+        self.insert_anchor(
+            runner.connection,
+            message_id="12345",
+            sequence="102",
+            sent_at=NOT_BEFORE - 2,
+        )
+        self.insert_anchor(
+            runner.connection,
+            message_id="9000000000000000999",
+            sequence="999",
+            sent_at=NOT_BEFORE - 1,
+            resolver="event-cdn",
+        )
+
+        runner.initialize()
+
+        job = runner.connection.execute(
+            "SELECT * FROM window_recovery_jobs WHERE group_id=?", (GROUP,)
+        ).fetchone()
+        self.assertEqual(job["start_anchor_id"], "9000000000000000101")
+        self.assertEqual(job["start_anchor_seq"], "101")
+        self.assertEqual(job["status"], "probe")
+        self.assertEqual(job["probe_ok"], 0)
+
+    def test_first_response_is_validated_enqueued_and_not_refetched(self) -> None:
+        fake = FakeOneBot(
+            page(
+                history_message(100, NOT_BEFORE - 1),
+                history_message(101, NOT_BEFORE + 1, image=True),
+            )
+        )
+        runner = self.make_runner(fake)
+        runner.initialize()
+        runner._budget_wait_seconds = lambda _now: 0  # type: ignore[method-assign]
+
+        self.assertTrue(runner.process_one_page())
+
+        self.assertEqual(
+            runner.connection.execute(
+                "SELECT count(*) FROM images WHERE resolver='event-cdn'"
+            ).fetchone()[0],
+            1,
+        )
+        job = runner.connection.execute("SELECT * FROM window_recovery_jobs").fetchone()
+        self.assertEqual(job["status"], "queued")
+        self.assertEqual(job["probe_ok"], 1)
+        self.assertEqual(job["next_anchor_id"], "800101")
+        self.assertEqual(job["next_anchor_seq"], "101")
+        self.assertEqual(job["pages"], 1)
+        self.assertEqual(job["images_enqueued"], 1)
+        self.assertEqual(len(fake.calls), 1)
+        action, params = fake.calls[0]
+        self.assertEqual(action, "get_group_msg_history")
+        self.assertEqual(params["message_seq"], RAW_ANCHOR)
+        self.assertIs(params["reverse_order"], False)
+
+    def test_hard_window_is_inclusive_and_message_sent_is_collected(self) -> None:
+        fake = FakeOneBot(
+            page(
+                history_message(100, NOT_BEFORE - 1, image=True),
+                history_message(101, NOT_BEFORE, image=True),
+                history_message(
+                    102, NOT_BEFORE + 100, image=True, post_type="message_sent"
+                ),
+                history_message(103, NOT_AFTER, image=True),
+                history_message(104, NOT_AFTER + 1, image=True),
+            )
+        )
+        runner = self.make_runner(fake, queue_threshold=10)
+        runner.initialize()
+        self.mark_probe_complete(runner)
+
+        self.assertTrue(runner.process_one_page())
+
+        rows = runner.connection.execute(
+            "SELECT message_seq, sent_at FROM images WHERE resolver='event-cdn' ORDER BY sent_at"
+        ).fetchall()
+        self.assertEqual(
+            [(row["message_seq"], row["sent_at"]) for row in rows],
+            [("101", NOT_BEFORE), ("102", NOT_BEFORE + 100), ("103", NOT_AFTER)],
+        )
+        job = runner.connection.execute("SELECT * FROM window_recovery_jobs").fetchone()
+        self.assertEqual(job["messages_in_window"], 3)
+        self.assertEqual(job["images_enqueued"], 3)
+        self.assertEqual(job["status"], "completed")
+
+    def test_overlapping_pages_deduplicate_by_real_sequence(self) -> None:
+        fake = FakeOneBot(
+            page(
+                history_message(100, NOT_BEFORE - 1),
+                history_message(101, NOT_BEFORE + 1, message_id=8101, image=True),
+            ),
+            page(
+                history_message(101, NOT_BEFORE + 1, message_id=9101, image=True),
+                history_message(102, NOT_BEFORE + 2, message_id=9102, image=True),
+                # Duplicate real_seq in one response is ignored as well.
+                history_message(102, NOT_BEFORE + 2, message_id=9992, image=True),
+            ),
+        )
+        runner = self.make_runner(fake, queue_threshold=10)
+        runner.initialize()
+        self.mark_probe_complete(runner)
+
+        self.assertTrue(runner.process_one_page())
+        runner.connection.execute(
+            "UPDATE window_recovery_jobs SET next_retry_at=0"
+        )
+        runner.connection.commit()
+        self.assertTrue(runner.process_one_page())
+
+        rows = runner.connection.execute(
+            "SELECT message_id, message_seq FROM images WHERE resolver='event-cdn' ORDER BY message_seq"
+        ).fetchall()
+        self.assertEqual([(row["message_id"], row["message_seq"]) for row in rows], [("8101", "101"), ("9102", "102")])
+        job = runner.connection.execute("SELECT * FROM window_recovery_jobs").fetchone()
+        self.assertEqual(job["images_enqueued"], 2)
+        self.assertEqual(job["duplicates"], 1)
+        self.assertEqual(fake.calls[1][1]["message_seq"], "8101")
+
+    def test_wrong_direction_fails_before_any_enqueue(self) -> None:
+        fake = FakeOneBot(
+            page(
+                history_message(99, NOT_BEFORE + 1, image=True),
+                history_message(100, NOT_BEFORE + 2),
+                history_message(101, NOT_BEFORE + 3, image=True),
+            )
+        )
+        runner = self.make_runner(fake)
+        runner.initialize()
+        runner._budget_wait_seconds = lambda _now: 0  # type: ignore[method-assign]
+
+        self.assertTrue(runner.process_one_page())
+
+        self.assertEqual(
+            runner.connection.execute("SELECT count(*) FROM images WHERE resolver='event-cdn'").fetchone()[0],
+            0,
+        )
+        job = runner.connection.execute("SELECT * FROM window_recovery_jobs").fetchone()
+        self.assertEqual(job["status"], "failed_direction")
+        self.assertEqual(job["images_enqueued"], 0)
+
+    def test_time_must_not_move_backwards_as_sequence_advances(self) -> None:
+        fake = FakeOneBot(
+            page(
+                history_message(100, NOT_BEFORE - 1),
+                history_message(101, NOT_BEFORE + 20, image=True),
+                history_message(102, NOT_BEFORE + 10, image=True),
+            )
+        )
+        runner = self.make_runner(fake)
+        runner.initialize()
+        runner._budget_wait_seconds = lambda _now: 0  # type: ignore[method-assign]
+
+        self.assertTrue(runner.process_one_page())
+
+        self.assertEqual(
+            runner.connection.execute(
+                "SELECT count(*) FROM images WHERE resolver='event-cdn'"
+            ).fetchone()[0],
+            0,
+        )
+        job = runner.connection.execute("SELECT * FROM window_recovery_jobs").fetchone()
+        self.assertEqual(job["status"], "failed_direction")
+        self.assertIn("time moved backwards", job["last_error"])
+
+    def test_inclusive_anchor_only_marks_source_exhausted_without_replay(self) -> None:
+        fake = FakeOneBot(
+            page(history_message(100, NOT_BEFORE - 1, image=True))
+        )
+        runner = self.make_runner(fake)
+        runner.initialize()
+        runner._budget_wait_seconds = lambda _now: 0  # type: ignore[method-assign]
+
+        self.assertTrue(runner.process_one_page())
+
+        job = runner.connection.execute("SELECT * FROM window_recovery_jobs").fetchone()
+        self.assertEqual(job["status"], "partial_source_exhausted")
+        self.assertEqual(job["probe_ok"], 1)
+        self.assertEqual(job["history_calls"], 1)
+        self.assertEqual(job["replay_count"], 0)
+        self.assertEqual(job["next_anchor_id"], RAW_ANCHOR)
+        self.assertIsNotNone(job["finished_at"])
+        self.assertEqual(
+            runner.connection.execute(
+                "SELECT count(*) FROM images WHERE resolver='event-cdn'"
+            ).fetchone()[0],
+            0,
+        )
+        self.assertEqual(len(fake.calls), 1)
+        self.assertFalse(runner._aggregate("test")["active"])
+
+    def test_not_logged_in_waits_without_consuming_or_replaying_history(self) -> None:
+        fake = FakeOneBot(
+            page(
+                history_message(100, NOT_BEFORE - 1),
+                history_message(101, NOT_BEFORE + 1, image=True),
+            ),
+            login_responses=[
+                RuntimeError("OneBot is still starting"),
+                {"user_id": SENDER, "nickname": "synthetic"},
+            ],
+        )
+        runner = self.make_runner(fake)
+        runner.initialize()
+        runner._budget_wait_seconds = lambda _now: 0  # type: ignore[method-assign]
+        phases: list[str] = []
+        runner._publish_state = (  # type: ignore[method-assign]
+            lambda phase, **_extra: phases.append(phase) or {}
+        )
+
+        self.assertFalse(runner.process_one_page())
+
+        self.assertEqual(phases[-1], "waiting_login")
+        self.assertEqual(fake.calls, [])
+        self.assertEqual(len(fake.login_calls), 1)
+        self.assertEqual(
+            runner.connection.execute(
+                "SELECT count(*) FROM window_recovery_calls"
+            ).fetchone()[0],
+            0,
+        )
+        counters = runner.connection.execute(
+            """
+            SELECT coalesce(sum(history_calls), 0),
+                   coalesce(sum(window_history_calls), 0)
+            FROM hourly_counters
+            """
+        ).fetchone()
+        self.assertEqual(tuple(counters), (0, 0))
+        job = runner.connection.execute(
+            "SELECT * FROM window_recovery_jobs"
+        ).fetchone()
+        self.assertEqual(job["status"], "probe")
+        self.assertEqual(job["history_calls"], 0)
+        self.assertEqual(job["retry_count"], 0)
+        self.assertEqual(job["replay_count"], 0)
+        self.assertEqual(job["next_anchor_id"], RAW_ANCHOR)
+
+        # The next short poll sees a logged-in account and proceeds normally.
+        self.assertTrue(runner.process_one_page())
+        self.assertEqual(len(fake.login_calls), 2)
+        self.assertEqual(len(fake.calls), 1)
+        self.assertEqual(fake.calls[0][0], "get_group_msg_history")
+
+    def test_login_probe_without_an_account_is_not_history_ready(self) -> None:
+        fake = FakeOneBot(
+            page(history_message(100, NOT_BEFORE - 1)),
+            login_responses=[{"user_id": "0", "nickname": ""}],
+        )
+        runner = self.make_runner(fake)
+        runner.initialize()
+        runner._budget_wait_seconds = lambda _now: 0  # type: ignore[method-assign]
+        phases: list[str] = []
+        runner._publish_state = (  # type: ignore[method-assign]
+            lambda phase, **_extra: phases.append(phase) or {}
+        )
+
+        self.assertFalse(runner.process_one_page())
+
+        self.assertEqual(phases[-1], "waiting_login")
+        self.assertEqual(fake.calls, [])
+        self.assertEqual(
+            runner.connection.execute(
+                "SELECT count(*) FROM window_recovery_calls"
+            ).fetchone()[0],
+            0,
+        )
+        job = runner.connection.execute(
+            "SELECT history_calls, retry_count, replay_count FROM window_recovery_jobs"
+        ).fetchone()
+        self.assertEqual(tuple(job), (0, 0, 0))
+
+    def test_nonempty_download_queue_blocks_history_call(self) -> None:
+        fake = FakeOneBot(page(history_message(100, NOT_BEFORE - 1)))
+        runner = self.make_runner(fake)
+        runner.initialize()
+        runner.connection.execute(
+            """
+            INSERT INTO images (
+                group_id, message_id, message_seq, image_index, sent_at,
+                status, updated_at, resolver, resolver_json, discovered_at
+            ) VALUES (?, '7001', '7001', 0, ?, 'queued', ?, 'event-cdn', '{}', ?)
+            """,
+            (GROUP, NOT_AFTER + 1, NOT_AFTER + 1, NOT_AFTER + 1),
+        )
+        runner.connection.commit()
+        phases: list[str] = []
+        runner._publish_state = lambda phase, **_extra: phases.append(phase) or {}  # type: ignore[method-assign]
+
+        self.assertFalse(runner.process_one_page())
+        self.assertEqual(fake.calls, [])
+        self.assertEqual(phases[-1], "waiting_queue")
+
+    def test_interval_hourly_daily_and_per_group_budgets(self) -> None:
+        fake = FakeOneBot(page(history_message(100, NOT_BEFORE - 1)))
+        runner = self.make_runner(
+            fake,
+            interval_seconds=600,
+            hourly_limit=2,
+            daily_limit=3,
+            max_calls_per_group=2,
+        )
+        runner.initialize()
+        midday = int(
+            dt.datetime(
+                2026,
+                8,
+                2,
+                12,
+                tzinfo=dt.timezone(dt.timedelta(hours=8)),
+            ).timestamp()
+        )
+
+        def insert_calls(*timestamps: int) -> None:
+            runner.connection.execute("DELETE FROM window_recovery_calls")
+            runner.connection.executemany(
+                """
+                INSERT INTO window_recovery_calls(
+                    group_id, not_before, not_after, called_at, outcome
+                ) VALUES (?, ?, ?, ?, 'ok')
+                """,
+                [(GROUP, NOT_BEFORE, NOT_AFTER, value) for value in timestamps],
+            )
+            runner.connection.commit()
+
+        insert_calls(midday - 100)
+        self.assertEqual(runner._budget_wait_seconds(midday), 500)
+        insert_calls(midday - 1800, midday - 1000)
+        self.assertGreaterEqual(runner._budget_wait_seconds(midday), 1801)
+        day_start = int(
+            dt.datetime(
+                2026,
+                8,
+                2,
+                tzinfo=dt.timezone(dt.timedelta(hours=8)),
+            ).timestamp()
+        )
+        insert_calls(day_start + 100, day_start + 200, day_start + 300)
+        self.assertEqual(runner._budget_wait_seconds(midday), day_start + 86400 - midday)
+
+        # A positive wait is a hard API gate.
+        insert_calls(midday - 100)
+        phases: list[str] = []
+        runner._publish_state = lambda phase, **_extra: phases.append(phase) or {}  # type: ignore[method-assign]
+        with mock.patch("qq_image_collector.window_recovery.time.time", return_value=midday):
+            self.assertFalse(runner.process_one_page())
+        self.assertEqual(fake.calls, [])
+        self.assertEqual(phases[-1], "waiting_budget")
+
+        # The per-group cap also terminates locally without an API call.
+        runner.connection.execute("DELETE FROM window_recovery_calls")
+        runner.connection.executemany(
+            """
+            INSERT INTO window_recovery_calls(
+                group_id, not_before, not_after, called_at, outcome
+            ) VALUES (?, ?, ?, ?, 'ok')
+            """,
+            [
+                (GROUP, NOT_BEFORE, NOT_AFTER, midday - 2000),
+                (GROUP, NOT_BEFORE, NOT_AFTER, midday - 1000),
+            ],
+        )
+        runner.connection.commit()
+        runner._budget_wait_seconds = lambda _now: 0  # type: ignore[method-assign]
+        self.assertTrue(runner.process_one_page())
+        self.assertEqual(fake.calls, [])
+        self.assertEqual(
+            runner.connection.execute("SELECT status FROM window_recovery_jobs").fetchone()[0],
+            "partial_max_calls",
+        )
+
+    def test_page_crossing_upper_bound_completes_without_an_extra_call(self) -> None:
+        fake = FakeOneBot(
+            page(
+                history_message(200, NOT_AFTER - 1, image=True),
+                history_message(201, NOT_AFTER + 2, image=True),
+            )
+        )
+        runner = self.make_runner(fake)
+        runner.initialize()
+        self.mark_probe_complete(runner)
+        runner.connection.execute(
+            """
+            UPDATE window_recovery_jobs
+            SET next_anchor_id='8200', next_anchor_seq='200',
+                next_anchor_time=?, next_retry_at=0
+            """,
+            (NOT_AFTER - 1,),
+        )
+        runner.connection.commit()
+
+        self.assertTrue(runner.process_one_page())
+
+        job = runner.connection.execute("SELECT * FROM window_recovery_jobs").fetchone()
+        self.assertEqual(job["status"], "completed")
+        self.assertIsNotNone(job["finished_at"])
+        self.assertEqual(job["images_enqueued"], 1)
+        self.assertEqual(len(fake.calls), 1)
+        self.assertFalse(runner._aggregate("test")["active"])
+
+    def test_enabled_group_set_is_frozen_after_initialization(self) -> None:
+        fake = FakeOneBot(page(history_message(100, NOT_BEFORE - 1)))
+        runner = self.make_runner(fake)
+        runner.initialize()
+        now = NOT_AFTER + 10
+        runner.connection.execute(
+            "UPDATE monitored_groups SET enabled=0, updated_at=? WHERE group_id=?",
+            (now, GROUP),
+        )
+        runner.connection.execute(
+            """
+            INSERT INTO monitored_groups(group_id, enabled, created_at, updated_at)
+            VALUES ('100000002', 1, ?, ?)
+            """,
+            (now, now),
+        )
+        runner.connection.commit()
+
+        with self.assertRaisesRegex(WindowPolicyError, "frozen window jobs"):
+            runner.process_one_page()
+        self.assertEqual(fake.calls, [])
+
+    def test_short_anchor_failures_stop_after_three_safe_replays(self) -> None:
+        fake = FakeOneBot(OneBotError("short id expired"), OneBotError("expired again"))
+        runner = self.make_runner(fake, queue_threshold=10)
+        runner.initialize()
+        runner._budget_wait_seconds = lambda _now: 0  # type: ignore[method-assign]
+        runner.connection.execute(
+            """
+            UPDATE window_recovery_jobs
+            SET status='queued', probe_ok=1, next_anchor_id='8101',
+                next_anchor_seq='101', next_anchor_time=?, replay_count=2,
+                next_retry_at=0
+            """,
+            (NOT_BEFORE + 1,),
+        )
+        runner.connection.commit()
+
+        self.assertTrue(runner.process_one_page())
+        job = runner.connection.execute("SELECT * FROM window_recovery_jobs").fetchone()
+        self.assertEqual(job["status"], "probe")
+        self.assertEqual(job["replay_count"], 3)
+        self.assertEqual(job["next_anchor_id"], RAW_ANCHOR)
+
+        # Simulate making forward progress once more after the third raw replay;
+        # the next short-ID failure must terminate instead of starting replay 4.
+        runner.connection.execute(
+            """
+            UPDATE window_recovery_jobs
+            SET status='queued', probe_ok=1, next_anchor_id='8102',
+                next_anchor_seq='102', next_anchor_time=?, next_retry_at=0
+            """,
+            (NOT_BEFORE + 2,),
+        )
+        runner.connection.commit()
+        self.assertTrue(runner.process_one_page())
+
+        job = runner.connection.execute("SELECT * FROM window_recovery_jobs").fetchone()
+        self.assertEqual(job["status"], "failed_anchor")
+        self.assertEqual(job["replay_count"], 3)
+        self.assertIn("three safe replays", job["last_error"])
+        self.assertEqual(len(fake.calls), 2)
+
+
+if __name__ == "__main__":
+    unittest.main()

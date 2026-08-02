@@ -337,6 +337,30 @@ accepted / rejected / duplicates / failed / expired / filtered_gif
 - 不放宽 OneBot 动作白名单，不把 400/403 默认转换为历史调用。
 - 不在 A–F 原始证据不完整时启用原有六群。
 
+## 一次性时间窗口补漏
+
+普通 `backfill` 与 `recover-gap` 已永久返回 410，常驻 Worker 也会在网络调用前硬拒绝
+history。若已有断档经过审计，可在 `.env` 写入闭区间 Unix 时间：
+
+```text
+WINDOW_RECOVERY_NOT_BEFORE=<审计后的下界>
+WINDOW_RECOVERY_NOT_AFTER=<生产切换时间>
+```
+
+这两个值必须与数据库生产标记完全一致。启动、查看和停止内部 profile：
+
+```bash
+./manage.sh window-recovery-start
+./manage.sh window-recovery-status
+./manage.sh window-recovery-stop
+```
+
+恢复器每群首屏先完整验证方向，验证前不入队，通过后才处理同一响应，不重复拉取探测
+页。随后每 10 分钟最多一页、每小时 6 次、每天 20 次；
+全局下载队列不为空时等待。只有硬时间窗内图片会进入原有事件 CDN 队列。它不更新
+实时游标、不调用 `get_image`、不提高常驻历史预算。脱敏汇总写入
+`repository/state/diagnostics/window-recovery-report.json`，完整群号与锚点只留在 SQLite。
+
 ## 日常命令
 
 ```bash

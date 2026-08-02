@@ -46,6 +46,7 @@ COUNTER_COLUMNS = frozenset(
         "cdn_403",
         "cdn_429",
         "history_calls",
+        "window_history_calls",
         "get_image_blocked",
         "accepted",
         "rejected",
@@ -302,6 +303,7 @@ def connect_database(
             cdn_403 INTEGER NOT NULL DEFAULT 0,
             cdn_429 INTEGER NOT NULL DEFAULT 0,
             history_calls INTEGER NOT NULL DEFAULT 0,
+            window_history_calls INTEGER NOT NULL DEFAULT 0,
             get_image_blocked INTEGER NOT NULL DEFAULT 0,
             accepted INTEGER NOT NULL DEFAULT 0,
             rejected INTEGER NOT NULL DEFAULT 0,
@@ -320,7 +322,54 @@ def connect_database(
             "cdn_requests": "INTEGER NOT NULL DEFAULT 0",
             "cdn_400": "INTEGER NOT NULL DEFAULT 0",
             "expired": "INTEGER NOT NULL DEFAULT 0",
+            "window_history_calls": "INTEGER NOT NULL DEFAULT 0",
         },
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS window_recovery_jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            group_id TEXT NOT NULL,
+            not_before INTEGER NOT NULL,
+            not_after INTEGER NOT NULL,
+            start_anchor_id TEXT NOT NULL,
+            start_anchor_seq TEXT NOT NULL,
+            start_anchor_time INTEGER NOT NULL,
+            next_anchor_id TEXT NOT NULL,
+            next_anchor_seq TEXT NOT NULL,
+            next_anchor_time INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'probe',
+            probe_ok INTEGER NOT NULL DEFAULT 0,
+            pages INTEGER NOT NULL DEFAULT 0,
+            history_calls INTEGER NOT NULL DEFAULT 0,
+            messages_seen INTEGER NOT NULL DEFAULT 0,
+            messages_in_window INTEGER NOT NULL DEFAULT 0,
+            images_enqueued INTEGER NOT NULL DEFAULT 0,
+            duplicates INTEGER NOT NULL DEFAULT 0,
+            retry_count INTEGER NOT NULL DEFAULT 0,
+            replay_count INTEGER NOT NULL DEFAULT 0,
+            next_retry_at INTEGER NOT NULL DEFAULT 0,
+            last_page_fingerprint TEXT,
+            last_error TEXT,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            finished_at INTEGER,
+            UNIQUE(group_id, not_before, not_after)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS window_recovery_calls (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            group_id TEXT NOT NULL,
+            not_before INTEGER NOT NULL,
+            not_after INTEGER NOT NULL,
+            called_at INTEGER NOT NULL,
+            outcome TEXT NOT NULL,
+            error TEXT
+        )
+        """
     )
     connection.execute("CREATE INDEX IF NOT EXISTS idx_images_status_queue ON images(status, next_retry_at, discovered_at)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_images_sha256 ON images(sha256)")
@@ -329,6 +378,18 @@ def connect_database(
         "CREATE INDEX IF NOT EXISTS idx_images_group_seq ON images(group_id, message_seq, image_index)"
     )
     connection.execute("CREATE INDEX IF NOT EXISTS idx_jobs_active ON jobs(status, created_at)")
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_window_recovery_ready
+        ON window_recovery_jobs(status, next_retry_at, updated_at)
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_window_recovery_calls_time
+        ON window_recovery_calls(called_at)
+        """
+    )
     connection.execute("DROP VIEW IF EXISTS occurrences")
     connection.execute("CREATE VIEW occurrences AS SELECT * FROM images")
 

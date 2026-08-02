@@ -167,6 +167,10 @@ class CollectorWorker:
 
     def _history_budget(self) -> None:
         now = int(time.time())
+        if int(self.runtime("production_live_only_started_at") or 0) > 0:
+            raise HistoryBudgetExceeded(
+                "ordinary history calls are disabled by the live-only production policy"
+            )
         hourly_limit = int(self.runtime("history_hourly_limit"))
         daily_limit = int(self.runtime("history_daily_limit"))
         if hourly_limit <= 0:

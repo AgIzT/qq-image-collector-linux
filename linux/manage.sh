@@ -15,7 +15,7 @@ runtime_root() {
 }
 
 usage() {
-  echo "Usage: ./manage.sh prepare|start|stop|restart|status|logs|login|activate-account [qq]|console-url|probe-event <test-group-id> [segments] [--reset]|diagnose-original <filename> [group-id] [sender-id]|diagnose-metadata <filename> [group-id] [sender-id]|url-lifecycle-capture [group-id]|url-lifecycle-check <label> [--finalize]|telemetry [hours]|audit-rkey-network [seconds]|purge-cache"
+  echo "Usage: ./manage.sh prepare|start|stop|restart|status|logs|login|activate-account [qq]|console-url|window-recovery-start|window-recovery-status|window-recovery-stop|probe-event <test-group-id> [segments] [--reset]|diagnose-original <filename> [group-id] [sender-id]|diagnose-metadata <filename> [group-id] [sender-id]|url-lifecycle-capture [group-id]|url-lifecycle-check <label> [--finalize]|telemetry [hours]|audit-rkey-network [seconds]|purge-cache"
 }
 
 case "${1:-}" in
@@ -55,6 +55,17 @@ case "${1:-}" in
   console-url)
     token="$(docker compose exec -T collector-console sh -lc 'cat /data/manager/manager.token')"
     printf 'Open through the existing Nginx public endpoint:\nhttp://<server>:18080/?session_token=%s\n' "$token"
+    ;;
+  window-recovery-start)
+    docker compose --profile window-recovery up -d window-recovery
+    ;;
+  window-recovery-status)
+    docker compose --profile window-recovery ps window-recovery
+    docker compose exec -T collector-console sh -lc \
+      'cat /data/qq-image-collector/state/diagnostics/window-recovery-report.json 2>/dev/null || true'
+    ;;
+  window-recovery-stop)
+    docker compose --profile window-recovery stop window-recovery
     ;;
   probe-event)
     [[ -n "${2:-}" ]] || { echo "isolated test group id is required" >&2; exit 2; }
