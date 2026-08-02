@@ -15,7 +15,7 @@ runtime_root() {
 }
 
 usage() {
-  echo "Usage: ./manage.sh prepare|start|stop|restart|status|logs|login|activate-account [qq]|console-url|probe-event [group-id] [segments]|diagnose-original <filename> [group-id] [sender-id]|diagnose-metadata <filename> [group-id] [sender-id]|url-lifecycle-capture [group-id]|url-lifecycle-check <label> [--finalize]|telemetry [hours]|audit-rkey-network [seconds]|purge-cache"
+  echo "Usage: ./manage.sh prepare|start|stop|restart|status|logs|login|activate-account [qq]|console-url|probe-event <test-group-id> [segments] [--reset]|diagnose-original <filename> [group-id] [sender-id]|diagnose-metadata <filename> [group-id] [sender-id]|url-lifecycle-capture [group-id]|url-lifecycle-check <label> [--finalize]|telemetry [hours]|audit-rkey-network [seconds]|purge-cache"
 }
 
 case "${1:-}" in
@@ -57,9 +57,16 @@ case "${1:-}" in
     printf 'Open through the existing Nginx public endpoint:\nhttp://<server>:18080/?session_token=%s\n' "$token"
     ;;
   probe-event)
-    args=()
-    [[ -z "${2:-}" ]] || args+=(--group "$2")
-    args+=(--image-segments "${3:-200}")
+    [[ -n "${2:-}" ]] || { echo "isolated test group id is required" >&2; exit 2; }
+    segments="${3:-200}"
+    reset=()
+    if [[ "$segments" == "--reset" ]]; then
+      segments=200
+      reset=(--reset)
+    elif [[ "${4:-}" == "--reset" ]]; then
+      reset=(--reset)
+    fi
+    args=(--group "$2" --image-segments "$segments" "${reset[@]}")
     docker compose exec -T -e PYTHONPATH=/app collector-console \
       python /app/linux/event_probe.py "${args[@]}"
     ;;

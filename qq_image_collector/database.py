@@ -12,7 +12,7 @@ from urllib.parse import urlsplit
 
 
 FILENAME_TIMEZONE = dt.timezone(dt.timedelta(hours=8))
-ASSET_PARSER_VERSION = "4"
+ASSET_PARSER_VERSION = "5"
 FINAL_CATEGORIES = (
     "NovelAI",
     "ComfyUI",

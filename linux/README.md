@@ -59,6 +59,10 @@ Test A 不要求用户集中发送 200 张图。它在 Worker 暂停、所有生
 绝对禁止无过滤监听全部群。该诊断只读取 WS，只输出脱敏聚合，不调用 OneBot HTTP、
 不下载图片、不写生产 SQLite。
 
+正式 Test A 由持久 systemd 服务运行，绑定一个明确目标群被动累计 200 个图片槽位。
+服务使用独立 0600 `url_probe.sqlite3`，普通重启续跑；达到完成门槛后正常退出且不再
+重启。诊断状态与生产数据库完全隔离。
+
 Test B、C、D、F 使用另一个隔离测试群，并共享一次 10 张图片的发送窗口。先准备三张
 已知 SHA-256 的源文件：NovelAI PNG `tEXt`、ComfyUI workflow、NAI Alpha stealth。
 运维方同时启动一次性 `diagnose-original`、三项 `diagnose-metadata`、
@@ -84,8 +88,9 @@ Test B/C 按源文件 MD5 独立匹配，Test D 捕获前 10 条 URL，Test F �
 
 `<目标群号>` 不得省略；禁止运行无 group 的全群普查。脚本只读 WS，直接检查标准
 图片段与 raw `picElement`，不复用生产事件解析结果，不调用 OneBot HTTP、不下载图片、
-不写生产数据库；唯一写入是脱敏诊断结果 `repository/state/url_probe.json`。必须原样
-回报以下字段：
+不写生产数据库。它只写权限为 0600 的独立 `url_probe.sqlite3` 和脱敏 JSON
+checkpoint；目标 scope 与事件只保存 SHA-256，不能保存群号、账号、消息 ID、文件名、
+正文、完整 URL 或查询参数。必须原样回报以下字段：
 
 - `complete` 必须为 `true`，`captured_estimated_image_slots >= 200`；
 - `standard_image_segments`、`raw_pic_elements`、`independently_matched_pairs`；
@@ -97,6 +102,20 @@ Test B/C 按源文件 MD5 独立匹配，Test D 捕获前 10 条 URL，Test F �
 
 `timed_out=true`、样本不足或只有概述均不通过。Test A 决定生产应优先 `data.url`
 还是 `originImageUrl`，不能预先假定 raw 与标准数组严格同序。
+
+### Test A 可靠性与续跑
+
+- 每个事件先以事件 SHA-256 去重，再在独立 SQLite 的单个事务中更新聚合；事务提交后
+  原子刷新 JSON checkpoint。重连重放不能重复计数。
+- WS 断线按 1–60 秒指数退避重连；进程、容器或服务器重启后从独立数据库继续。
+- 单次最长 6 小时仍不足 200 时记录为 partial，保留状态；下次启动继续累计，不把
+  partial 当作通过，也不清零。
+- `--reset` 是唯一允许清空旧统计并开始新 scope 的操作，执行前必须确认目标群；普通
+  启停严禁附带 `--reset`。
+- 正式服务器任务由 systemd 保持运行；只在失败或未完成时恢复。达到 200 后状态为
+  completed、进程正常退出，服务不得重启。
+- 0600 SQLite/JSON 中也只能出现 SHA-256 scope、事件指纹和脱敏聚合；任何生产数据库
+  表、真实标识或完整 URL 都不属于 Test A 状态。
 
 ## Test B：一次性字节一致性
 
@@ -143,6 +162,11 @@ sentinel，生产 Worker 从未获得这项能力。
 
 任一类型失败都不能进入灰度。
 
+临时下载路径可能以 `.bin` 或 `.part` 结尾。Test C 和生产解析不得用该后缀判断图片
+类型；PNG 原始文本扫描必须先检查八字节 PNG 魔数
+`89 50 4E 47 0D 0A 1A 0A`，并结合实际解码格式。只有真实字节格式确定后才能选择最终
+扩展名。
+
 ## Test D：URL 生命周期
 
 先从测试群事件采集 10 条 URL。完整 URL 仅写入权限为 0600 的 secret 文件，终端只
@@ -162,6 +186,23 @@ sentinel，生产 Worker 从未获得这项能力。
 
 完整状态矩阵保存在 `repository/state/url_lifecycle.report.json`。最后一步必须输出
 `secret_urls_deleted=true`。不得提前连续执行四次伪造生命周期。
+
+## 当前门禁进度（2026-08-02）
+
+本轮隔离测试的脱敏结论如下；不得在文档或提交中补入账号、群、消息、真实文件名、
+完整 URL、rkey 或具体哈希值：
+
+- `data.url` 下载字节与已知源 SHA-256 一致；
+- 唯一一次 `get_image` 诊断也与源 SHA-256 一致，sentinel 已消费，不得删除或重跑；
+- raw `originImageUrl` 被白名单拒绝或不可用，当前生产候选只能使用 `data`；
+- ComfyUI workflow 样本的字节和元数据比较通过；
+- NAI 的 Test C 结果是假失败：临时 `.bin/.part` 后缀使 PNG 原始文本扫描被跳过，
+  不是 CDN 破坏了 NAI 元数据；
+- Test D 的 T+0 当前为 10 条 Range 探测全部 HTTP 206，待后续时间点和最终审计确认。
+
+生产保持暂停，六个生产群保持停用。修复为 PNG 魔数驱动后，只重跑 Test C 的三张
+已知源文件，连同已经通过的 ComfyUI 再做一次回归；不重跑 Test B，不再次调用
+`get_image`。Test D 继续按实际 T+1h/T+6h/T+24h 时间点完成。
 
 ## URL preference 与 TTL 决策
 

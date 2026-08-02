@@ -291,11 +291,10 @@ def _read_png_text_channels(path: Path) -> tuple[dict[str, str], dict[str, str]]
     NovelAI's inspector reads ordinary tEXt/iTXt fields before trying EXIF and
     Alpha stealth metadata.  A zTXt payload is useful to this collector, but it
     must not be treated as an ordinary field when simulating that fallback
-    order.
+    order.  CDN downloads are inspected while they still have a temporary
+    ``.part``/``.bin`` name, so PNG detection must be based on the signature
+    and chunk structure rather than the filename suffix.
     """
-    if path.suffix.casefold() != ".png":
-        return {}, {}
-
     try:
         raw = path.read_bytes()
     except OSError:

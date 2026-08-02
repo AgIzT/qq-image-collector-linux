@@ -1,3 +1,4 @@
+import gzip
 import json
 import tempfile
 import unittest
@@ -7,6 +8,7 @@ from unittest.mock import patch
 from PIL import Image
 from PIL.PngImagePlugin import PngInfo
 
+from linux.diagnostic_compare import metadata_summary
 from qq_image_collector.database import accepted_path_for, category_for_source
 from metadata_reader import _extract_stealth_png, inspect_image
 
@@ -18,6 +20,86 @@ class MetadataReaderTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
+
+    def assert_png_bytes_are_extension_invariant(self, png_path: Path) -> None:
+        expected = inspect_image(png_path)
+        expected_summary = metadata_summary(png_path)
+        payload = png_path.read_bytes()
+        for suffix in (".part", ".bin"):
+            candidate = self.root / f"{png_path.stem}{suffix}"
+            candidate.write_bytes(payload)
+            actual = inspect_image(candidate)
+            self.assertEqual(actual.accepted, expected.accepted)
+            self.assertEqual(actual.source, expected.source)
+            self.assertEqual(actual.fields, expected.fields)
+            self.assertEqual(actual.image_format, expected.image_format)
+            self.assertEqual(metadata_summary(candidate), expected_summary)
+
+    def test_png_metadata_channels_do_not_depend_on_filename_extension(self) -> None:
+        novelai_text = self.root / "novelai-text.png"
+        metadata = PngInfo()
+        metadata.add_text("Source", "NovelAI Diffusion V4")
+        metadata.add_text(
+            "Comment",
+            json.dumps({"prompt": "cat", "steps": 28, "signed_hash": "x"}),
+        )
+        Image.new("RGB", (64, 64), "white").save(novelai_text, pnginfo=metadata)
+        self.assertEqual(inspect_image(novelai_text).source, "novelai")
+        self.assert_png_bytes_are_extension_invariant(novelai_text)
+
+        novelai_ztxt = self.root / "novelai-ztxt.png"
+        metadata = PngInfo()
+        metadata.add_text("Source", "NovelAI Diffusion V4", zip=True)
+        metadata.add_text(
+            "Comment",
+            json.dumps({"prompt": "cat", "steps": 28, "signed_hash": "x"}),
+            zip=True,
+        )
+        Image.new("RGB", (64, 64), "white").save(novelai_ztxt, pnginfo=metadata)
+        self.assertEqual(inspect_image(novelai_ztxt).source, "novelai-unreadable")
+        self.assert_png_bytes_are_extension_invariant(novelai_ztxt)
+
+        comfyui = self.root / "comfyui-workflow.png"
+        metadata = PngInfo()
+        metadata.add_text(
+            "workflow",
+            json.dumps({"nodes": [{"id": 1, "class_type": "SaveImage"}]}),
+        )
+        Image.new("RGB", (64, 64), "white").save(comfyui, pnginfo=metadata)
+        self.assertEqual(inspect_image(comfyui).source, "comfyui")
+        self.assert_png_bytes_are_extension_invariant(comfyui)
+
+        stealth = self.root / "novelai-alpha.png"
+        stealth_payload = gzip.compress(
+            json.dumps(
+                {"prompt": "cat", "steps": 28, "signed_hash": "x"}
+            ).encode("utf-8")
+        )
+        packed = (
+            b"stealth_pngcomp"
+            + (len(stealth_payload) * 8).to_bytes(4, "big", signed=True)
+            + stealth_payload
+        )
+        bits = [
+            (byte >> shift) & 1
+            for byte in packed
+            for shift in range(7, -1, -1)
+        ]
+        width = 64
+        height = (len(bits) + width - 1) // width
+        if height % 8 == 0:
+            height += 1
+        image = Image.new("RGBA", (width, height), (255, 255, 255, 254))
+        alpha = [254] * (width * height)
+        for index, bit in enumerate(bits):
+            x, y = divmod(index, height)
+            alpha[y * width + x] |= bit
+        channel = Image.new("L", image.size)
+        channel.putdata(alpha)
+        image.putalpha(channel)
+        image.save(stealth)
+        self.assertEqual(inspect_image(stealth).source, "novelai")
+        self.assert_png_bytes_are_extension_invariant(stealth)
 
     def test_png_parameters(self) -> None:
         path = self.root / "a1111.png"

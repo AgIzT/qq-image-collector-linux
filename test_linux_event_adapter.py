@@ -4,15 +4,20 @@ import argparse
 import asyncio
 import json
 import os
+import sqlite3
+import sys
 import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
+
+from websockets.exceptions import ConnectionClosedOK
 
 from collector_control import set_setting
 from linux.bootstrap import prepare
 from linux.cache_cleanup import cleanup_once
+from linux import event_probe
 from linux.event_probe import receive_sample
 from linux.telemetry_report import report as telemetry_report
 from qq_image_collector.database import connect_database
@@ -75,6 +80,7 @@ class LinuxEventAdapterTests(unittest.TestCase):
     def test_compose_is_private_and_pinned(self) -> None:
         compose = (Path(__file__).parent / "linux" / "docker-compose.yml").read_text(encoding="utf-8")
         self.assertIn("sha256:e66a6e52", compose)
+        self.assertEqual(compose.count("qq-ai-image-collector-console:1.1.2-event"), 2)
         self.assertNotIn(":3000\"", compose)
         self.assertNotIn(":3001\"", compose)
         self.assertNotIn("40653", compose)
@@ -156,10 +162,26 @@ class LinuxEventAdapterTests(unittest.TestCase):
             "docker compose exec -T collector-console python /app/linux/", manage
         )
         self.assertIn("./audit_rkey_network.sh qqai-napcat", manage)
+        probe_block = manage.split("  probe-event)", 1)[1].split(
+            "  diagnose-original)", 1
+        )[0]
+        self.assertIn(
+            '[[ -n "${2:-}" ]] || { echo "isolated test group id is required"',
+            probe_block,
+        )
+        self.assertIn('args=(--group "$2" --image-segments "$segments"', probe_block)
+        self.assertNotIn('[[ -z "${2:-}" ]] || args+=(--group "$2")', probe_block)
+
+    def test_event_probe_cli_rejects_missing_group(self) -> None:
+        with patch.object(sys, "argv", ["event_probe.py"]):
+            with self.assertRaises(SystemExit) as raised:
+                event_probe.main()
+        self.assertEqual(raised.exception.code, 2)
 
     def test_event_probe_counts_unmatched_standard_and_raw_as_union(self) -> None:
         config = self.root / "collector.json"
         output = self.root / "probe.json"
+        database = self.root / "probe.sqlite3"
         config.write_text(
             json.dumps(
                 {
@@ -208,7 +230,9 @@ class LinuxEventAdapterTests(unittest.TestCase):
                 return json.dumps(event)
 
         with patch("linux.event_probe.websockets.connect", return_value=FakeWebSocket()):
-            code = asyncio.run(receive_sample(config, None, 2, 5, output))
+            code = asyncio.run(
+                receive_sample(config, "100000001", 2, 5, output, database)
+            )
 
         payload = json.loads(output.read_text(encoding="utf-8"))
         self.assertEqual(code, 0)
@@ -216,6 +240,168 @@ class LinuxEventAdapterTests(unittest.TestCase):
         self.assertEqual(payload["captured_estimated_image_slots"], 2)
         self.assertEqual(payload["standard_without_raw_match"], 1)
         self.assertEqual(payload["raw_without_standard_match"], 1)
+
+    def test_event_probe_checkpoints_resumes_and_deduplicates_privately(self) -> None:
+        config = self.root / "collector-resume.json"
+        output = self.root / "probe-resume.json"
+        database = self.root / "probe-resume.sqlite3"
+        group = "987654321012345"
+        secret_url = "https://gchat.qpic.cn/private-object?rkey=NEVER_STORE_THIS"
+        config.write_text(
+            json.dumps(
+                {
+                    "onebot": {"ws_url": "ws://synthetic.invalid", "token": "test"},
+                    "storage": {
+                        "root": str(self.root / "repository"),
+                        "database": str(self.root / "production.sqlite3"),
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        def event(message_id: str, url: str) -> dict:
+            return {
+                "post_type": "message",
+                "message_type": "group",
+                "group_id": int(group),
+                "message_id": message_id,
+                "message": [
+                    {"type": "image", "data": {"file": "same.png", "url": url}}
+                ],
+                "raw": {
+                    "msgId": message_id,
+                    "elements": [
+                        {
+                            "picElement": {
+                                "fileName": "same.png",
+                                "originImageUrl": url,
+                                "original": True,
+                            }
+                        }
+                    ],
+                },
+            }
+
+        first_event = event("1", secret_url)
+        second_event = event("2", "https://gchat.qpic.cn/second?rkey=ALSO_SECRET")
+
+        class FakeWebSocket:
+            def __init__(self, values):
+                self.values = iter(values)
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            async def recv(self):
+                value = next(self.values)
+                if isinstance(value, BaseException):
+                    raise value
+                return json.dumps(value)
+
+        first_socket = FakeWebSocket([first_event, asyncio.TimeoutError()])
+        with patch("linux.event_probe.websockets.connect", return_value=first_socket):
+            first_code = asyncio.run(
+                receive_sample(config, group, 2, 1, output, database)
+            )
+        self.assertEqual(first_code, 2)
+        partial = json.loads(output.read_text(encoding="utf-8"))
+        self.assertEqual(partial["captured_estimated_image_slots"], 1)
+        self.assertTrue(partial["timed_out"])
+
+        second_socket = FakeWebSocket([first_event, second_event])
+        with patch("linux.event_probe.websockets.connect", return_value=second_socket):
+            second_code = asyncio.run(
+                receive_sample(config, group, 2, 1, output, database)
+            )
+        self.assertEqual(second_code, 0)
+        completed = json.loads(output.read_text(encoding="utf-8"))
+        self.assertEqual(completed["captured_estimated_image_slots"], 2)
+        self.assertEqual(completed["events_seen"], 2)
+        self.assertTrue(completed["connection"]["resumed_from_checkpoint"])
+
+        with sqlite3.connect(database) as checkpoint:
+            self.assertEqual(
+                checkpoint.execute("SELECT count(*) FROM probe_events").fetchone()[0], 2
+            )
+            self.assertEqual(
+                checkpoint.execute("SELECT count(*) FROM probe_state").fetchone()[0], 1
+            )
+        database_bytes = database.read_bytes()
+        output_bytes = output.read_bytes()
+        for secret in (group, secret_url, "NEVER_STORE_THIS", "ALSO_SECRET"):
+            self.assertNotIn(secret.encode(), database_bytes)
+            self.assertNotIn(secret.encode(), output_bytes)
+        if os.name != "nt":
+            self.assertEqual(database.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(output.stat().st_mode & 0o777, 0o600)
+
+        reset_socket = FakeWebSocket([first_event])
+        with patch("linux.event_probe.websockets.connect", return_value=reset_socket):
+            reset_code = asyncio.run(
+                receive_sample(config, group, 1, 1, output, database, reset=True)
+            )
+        self.assertEqual(reset_code, 0)
+        reset_payload = json.loads(output.read_text(encoding="utf-8"))
+        self.assertEqual(reset_payload["events_seen"], 1)
+        self.assertFalse(reset_payload["connection"]["resumed_from_checkpoint"])
+        with sqlite3.connect(database) as checkpoint:
+            self.assertEqual(
+                checkpoint.execute("SELECT count(*) FROM probe_events").fetchone()[0], 1
+            )
+
+    def test_event_probe_normal_close_reconnects_within_deadline(self) -> None:
+        config = self.root / "collector-reconnect.json"
+        output = self.root / "probe-reconnect.json"
+        database = self.root / "probe-reconnect.sqlite3"
+        group = "100000009"
+        config.write_text(
+            json.dumps(
+                {
+                    "onebot": {"ws_url": "ws://synthetic.invalid", "token": "test"},
+                    "storage": {"root": str(self.root / "repository")},
+                }
+            ),
+            encoding="utf-8",
+        )
+        event = {
+            "post_type": "message",
+            "message_type": "group",
+            "group_id": int(group),
+            "message": [
+                {"type": "image", "data": {"file": "image.png", "url": ""}}
+            ],
+            "raw": {"elements": []},
+        }
+
+        class ClosedSocket:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            async def recv(self):
+                raise ConnectionClosedOK(None, None)
+
+        class EventSocket(ClosedSocket):
+            async def recv(self):
+                return json.dumps(event)
+
+        with patch(
+            "linux.event_probe.websockets.connect",
+            side_effect=[ClosedSocket(), EventSocket()],
+        ), patch("linux.event_probe.asyncio.sleep", new_callable=AsyncMock):
+            code = asyncio.run(receive_sample(config, group, 1, 5, output, database))
+        self.assertEqual(code, 0)
+        payload = json.loads(output.read_text(encoding="utf-8"))
+        self.assertEqual(payload["connection"]["attempts"], 2)
+        self.assertEqual(payload["connection"]["disconnects"], 1)
+        self.assertEqual(payload["connection"]["reconnects"], 1)
+        self.assertEqual(payload["connection"]["state"], "complete")
 
     def test_telemetry_cannot_pass_before_full_observation_window(self) -> None:
         database = self.root / "telemetry.sqlite3"
