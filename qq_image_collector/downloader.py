@@ -37,9 +37,18 @@ class DownloadPolicyError(DownloadError):
 
 
 class CdnHttpError(DownloadError):
-    def __init__(self, status_code: int, message: str) -> None:
+    def __init__(
+        self,
+        status_code: int,
+        message: str,
+        *,
+        attempted_statuses: tuple[int, ...] | None = None,
+    ) -> None:
         super().__init__(message)
         self.status_code = int(status_code)
+        self.attempted_statuses = tuple(
+            int(value) for value in (attempted_statuses or (self.status_code,))
+        )
 
 
 class GifDetected(DownloadError):
@@ -106,6 +115,7 @@ class CdnDownloader:
         self.max_bytes = int(max_bytes)
         self.daily_limit = int(daily_limit)
         self.url_preference = url_preference
+        self.last_attempted_statuses: tuple[int, ...] = ()
         self.client = httpx.AsyncClient(
             timeout=httpx.Timeout(timeout_seconds, connect=20),
             follow_redirects=False,
@@ -135,7 +145,9 @@ class CdnDownloader:
         try:
             async with self.client.stream("GET", url) as response:
                 if response.status_code != 200:
-                    if response.status_code == 403:
+                    if response.status_code == 400:
+                        increment_counter(self.connection, "cdn_400")
+                    elif response.status_code == 403:
                         increment_counter(self.connection, "cdn_403")
                     elif response.status_code == 429:
                         increment_counter(self.connection, "cdn_429")
@@ -176,6 +188,7 @@ class CdnDownloader:
             raise
 
     async def process(self, row: sqlite3.Row) -> str:
+        self.last_attempted_statuses = ()
         if self.daily_remaining() <= 0:
             raise DownloadPolicyError("daily CDN download limit reached")
         urls = candidate_urls(row, self.url_preference)
@@ -190,6 +203,7 @@ class CdnDownloader:
             return "expired"
 
         temp_path: Path | None = None
+        attempted_statuses: list[int] = []
         try:
             try:
                 for index, url in enumerate(urls):
@@ -197,9 +211,15 @@ class CdnDownloader:
                         temp_path, _size, _prefix = await self._stream_to_temp(url)
                         break
                     except CdnHttpError as exc:
-                        if exc.status_code in {403, 404, 410} and index + 1 < len(urls):
+                        attempted_statuses.extend(exc.attempted_statuses)
+                        self.last_attempted_statuses = tuple(attempted_statuses)
+                        if exc.status_code in {400, 403, 404, 410} and index + 1 < len(urls):
                             continue
-                        raise
+                        raise CdnHttpError(
+                            exc.status_code,
+                            str(exc),
+                            attempted_statuses=tuple(attempted_statuses),
+                        ) from exc
             except GifDetected:
                 finish_image(
                     self.connection,

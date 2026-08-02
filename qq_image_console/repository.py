@@ -252,6 +252,7 @@ class Repository:
                     "cdn_requests",
                     "cdn_downloads",
                     "cdn_bytes",
+                    "cdn_400",
                     "cdn_403",
                     "cdn_429",
                     "history_calls",

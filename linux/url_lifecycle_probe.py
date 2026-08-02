@@ -5,6 +5,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,10 @@ from qq_image_collector.config import load_settings
 from qq_image_collector.downloader import validate_cdn_url
 from qq_image_collector.events import parse_group_event
 from qq_image_collector.onebot import websocket_settings
+
+
+CONTENT_RANGE = re.compile(r"bytes\s+(?:\d+-\d+|\*)/(?:\d+|\*)", re.IGNORECASE)
+MEDIA_TYPE = re.compile(r"[a-z0-9!#$&^_.+-]+/[a-z0-9!#$&^_.+-]+", re.IGNORECASE)
 
 
 def _atomic_private_json(path: Path, value: Any) -> None:
@@ -44,16 +49,130 @@ def _public_record(record: dict[str, Any]) -> dict[str, Any]:
     return {key: record.get(key) for key in ("id", "kind", "host", "has_rkey", "captured_at")}
 
 
-async def _status(client: httpx.AsyncClient, url: str) -> dict[str, Any]:
+def _safe_response_headers(response: httpx.Response) -> dict[str, Any]:
+    headers = response.headers
+    length_text = headers.get("content-length", "").strip()
+    content_length = int(length_text) if length_text.isdigit() else None
+    range_text = headers.get("content-range", "").strip()
+    content_range = range_text if CONTENT_RANGE.fullmatch(range_text) else None
+    media_type = headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    content_type = media_type if MEDIA_TYPE.fullmatch(media_type) else None
+    accept_ranges = {
+        value.strip().casefold()
+        for value in headers.get("accept-ranges", "").split(",")
+        if value.strip()
+    }
+    transfer_encoding = {
+        value.strip().casefold()
+        for value in headers.get("transfer-encoding", "").split(",")
+        if value.strip()
+    }
+    etag = headers.get("etag", "")
+    location = headers.get("location", "").strip()
+    location_summary: dict[str, Any] = {"present": bool(location)}
+    if location:
+        parsed = urlsplit(location)
+        query = parse_qs(parsed.query, keep_blank_values=True)
+        location_summary.update(
+            {
+                "host": (parsed.hostname or "").lower(),
+                "relative": not bool(parsed.scheme or parsed.netloc),
+                "has_rkey": any(key.casefold() == "rkey" for key in query),
+            }
+        )
+    return {
+        "content_length": content_length,
+        "content_range": content_range,
+        "accept_ranges_bytes": "bytes" in accept_ranges,
+        "content_type": content_type,
+        "transfer_encoding_chunked": "chunked" in transfer_encoding,
+        "etag_sha256": hashlib.sha256(etag.encode("utf-8")).hexdigest() if etag else None,
+        "location": location_summary,
+    }
+
+
+async def _probe_response_headers(
+    client: httpx.AsyncClient,
+    url: str,
+    mode: str,
+) -> dict[str, Any]:
+    if mode not in {"range_get", "plain_get"}:
+        raise ValueError(f"unsupported lifecycle probe mode: {mode}")
+    response: httpx.Response | None = None
+    result: dict[str, Any] = {
+        "method": "GET",
+        "mode": mode,
+        "checked_at": int(time.time()),
+        "http_status": None,
+        "error": None,
+        "body_consumed": False,
+        "response_headers": {},
+    }
     try:
-        async with client.stream(
+        request_headers = {"Range": "bytes=0-0"} if mode == "range_get" else {}
+        request = client.build_request(
             "GET",
             validate_cdn_url(url),
-            headers={"Range": "bytes=0-0"},
-        ) as response:
-            return {"http_status": response.status_code, "error": None}
+            headers=request_headers,
+        )
+        response = await client.send(request, stream=True)
+        result["http_status"] = response.status_code
+        result["response_headers"] = _safe_response_headers(response)
     except (httpx.HTTPError, ValueError) as exc:
-        return {"http_status": None, "error": type(exc).__name__}
+        result["error"] = type(exc).__name__
+    finally:
+        if response is not None:
+            try:
+                await response.aclose()
+            except httpx.HTTPError as exc:
+                result["close_error"] = type(exc).__name__
+    return result
+
+
+async def _paired_probe(client: httpx.AsyncClient, url: str) -> dict[str, Any]:
+    started_at = int(time.time())
+    range_get = await _probe_response_headers(client, url, "range_get")
+    plain_get = await _probe_response_headers(client, url, "plain_get")
+    return {
+        "pair_started_at": started_at,
+        "pair_finished_at": int(time.time()),
+        "range_get": range_get,
+        "plain_get": plain_get,
+    }
+
+
+def _load_report(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        return {"schema": 2, "checks": [], "legacy_schema1_checks": 0}
+    loaded = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(loaded, dict) or not isinstance(loaded.get("checks"), list):
+        raise RuntimeError("URL lifecycle report has an invalid structure")
+    schema = int(loaded.get("schema") or 1)
+    if schema == 1:
+        checks = []
+        for value in loaded["checks"]:
+            if not isinstance(value, dict):
+                continue
+            legacy = dict(value)
+            legacy.update(
+                {
+                    "legacy": True,
+                    "legacy_schema": 1,
+                    "probe_modes": ["range_get"],
+                    "plain_get_recorded": False,
+                }
+            )
+            checks.append(legacy)
+        return {
+            "schema": 2,
+            "checks": checks,
+            "legacy_schema1_checks": len(checks),
+            "migration_note": "schema 1 checks are Range-only; no plain GET result was fabricated",
+        }
+    if schema != 2:
+        raise RuntimeError(f"unsupported URL lifecycle report schema: {schema}")
+    loaded.setdefault("legacy_schema1_checks", 0)
+    return loaded
 
 
 async def check(
@@ -73,14 +192,19 @@ async def check(
         headers={"User-Agent": "Mozilla/5.0"},
     ) as client:
         for record in records:
-            status = await _status(client, str(record.get("url") or ""))
-            results.append(_public_record(record) | status)
-    report = {"schema": 1, "checks": []}
-    if report_path.is_file():
-        loaded = json.loads(report_path.read_text(encoding="utf-8"))
-        if isinstance(loaded, dict) and isinstance(loaded.get("checks"), list):
-            report = loaded
-    report["checks"].append({"label": label, "checked_at": int(time.time()), "results": results})
+            probes = await _paired_probe(client, str(record.get("url") or ""))
+            results.append(_public_record(record) | probes)
+    report = _load_report(report_path)
+    report["checks"].append(
+        {
+            "label": label,
+            "checked_at": int(time.time()),
+            "legacy": False,
+            "probe_modes": ["range_get", "plain_get"],
+            "body_policy": "streamed response headers only; response body was not consumed",
+            "results": results,
+        }
+    )
     _atomic_private_json(report_path, report)
     print(json.dumps(report["checks"][-1], ensure_ascii=False, indent=2))
     if finalize:

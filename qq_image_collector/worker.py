@@ -400,9 +400,31 @@ class CollectorWorker:
         else:
             self._persist_downloader_state(status="running", last_error="CDN 403")
 
+    @staticmethod
+    def _eligible_400_refresh(row: sqlite3.Row) -> bool:
+        if str(row["resolver"] or "") != "event-cdn":
+            return False
+        data = resolver_data(row)
+        if not str(data.get("raw_message_seq") or "").strip():
+            return False
+        has_rkey = bool(
+            data.get("data_url_has_rkey") or data.get("origin_url_has_rkey")
+        )
+        try:
+            expires_at = int(data.get("url_expires_at") or 0)
+        except (TypeError, ValueError):
+            expires_at = 0
+        return has_rkey or (0 < expires_at <= int(time.time()))
+
     async def _process_claimed(self, row: sqlite3.Row) -> None:
+        attempted_statuses: tuple[int, ...] = ()
+        noted_403 = False
         try:
             result = await self.downloader.process(row)
+            attempted_statuses = self.downloader.last_attempted_statuses
+            if 403 in attempted_statuses:
+                self._note_403()
+                noted_403 = True
             self._persist_downloader_state(
                 status="running",
                 last_success_at=int(time.time()),
@@ -410,15 +432,31 @@ class CollectorWorker:
                 last_error=None,
             )
         except CdnHttpError as exc:
-            if exc.status_code == 403:
+            attempted_statuses = exc.attempted_statuses
+            if 403 in attempted_statuses:
                 self._note_403()
-                if not bool(self.runtime("allow_403_history_refresh")):
+                noted_403 = True
+            if exc.status_code in {400, 403}:
+                if exc.status_code == 400 and not self._eligible_400_refresh(row):
                     finish_image(
                         self.connection,
                         row,
                         status="expired",
-                        error="CDN URL returned 403; account-session URL refresh is disabled",
-                        http_status=403,
+                        error="CDN URL returned HTTP 400 without bounded refresh eligibility",
+                        http_status=400,
+                    )
+                    increment_counter(self.connection, "expired")
+                    return
+                if self.runtime("allow_403_history_refresh") is not True:
+                    finish_image(
+                        self.connection,
+                        row,
+                        status="expired",
+                        error=(
+                            f"CDN URL returned {exc.status_code}; "
+                            "account-session URL refresh is disabled"
+                        ),
+                        http_status=exc.status_code,
                     )
                     increment_counter(self.connection, "expired")
                     return
@@ -439,7 +477,7 @@ class CollectorWorker:
                     row,
                     status="expired",
                     error="CDN URL expired and one bounded refresh failed",
-                    http_status=403,
+                    http_status=exc.status_code,
                 )
                 increment_counter(self.connection, "expired")
                 return
@@ -517,6 +555,9 @@ class CollectorWorker:
                 error=type(exc).__name__,
             )
             increment_counter(self.connection, "failed")
+        finally:
+            if not noted_403 and 403 in self.downloader.last_attempted_statuses:
+                self._note_403()
 
     async def download_loop(self) -> None:
         runtime = self.settings["runtime"]

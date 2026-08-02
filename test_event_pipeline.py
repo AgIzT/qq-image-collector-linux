@@ -431,6 +431,51 @@ class EventPipelineTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_cdn_400_falls_back_to_second_allowed_event_url(self) -> None:
+        async def scenario() -> None:
+            event = image_event(
+                url="https://multimedia.nt.qq.com.cn/stale?rkey=old"
+            )
+            event["raw"]["elements"][0]["picElement"]["originImageUrl"] = (
+                "https://gchat.qpic.cn/fresh"
+            )
+            _cursor, items = parse_group_event(event)
+            enqueue_image(self.connection, items[0])
+            requested_hosts: list[str] = []
+
+            async def handler(request: httpx.Request) -> httpx.Response:
+                requested_hosts.append(str(request.url.host))
+                if request.url.host == "multimedia.nt.qq.com.cn":
+                    return httpx.Response(400)
+                return httpx.Response(200, content=a1111_png())
+
+            downloader = CdnDownloader(
+                self.connection, self.root, max_bytes=1024 * 1024, daily_limit=10
+            )
+            await downloader.client.aclose()
+            downloader.client = httpx.AsyncClient(
+                transport=httpx.MockTransport(handler)
+            )
+            self.assertEqual(
+                await downloader.process(claim_next_image(self.connection)),
+                "accepted",
+            )
+            self.assertEqual(
+                requested_hosts,
+                ["multimedia.nt.qq.com.cn", "gchat.qpic.cn"],
+            )
+            counters = self.connection.execute(
+                """
+                SELECT sum(cdn_requests), sum(cdn_downloads),
+                       sum(cdn_400), sum(cdn_403), sum(cdn_429)
+                FROM hourly_counters
+                """
+            ).fetchone()
+            self.assertEqual(tuple(counters), (2, 1, 1, 0, 0))
+            await downloader.close()
+
+        asyncio.run(scenario())
+
     def test_cdn_skips_invalid_preferred_url_and_uses_allowed_fallback(self) -> None:
         async def scenario() -> None:
             event = image_event(url="https://example.invalid/not-qq?rkey=bad")

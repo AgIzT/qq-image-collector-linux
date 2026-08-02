@@ -18,6 +18,7 @@ export type DailyCounters = {
   cdn_requests: number;
   cdn_downloads: number;
   cdn_bytes: number;
+  cdn_400: number;
   cdn_403: number;
   cdn_429: number;
   history_calls: number;

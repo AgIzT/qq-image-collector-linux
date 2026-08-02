@@ -48,6 +48,9 @@ chmod 600 .env
 - 不触发“恢复本次断档”，不创建任何历史任务；
 - `allow_403_history_refresh=false`。
 
+该键沿用旧名称以避免扩大迁移面，实际只控制具备严格到期证据的 HTTP 400/403 单次
+历史刷新；默认关闭，且不通过公网控制台开放。
+
 测试图片放到宿主持久目录 `${QQAI_RUNTIME_ROOT}/diagnostics/`；容器内只读路径为
 `/diagnostics/`。每项测试必须保留命令的完整原始 JSON/终端输出，不能只记录结论。
 输出中不得补写账号、群号、文件名、完整 CDN URL、rkey 或 Prompt。
@@ -176,7 +179,14 @@ sentinel，生产 Worker 从未获得这项能力。
 ./manage.sh url-lifecycle-capture <测试群号>
 ```
 
-该命令会同时完成 T+0。之后必须在实际时间点运行：
+该命令会同时完成新的 schema 2 T+0。每条 URL、每个时间点都顺序执行两次 GET：
+
+- `range_get`：带 `Range: bytes=0-0`；
+- `plain_get`：不带 Range，与生产下载的请求形态一致。
+
+两种请求都用 streaming 模式，只等待响应头并立即关闭；代码不调用 body read/iterator，
+不会主动下载完整响应体。操作系统缓冲可能收到少量已经在途的字节，因此不能声称线上
+绝对传输 0 body。之后必须在实际时间点运行：
 
 ```bash
 ./manage.sh url-lifecycle-check T+1h
@@ -184,8 +194,15 @@ sentinel，生产 Worker 从未获得这项能力。
 ./manage.sh url-lifecycle-check T+24h --finalize
 ```
 
-完整状态矩阵保存在 `repository/state/url_lifecycle.report.json`。最后一步必须输出
-`secret_urls_deleted=true`。不得提前连续执行四次伪造生命周期。
+完整状态矩阵保存在 `repository/state/url_lifecycle.report.json`。每个结果分别包含
+`range_get` 与 `plain_get`，以及两次请求的时间；公开字段只允许 HTTP 状态和白名单化的
+长度、Content-Range、bytes 支持、MIME、chunked、ETag 哈希与脱敏 Location 形态。
+完整 Location、Cookie、Content-Disposition、认证头、未知响应头和正文均不得进入报告。
+
+脚本可以读取旧 schema 1 报告，但旧 check 必须标为 `legacy=true`、
+`plain_get_recorded=false`，不得补造普通 GET。最后一步必须输出
+`secret_urls_deleted=true`。不得提前连续执行四次伪造生命周期。10 条 URL 的完整四时点
+矩阵共 80 次直连 CDN GET，不调用 OneBot HTTP 或账号会话接口。
 
 ## 当前门禁进度（2026-08-02）
 
@@ -198,11 +215,13 @@ sentinel，生产 Worker 从未获得这项能力。
 - ComfyUI workflow 样本的字节和元数据比较通过；
 - NAI 的 Test C 结果是假失败：临时 `.bin/.part` 后缀使 PNG 原始文本扫描被跳过，
   不是 CDN 破坏了 NAI 元数据；
-- Test D 的 T+0 当前为 10 条 Range 探测全部 HTTP 206，待后续时间点和最终审计确认。
+- 旧 Test D 的 T+0 为 10 条 Range 探测全部 HTTP 206；旧 10 条 URL 在 T+1 时，Range
+  GET 与普通 GET 均为 HTTP 400。旧 T+0 缺少普通 GET，只能标为 legacy。
 
 生产保持暂停，六个生产群保持停用。修复为 PNG 魔数驱动后，只重跑 Test C 的三张
 已知源文件，连同已经通过的 ComfyUI 再做一次回归；不重跑 Test B，不再次调用
-`get_image`。Test D 继续按实际 T+1h/T+6h/T+24h 时间点完成。
+`get_image`。严格 Test D 必须用 schema 2 重新捕获 10 条 URL，从新的成对 T+0 开始，
+再按实际 T+1h/T+6h/T+24h 时间点完成。
 
 ## URL preference 与 TTL 决策
 
@@ -214,8 +233,9 @@ sentinel，生产 Worker 从未获得这项能力。
 | 仅 raw `originImageUrl` 字节一致 | `url_preference=raw` |
 | 两路均一致 | 优先无 rkey 且为 `gchat.qpic.cn` 的一路；否则按 Test D 生命周期更长者 |
 | 两路均不一致 | 保持暂停，重新设计链路，不启用生产群 |
-| 无 rkey 的 gchat URL 到 T+24h 均为 200 | 视为当前样本至少存活 24h，不需要 rkey 过期抢救 |
-| rkey URL 到 T+24h 均为 200 | 只能证明 TTL 下限为 24h；保留保守调度并继续观察 |
+| 无 rkey 的 gchat URL 的 `plain_get` 到 T+24h 各时点均为 200 | 视为当前样本至少存活 24h；Range 结果只作辅助 |
+| rkey URL 的 `plain_get` 到 T+24h 各时点均为 200 | 只能证明 TTL 下限为 24h；保留保守调度并继续观察 |
+| Range 仍为 206、但同时间点 `plain_get` 失败 | 对生产普通 GET 不可用，不能通过门禁 |
 | T+6h 前出现失效 | 当前 6h 提示不安全；先按最早失效时间减安全余量改实现，再灰度 |
 | T+1h 或 T+0 已失效 | 不进入灰度 |
 
@@ -295,7 +315,7 @@ A–F 全部通过后，只启用一个灰度群，记录 `rollout_started_at`�
 
 ```text
 events / image_segments / queued_high / queued_medium / queued_low
-cdn_requests / cdn_downloads / cdn_bytes / cdn_403 / cdn_429
+cdn_requests / cdn_downloads / cdn_bytes / cdn_400 / cdn_403 / cdn_429
 history_calls / get_image_blocked
 accepted / rejected / duplicates / failed / expired / filtered_gif
 ```
@@ -314,7 +334,7 @@ accepted / rejected / duplicates / failed / expired / filtered_gif
 - 不增加国内中继、双机下载或 CDN 代理；现有证据不支持“境外 IP/字节量导致风控”。
 - 不恢复 QCE、启动轮询、任意日期回填或连续历史回填。
 - 不允许生产代码调用 `get_image/downloadRichMedia`。
-- 不放宽 OneBot 动作白名单，不把 403 默认转换为历史调用。
+- 不放宽 OneBot 动作白名单，不把 400/403 默认转换为历史调用。
 - 不在 A–F 原始证据不完整时启用原有六群。
 
 ## 日常命令

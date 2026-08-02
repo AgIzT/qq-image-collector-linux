@@ -196,6 +196,272 @@ class WorkerIntegrationTests(unittest.IsolatedAsyncioTestCase):
         await worker.downloader.close()
         worker.connection.close()
 
+    async def test_400_default_never_calls_history_and_expires(self) -> None:
+        worker = CollectorWorker(write_config(self.root, "ws://127.0.0.1:9"))
+
+        async def stale(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(400)
+
+        await worker.downloader.client.aclose()
+        worker.downloader.client = httpx.AsyncClient(
+            transport=httpx.MockTransport(stale)
+        )
+        _cursor, items = parse_group_event(
+            image_event(
+                url="https://multimedia.nt.qq.com.cn/stale-default?rkey=old"
+            )
+        )
+        enqueue_image(worker.connection, items[0])
+        history_calls = 0
+
+        async def history(_action: str, _params: dict) -> dict:
+            nonlocal history_calls
+            history_calls += 1
+            return {"messages": []}
+
+        worker.onebot.call_async = history  # type: ignore[method-assign]
+        await worker._process_claimed(claim_next_image(worker.connection))
+        status, resolver = worker.connection.execute(
+            "SELECT status, resolver_json FROM images"
+        ).fetchone()
+        self.assertEqual(status, "expired")
+        self.assertEqual(json.loads(resolver)["http_status"], 400)
+        self.assertEqual(history_calls, 0)
+        counters = worker.connection.execute(
+            """
+            SELECT sum(cdn_400), sum(expired), sum(failed), sum(history_calls)
+            FROM hourly_counters
+            """
+        ).fetchone()
+        self.assertEqual(tuple(counters), (1, 1, 0, 0))
+        await worker.downloader.close()
+        worker.connection.close()
+
+    async def test_400_with_rkey_refreshes_once_then_new_url_succeeds(self) -> None:
+        worker = CollectorWorker(write_config(self.root, "ws://127.0.0.1:9"))
+        worker.connection.execute(
+            """
+            INSERT INTO app_settings(key, value_json, updated_at)
+            VALUES ('allow_403_history_refresh', 'true', ?)
+            """,
+            (int(time.time()),),
+        )
+        worker.connection.commit()
+
+        async def cdn(request: httpx.Request) -> httpx.Response:
+            if "stale" in request.url.path:
+                return httpx.Response(400)
+            return httpx.Response(200, content=a1111_png())
+
+        await worker.downloader.client.aclose()
+        worker.downloader.client = httpx.AsyncClient(
+            transport=httpx.MockTransport(cdn)
+        )
+        _cursor, items = parse_group_event(
+            image_event(url="https://multimedia.nt.qq.com.cn/stale?rkey=old")
+        )
+        enqueue_image(worker.connection, items[0])
+        history_calls = 0
+
+        async def history(action: str, _params: dict) -> dict:
+            nonlocal history_calls
+            history_calls += 1
+            self.assertEqual(action, "get_group_msg_history")
+            return {
+                "messages": [
+                    image_event(
+                        url="https://multimedia.nt.qq.com.cn/fresh?rkey=new"
+                    )
+                ]
+            }
+
+        worker.onebot.call_async = history  # type: ignore[method-assign]
+        await worker._process_claimed(claim_next_image(worker.connection))
+        queued = worker.connection.execute(
+            "SELECT status, resolver_json FROM images"
+        ).fetchone()
+        flags = json.loads(queued[1])
+        self.assertEqual(queued[0], "queued")
+        self.assertTrue(flags["url_refresh_attempted"])
+        self.assertTrue(flags["url_refreshed"])
+        self.assertEqual(history_calls, 1)
+
+        await worker._process_claimed(claim_next_image(worker.connection))
+        self.assertEqual(
+            worker.connection.execute("SELECT status FROM images").fetchone()[0],
+            "accepted",
+        )
+        self.assertEqual(history_calls, 1)
+        counters = worker.connection.execute(
+            """
+            SELECT sum(history_calls), sum(cdn_requests), sum(cdn_downloads),
+                   sum(cdn_400), sum(expired)
+            FROM hourly_counters
+            """
+        ).fetchone()
+        self.assertEqual(tuple(counters), (1, 2, 1, 1, 0))
+        await worker.downloader.close()
+        worker.connection.close()
+
+    async def test_400_without_expiry_evidence_never_refreshes(self) -> None:
+        worker = CollectorWorker(write_config(self.root, "ws://127.0.0.1:9"))
+        worker.connection.execute(
+            """
+            INSERT INTO app_settings(key, value_json, updated_at)
+            VALUES ('allow_403_history_refresh', 'true', ?)
+            """,
+            (int(time.time()),),
+        )
+        worker.connection.commit()
+
+        async def bad_request(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(400)
+
+        await worker.downloader.client.aclose()
+        worker.downloader.client = httpx.AsyncClient(
+            transport=httpx.MockTransport(bad_request)
+        )
+        _cursor, items = parse_group_event(
+            image_event(url="https://multimedia.nt.qq.com.cn/no-expiry-evidence")
+        )
+        enqueue_image(worker.connection, items[0])
+        history_calls = 0
+
+        async def history(_action: str, _params: dict) -> dict:
+            nonlocal history_calls
+            history_calls += 1
+            return {"messages": []}
+
+        worker.onebot.call_async = history  # type: ignore[method-assign]
+        await worker._process_claimed(claim_next_image(worker.connection))
+        self.assertEqual(history_calls, 0)
+        status, resolver = worker.connection.execute(
+            "SELECT status, resolver_json FROM images"
+        ).fetchone()
+        self.assertEqual(status, "expired")
+        self.assertEqual(json.loads(resolver)["http_status"], 400)
+        self.assertEqual(
+            worker.connection.execute(
+                "SELECT sum(history_calls) FROM hourly_counters"
+            ).fetchone()[0],
+            0,
+        )
+        await worker.downloader.close()
+        worker.connection.close()
+
+    async def test_400_refresh_budget_zero_defers_without_onebot_call(self) -> None:
+        worker = CollectorWorker(write_config(self.root, "ws://127.0.0.1:9"))
+        now = int(time.time())
+        for key, value in (
+            ("allow_403_history_refresh", "true"),
+            ("history_hourly_limit", "0"),
+            ("history_daily_limit", "0"),
+        ):
+            worker.connection.execute(
+                "INSERT INTO app_settings(key, value_json, updated_at) VALUES (?, ?, ?)",
+                (key, value, now),
+            )
+        worker.connection.commit()
+
+        async def stale(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(400)
+
+        await worker.downloader.client.aclose()
+        worker.downloader.client = httpx.AsyncClient(
+            transport=httpx.MockTransport(stale)
+        )
+        _cursor, items = parse_group_event(
+            image_event(
+                url="https://multimedia.nt.qq.com.cn/stale-budget?rkey=old"
+            )
+        )
+        enqueue_image(worker.connection, items[0])
+        history_calls = 0
+
+        async def forbidden_history(_action: str, _params: dict) -> dict:
+            nonlocal history_calls
+            history_calls += 1
+            raise AssertionError("history request must be blocked by the zero budget")
+
+        worker.onebot.call_async = forbidden_history  # type: ignore[method-assign]
+        before = int(time.time())
+        await worker._process_claimed(claim_next_image(worker.connection))
+        status, next_retry = worker.connection.execute(
+            "SELECT status, next_retry_at FROM images"
+        ).fetchone()
+        self.assertEqual(status, "deferred")
+        self.assertGreaterEqual(next_retry, before + 3590)
+        self.assertEqual(history_calls, 0)
+        self.assertEqual(
+            worker.connection.execute(
+                "SELECT sum(history_calls) FROM hourly_counters"
+            ).fetchone()[0],
+            0,
+        )
+        await worker.downloader.close()
+        worker.connection.close()
+
+    async def test_404_and_410_never_call_history(self) -> None:
+        for status_code in (404, 410):
+            with self.subTest(status_code=status_code):
+                case_root = self.root / str(status_code)
+                case_root.mkdir()
+                worker = CollectorWorker(
+                    write_config(case_root, "ws://127.0.0.1:9")
+                )
+                worker.connection.execute(
+                    """
+                    INSERT INTO app_settings(key, value_json, updated_at)
+                    VALUES ('allow_403_history_refresh', 'true', ?)
+                    """,
+                    (int(time.time()),),
+                )
+                worker.connection.commit()
+
+                async def missing(
+                    _request: httpx.Request, code: int = status_code
+                ) -> httpx.Response:
+                    return httpx.Response(code)
+
+                await worker.downloader.client.aclose()
+                worker.downloader.client = httpx.AsyncClient(
+                    transport=httpx.MockTransport(missing)
+                )
+                _cursor, items = parse_group_event(
+                    image_event(
+                        url=(
+                            "https://multimedia.nt.qq.com.cn/"
+                            f"missing-{status_code}?rkey=old"
+                        )
+                    )
+                )
+                enqueue_image(worker.connection, items[0])
+                history_calls = 0
+
+                async def history(_action: str, _params: dict) -> dict:
+                    nonlocal history_calls
+                    history_calls += 1
+                    return {"messages": []}
+
+                worker.onebot.call_async = history  # type: ignore[method-assign]
+                await worker._process_claimed(claim_next_image(worker.connection))
+                self.assertEqual(history_calls, 0)
+                status, resolver = worker.connection.execute(
+                    "SELECT status, resolver_json FROM images"
+                ).fetchone()
+                self.assertEqual(status, "expired")
+                self.assertEqual(
+                    json.loads(resolver)["http_status"], status_code
+                )
+                self.assertEqual(
+                    worker.connection.execute(
+                        "SELECT sum(history_calls) FROM hourly_counters"
+                    ).fetchone()[0],
+                    0,
+                )
+                await worker.downloader.close()
+                worker.connection.close()
+
     async def test_get_image_policy_violation_stops_and_pauses_worker(self) -> None:
         worker = CollectorWorker(write_config(self.root, "ws://127.0.0.1:9"))
         with self.assertRaises(Exception):
@@ -214,15 +480,19 @@ class WorkerIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_429_defers_item_and_opens_one_hour_circuit(self) -> None:
         worker = CollectorWorker(write_config(self.root, "ws://127.0.0.1:9"))
+        requested_hosts: list[str] = []
 
-        async def limited(_request: httpx.Request) -> httpx.Response:
+        async def limited(request: httpx.Request) -> httpx.Response:
+            requested_hosts.append(str(request.url.host))
             return httpx.Response(429)
 
         await worker.downloader.client.aclose()
         worker.downloader.client = httpx.AsyncClient(transport=httpx.MockTransport(limited))
-        _cursor, items = parse_group_event(
-            image_event(url="https://gchat.qpic.cn/limited?rkey=temporary")
+        event = image_event(url="https://gchat.qpic.cn/limited?rkey=temporary")
+        event["raw"]["elements"][0]["picElement"]["originImageUrl"] = (
+            "https://multimedia.nt.qq.com.cn/unused?rkey=temporary"
         )
+        _cursor, items = parse_group_event(event)
         enqueue_image(worker.connection, items[0])
         row = claim_next_image(worker.connection)
         before = int(time.time())
@@ -238,6 +508,59 @@ class WorkerIntegrationTests(unittest.IsolatedAsyncioTestCase):
             "SELECT sum(cdn_429), sum(history_calls) FROM hourly_counters"
         ).fetchone()
         self.assertEqual(tuple(counters), (1, 0))
+        self.assertEqual(requested_hosts, ["gchat.qpic.cn"])
+        await worker.downloader.close()
+        worker.connection.close()
+
+    async def test_fallback_does_not_hide_403_from_circuit_breaker(self) -> None:
+        worker = CollectorWorker(write_config(self.root, "ws://127.0.0.1:9"))
+        requested_hosts: list[str] = []
+
+        async def expired_candidates(request: httpx.Request) -> httpx.Response:
+            requested_hosts.append(str(request.url.host))
+            if request.url.host == "gchat.qpic.cn":
+                return httpx.Response(403)
+            return httpx.Response(400)
+
+        await worker.downloader.client.aclose()
+        worker.downloader.client = httpx.AsyncClient(
+            transport=httpx.MockTransport(expired_candidates)
+        )
+        before = int(time.time())
+        for index in range(3):
+            event = image_event(
+                url=f"https://gchat.qpic.cn/forbidden-{index}?rkey=old"
+            )
+            event["raw"]["msgId"] = str(int(MESSAGE) + index + 1)
+            event["raw"]["msgSeq"] = str(12346 + index)
+            event["raw"]["elements"][0]["picElement"]["originImageUrl"] = (
+                "https://multimedia.nt.qq.com.cn/"
+                f"stale-{index}?rkey=old"
+            )
+            _cursor, items = parse_group_event(event)
+            self.assertTrue(enqueue_image(worker.connection, items[0]))
+            await worker._process_claimed(claim_next_image(worker.connection))
+
+        self.assertEqual(
+            requested_hosts,
+            ["gchat.qpic.cn", "multimedia.nt.qq.com.cn"] * 3,
+        )
+        self.assertEqual(
+            worker.connection.execute(
+                "SELECT count(*) FROM images WHERE status='expired'"
+            ).fetchone()[0],
+            3,
+        )
+        counters = worker.connection.execute(
+            """
+            SELECT sum(cdn_requests), sum(cdn_400), sum(cdn_403),
+                   sum(expired), sum(history_calls)
+            FROM hourly_counters
+            """
+        ).fetchone()
+        self.assertEqual(tuple(counters), (6, 3, 3, 3, 0))
+        self.assertEqual(len(worker.recent_403), 3)
+        self.assertGreaterEqual(worker.circuit_until, before + 3590)
         await worker.downloader.close()
         worker.connection.close()
 

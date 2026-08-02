@@ -42,6 +42,7 @@ COUNTER_COLUMNS = frozenset(
         "cdn_requests",
         "cdn_downloads",
         "cdn_bytes",
+        "cdn_400",
         "cdn_403",
         "cdn_429",
         "history_calls",
@@ -297,6 +298,7 @@ def connect_database(
             cdn_requests INTEGER NOT NULL DEFAULT 0,
             cdn_downloads INTEGER NOT NULL DEFAULT 0,
             cdn_bytes INTEGER NOT NULL DEFAULT 0,
+            cdn_400 INTEGER NOT NULL DEFAULT 0,
             cdn_403 INTEGER NOT NULL DEFAULT 0,
             cdn_429 INTEGER NOT NULL DEFAULT 0,
             history_calls INTEGER NOT NULL DEFAULT 0,
@@ -316,6 +318,7 @@ def connect_database(
         {
             "image_segments": "INTEGER NOT NULL DEFAULT 0",
             "cdn_requests": "INTEGER NOT NULL DEFAULT 0",
+            "cdn_400": "INTEGER NOT NULL DEFAULT 0",
             "expired": "INTEGER NOT NULL DEFAULT 0",
         },
     )

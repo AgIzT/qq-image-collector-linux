@@ -278,7 +278,8 @@ export default function App() {
             <Metric label="队列深度" value={queue.depth} note={`最老 ${formatDuration(queue.oldest_age_seconds)} · ${queue.expiry_urgent} 条临期`} />
             <Metric label="CDN 请求 / 完整下载" value={`${today.cdn_requests} / ${today.cdn_downloads}`} note={formatBytes(today.cdn_bytes)} />
             <Metric label="有效新增" value={today.accepted} note={`${today.duplicates} 个重复`} />
-            <Metric label="CDN 403 / 429" value={`${today.cdn_403} / ${today.cdn_429}`} />
+            <Metric label="CDN 400 / 403" value={`${today.cdn_400} / ${today.cdn_403}`} note="URL 失效候选 / 拒绝" />
+            <Metric label="CDN 429" value={today.cdn_429} note="触发一小时下载熔断" />
             <Metric label="URL 已失效" value={today.expired} note="独立告警，不并入普通失败" />
             <Metric label="历史调用" value={today.history_calls} note="稳态应为 0" />
             <Metric label="拦截 get_image" value={today.get_image_blocked} note="必须始终为 0" />

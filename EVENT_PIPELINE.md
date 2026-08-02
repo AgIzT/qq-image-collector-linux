@@ -42,7 +42,7 @@ queued/deferred -> downloading
 rkey URL 记录 `url_expires_at` 为“保守 6 小时、尚未实测”的调度提示；只有进入
 最后一小时才越过普通优先级。Test D 完成后才能把该提示改成真实 TTL。
 
-候选 URL 按配置顺序逐个做 HTTPS/主机白名单验证。首选非法、403、404 或 410
+候选 URL 按配置顺序逐个做 HTTPS/主机白名单验证。首选非法、400、403、404 或 410
 时先尝试事件已有的第二个合法候选，不产生账号会话请求。5xx/408/425 最多退避
 三次；429 熔断一小时。`expired` 与普通失败分开统计。终态保存两路 URL 指纹，
 后续直接事件或已经发生的有限断档若带来不同 URL，可原地复活；同一 URL 不会
@@ -66,9 +66,10 @@ PNG 原始 `tEXt/iTXt/zTXt` 扫描必须由八字节 PNG 魔数
 - `get_group_msg_history`
 
 `get_image` 在网络前硬拒绝，递增 `get_image_blocked`、设置
-`collector_paused=true`、写 `critical_alarm` 并停止 Worker。403 默认不会刷新
-历史 URL；若将来根据实测显式启用，每图也只允许一次且受每小时 6、每日 20 次
-历史总配额约束。WS 断线超过 3 秒只进行有限断档恢复；历史结果不能更新 live
+`collector_paused=true`、写 `critical_alarm` 并停止 Worker。400/403 默认不会刷新
+历史 URL；只有显式启用、且 400 同时具备 event-cdn、原始消息序号与 rkey/到期证据
+时才允许尝试。每图最多一次，并受每小时 6、每日 20 次历史总配额约束；404/410
+永不触发历史。WS 断线超过 3 秒只进行有限断档恢复；历史结果不能更新 live
 游标。任意日期回填、连续回填、启动轮询和 QCE 均不存在。
 
 `linux/diagnostic_compare.py` 与生产 Worker 隔离：Test B 只有显式危险参数才调用
@@ -80,14 +81,22 @@ CDN 字节/元数据，不调用账号 API。
 `hourly_counters` 分开记录：
 
 - `events`、`image_segments`、`queued_high/medium/low`；
-- `cdn_requests`（所有尝试）、`cdn_downloads`（完整 200）、`cdn_bytes`、403/429；
+- `cdn_requests`（所有尝试）、`cdn_downloads`（完整 200）、`cdn_bytes`、400/403/429；
 - `history_calls`、`get_image_blocked`；
 - accepted、rejected、duplicates、failed、expired、filtered_gif。
 
 Test A 直接独立统计标准段与 raw，不依赖生产解析器；Test D 的完整 URL 只暂存在
-chmod 0600 的诊断文件，T+24h 后删除。Test E 只统计灰度开始后、
+chmod 0600 的诊断文件，T+24h 后删除。Test D 对每条 URL、每个时间点顺序发送成对的
+Range GET（`bytes=0-0`）与不带 Range 的普通 GET；两者都以 streaming 模式只取得响应
+头后立即关闭，应用不得消费响应体。Test E 只统计灰度开始后、
 `resolver='event-cdn'` 的记录。`telemetry_report.py --hours 72` 只有在实际观察时间
 达到 72 小时且 `history_calls=get_image_blocked=0` 时才返回通过。
+
+生命周期公开报告只允许响应状态和严格白名单化的长度、Content-Range、是否支持 bytes、
+MIME、是否 chunked、ETag SHA-256 与脱敏 Location 形态；不得记录任意响应头、完整
+Location、Cookie、文件名、认证信息或正文。schema 1 的历史 Range-only check 可读取并
+标记为 legacy，但禁止伪造缺失的普通 GET 结果。TTL 与生产可用性主要依据普通 GET，
+Range 只作为辅助证据。
 
 Test A 与主动发图诊断分开，以降低用户负担。它必须在 Worker 暂停、所有生产群停用
 时，对一个明确指定的目标群进行只读 WS 被动累计，直到取得不少于 200 个图片段；必须
@@ -125,9 +134,11 @@ NAI 样本的 Test C 失败已经确认为诊断实现假失败：下载字节�
 必须继续暂停；完成 PNG 魔数驱动修复后，只重跑 Test C 的三张已知源做完整回归，不
 重跑 Test B，也绝不再次调用 `get_image`。
 
-Test D 当前 T+0 原始记录为 10 条 Range 请求全部返回 HTTP 206；这是
-`Range: bytes=0-0` 的预期候选结果，仍需随 T+1h/T+6h/T+24h 矩阵及最终审计一起确认。
-记录中不保存或公开账号、群、消息、文件名、完整 URL 或具体哈希值。
+旧 Test D 的 T+0 原始记录为 10 条 Range 请求全部返回 HTTP 206；这只证明当时的
+Range 请求可用。随后已确认旧 10 条 URL 在 T+1 时 Range GET 与普通 GET 均返回 400。
+由于旧 T+0 没有普通 GET 数据，该轮只能作为 legacy 调查证据，不能满足严格 Test D。
+schema 2 上线后必须重新捕获 10 条 URL，从新的成对 T+0 开始完整执行
+T+1h/T+6h/T+24h。记录中不保存或公开账号、群、消息、文件名、完整 URL 或具体哈希值。
 
 ## 镜像、rkey 与清理
 

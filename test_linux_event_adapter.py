@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import io
 import json
 import os
 import sqlite3
@@ -9,9 +10,11 @@ import sys
 import tempfile
 import time
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+import httpx
 from websockets.exceptions import ConnectionClosedOK
 
 from collector_control import set_setting
@@ -20,6 +23,7 @@ from linux.cache_cleanup import cleanup_once
 from linux import event_probe
 from linux.event_probe import receive_sample
 from linux.telemetry_report import report as telemetry_report
+from linux import url_lifecycle_probe
 from qq_image_collector.database import connect_database
 
 
@@ -80,7 +84,7 @@ class LinuxEventAdapterTests(unittest.TestCase):
     def test_compose_is_private_and_pinned(self) -> None:
         compose = (Path(__file__).parent / "linux" / "docker-compose.yml").read_text(encoding="utf-8")
         self.assertIn("sha256:e66a6e52", compose)
-        self.assertEqual(compose.count("qq-ai-image-collector-console:1.1.2-event"), 2)
+        self.assertEqual(compose.count("qq-ai-image-collector-console:1.1.3-event"), 2)
         self.assertNotIn(":3000\"", compose)
         self.assertNotIn(":3001\"", compose)
         self.assertNotIn("40653", compose)
@@ -441,6 +445,156 @@ class LinuxEventAdapterTests(unittest.TestCase):
         self.assertLess(exists_check, sentinel_write)
         self.assertLess(sentinel_write, outbound_call)
         self.assertIn("one-time get_image diagnostic has already been consumed", source)
+
+    def test_lifecycle_probe_pairs_range_and_plain_get_without_reading_bodies(self) -> None:
+        requests: list[httpx.Request] = []
+        streams = []
+
+        class HeaderOnlyStream(httpx.AsyncByteStream):
+            def __init__(self) -> None:
+                self.iterated = False
+                self.closed = False
+
+            async def __aiter__(self):
+                self.iterated = True
+                raise AssertionError("lifecycle probe must not consume a response body")
+                yield b"unreachable"
+
+            async def aclose(self) -> None:
+                self.closed = True
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            stream = HeaderOnlyStream()
+            streams.append(stream)
+            is_range = request.headers.get("range") == "bytes=0-0"
+            return httpx.Response(
+                206 if is_range else 200,
+                request=request,
+                headers={
+                    "Content-Length": "1" if is_range else "98765",
+                    "Content-Range": "bytes 0-0/98765" if is_range else "",
+                    "Accept-Ranges": "bytes",
+                    "Content-Type": "image/png; charset=binary",
+                    "ETag": '"PRIVATE_ETAG"',
+                    "Location": "https://redirect.invalid/object?rkey=DO_NOT_STORE",
+                    "Content-Disposition": 'attachment; filename="PRIVATE.png"',
+                    "Set-Cookie": "PRIVATE_COOKIE=1",
+                },
+                stream=stream,
+            )
+
+        async def run() -> dict:
+            async with httpx.AsyncClient(
+                transport=httpx.MockTransport(handler), follow_redirects=False
+            ) as client:
+                return await url_lifecycle_probe._paired_probe(
+                    client,
+                    "https://multimedia.nt.qq.com.cn/object?rkey=REQUEST_SECRET",
+                )
+
+        result = asyncio.run(run())
+        self.assertEqual(len(requests), 2)
+        self.assertEqual(requests[0].method, "GET")
+        self.assertEqual(requests[0].headers.get("range"), "bytes=0-0")
+        self.assertEqual(requests[1].method, "GET")
+        self.assertNotIn("range", requests[1].headers)
+        self.assertEqual(result["range_get"]["http_status"], 206)
+        self.assertEqual(result["plain_get"]["http_status"], 200)
+        self.assertFalse(result["range_get"]["body_consumed"])
+        self.assertFalse(result["plain_get"]["body_consumed"])
+        self.assertEqual(
+            result["range_get"]["response_headers"]["content_range"],
+            "bytes 0-0/98765",
+        )
+        self.assertEqual(
+            result["plain_get"]["response_headers"]["location"],
+            {
+                "present": True,
+                "host": "redirect.invalid",
+                "relative": False,
+                "has_rkey": True,
+            },
+        )
+        self.assertTrue(all(stream.closed for stream in streams))
+        self.assertFalse(any(stream.iterated for stream in streams))
+        rendered = json.dumps(result)
+        for secret in (
+            "REQUEST_SECRET",
+            "DO_NOT_STORE",
+            "PRIVATE_ETAG",
+            "PRIVATE.png",
+            "PRIVATE_COOKIE",
+        ):
+            self.assertNotIn(secret, rendered)
+
+    def test_lifecycle_schema_one_is_preserved_as_legacy_without_plain_result(self) -> None:
+        secret = self.root / "lifecycle.secret.json"
+        report = self.root / "lifecycle.report.json"
+        private_url = "https://multimedia.nt.qq.com.cn/object?rkey=NEVER_PRINT"
+        secret.write_text(
+            json.dumps(
+                [
+                    {
+                        "id": "public-hash",
+                        "kind": "data_url",
+                        "host": "multimedia.nt.qq.com.cn",
+                        "has_rkey": True,
+                        "captured_at": 1,
+                        "url": private_url,
+                    }
+                ]
+            ),
+            encoding="utf-8",
+        )
+        report.write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "checks": [
+                        {
+                            "label": "T+0",
+                            "checked_at": 2,
+                            "results": [{"id": "public-hash", "http_status": 206}],
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        paired = {
+            "pair_started_at": 3,
+            "pair_finished_at": 4,
+            "range_get": {"http_status": 400, "body_consumed": False},
+            "plain_get": {"http_status": 400, "body_consumed": False},
+        }
+        stdout = io.StringIO()
+        with patch(
+            "linux.url_lifecycle_probe._paired_probe",
+            new_callable=AsyncMock,
+            return_value=paired,
+        ), redirect_stdout(stdout):
+            code = asyncio.run(
+                url_lifecycle_probe.check(secret, report, "T+1h", finalize=True)
+            )
+
+        self.assertEqual(code, 0)
+        self.assertFalse(secret.exists())
+        payload = json.loads(report.read_text(encoding="utf-8"))
+        self.assertEqual(payload["schema"], 2)
+        self.assertEqual(payload["legacy_schema1_checks"], 1)
+        self.assertTrue(payload["checks"][0]["legacy"])
+        self.assertEqual(payload["checks"][0]["probe_modes"], ["range_get"])
+        self.assertFalse(payload["checks"][0]["plain_get_recorded"])
+        self.assertNotIn("plain_get", payload["checks"][0]["results"][0])
+        self.assertFalse(payload["checks"][1]["legacy"])
+        self.assertEqual(
+            payload["checks"][1]["probe_modes"], ["range_get", "plain_get"]
+        )
+        self.assertEqual(payload["checks"][1]["results"][0]["plain_get"]["http_status"], 400)
+        self.assertIn("secret_urls_deleted", stdout.getvalue())
+        self.assertNotIn("NEVER_PRINT", report.read_text(encoding="utf-8"))
+        self.assertNotIn("NEVER_PRINT", stdout.getvalue())
 
 
 if __name__ == "__main__":
