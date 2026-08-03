@@ -508,6 +508,7 @@ def increment_counter(
     amount: int = 1,
     *,
     timestamp: int | None = None,
+    commit: bool = True,
 ) -> None:
     if column not in COUNTER_COLUMNS:
         raise ValueError(f"unknown counter: {column}")
@@ -523,7 +524,10 @@ def increment_counter(
             (int(amount), now, bucket),
         )
 
-    _retry_locked_write(connection, write)
+    if commit:
+        _retry_locked_write(connection, write)
+    else:
+        write()
 
 
 def counter_sum(
@@ -566,7 +570,12 @@ def _priority(item: dict[str, Any]) -> int:
     return 2
 
 
-def enqueue_image(connection: sqlite3.Connection, item: dict[str, Any]) -> bool:
+def enqueue_image(
+    connection: sqlite3.Connection,
+    item: dict[str, Any],
+    *,
+    commit: bool = True,
+) -> bool:
     now = int(time.time())
     priority = _priority(item)
     resolver_data = dict(item.get("resolver_data") or {})
@@ -648,8 +657,13 @@ def enqueue_image(connection: sqlite3.Connection, item: dict[str, Any]) -> bool:
                     image_index,
                 ),
             )
-            connection.commit()
-            increment_counter(connection, ("queued_high", "queued_medium", "queued_low")[priority])
+            if commit:
+                connection.commit()
+            increment_counter(
+                connection,
+                ("queued_high", "queued_medium", "queued_low")[priority],
+                commit=commit,
+            )
             return True
     connection.execute(
         """
@@ -722,10 +736,15 @@ def enqueue_image(connection: sqlite3.Connection, item: dict[str, Any]) -> bool:
             int(item.get("discovered_at") or now),
         ),
     )
-    connection.commit()
+    if commit:
+        connection.commit()
     inserted = existed is None
     if inserted:
-        increment_counter(connection, ("queued_high", "queued_medium", "queued_low")[priority])
+        increment_counter(
+            connection,
+            ("queued_high", "queued_medium", "queued_low")[priority],
+            commit=commit,
+        )
     return inserted
 
 

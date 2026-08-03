@@ -683,9 +683,9 @@ class WindowRecoveryRunner:
                 item_time = int(item.get("sent_at") or 0)
                 if not (self.not_before <= item_time <= self.not_after):
                     raise WindowPolicyError("parser emitted an out-of-window image")
-                if enqueue_image(self.connection, item):
-                    increment_counter(self.connection, "images_seen")
-                    increment_counter(self.connection, "image_segments")
+                if enqueue_image(self.connection, item, commit=False):
+                    increment_counter(self.connection, "images_seen", commit=False)
+                    increment_counter(self.connection, "image_segments", commit=False)
                     images_enqueued += 1
                 else:
                     duplicates += 1

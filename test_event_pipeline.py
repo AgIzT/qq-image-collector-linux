@@ -22,6 +22,7 @@ from qq_image_collector.database import (
     enqueue_image,
     finish_image,
     get_runtime_state,
+    increment_counter,
     queue_snapshot,
 )
 from qq_image_collector.downloader import CdnDownloader, validate_cdn_url
@@ -223,6 +224,27 @@ class EventPipelineTests(unittest.TestCase):
         self.assertEqual(claimed["message_id"], older_items[0]["message_id"])
         self.assertEqual(snapshot["depth"], 2)
         self.assertNotIn("json_extract", "\n".join(statements).casefold())
+
+    def test_batched_enqueue_and_counters_share_one_transaction(self) -> None:
+        _cursor, items = parse_group_event(
+            image_event(url="https://gchat.qpic.cn/batched?rkey=secret")
+        )
+        self.assertTrue(enqueue_image(self.connection, items[0], commit=False))
+        increment_counter(self.connection, "images_seen", commit=False)
+        self.assertEqual(
+            self.connection.execute("SELECT count(*) FROM images").fetchone()[0],
+            1,
+        )
+        self.connection.rollback()
+        self.assertEqual(
+            self.connection.execute("SELECT count(*) FROM images").fetchone()[0],
+            0,
+        )
+        counters = self.connection.execute(
+            "SELECT coalesce(sum(images_seen), 0), coalesce(sum(queued_high), 0) "
+            "FROM hourly_counters"
+        ).fetchone()
+        self.assertEqual(tuple(counters), (0, 0))
 
     def test_queue_columns_migrate_once_from_resolver_json(self) -> None:
         self.connection.close()

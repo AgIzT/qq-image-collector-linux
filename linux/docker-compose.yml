@@ -139,7 +139,7 @@ services:
       - --page-size
       - "20"
       - --interval-seconds
-      - "60"
+      - "0"
       - --hourly-limit
       - "0"
       - --daily-limit
