@@ -80,7 +80,8 @@ class Repository:
                     'daily_download_limit', 'history_hourly_limit',
                     'history_daily_limit', 'history_max_pages_per_gap',
                     'allow_403_history_refresh', 'cdn_403_window_seconds',
-                    'cdn_403_trip_count', 'cdn_circuit_seconds'
+                    'cdn_403_trip_count', 'cdn_circuit_seconds',
+                    'production_history_floor', 'production_live_only_started_at'
                 )
                 """
             )

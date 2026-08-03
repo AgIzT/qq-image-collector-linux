@@ -58,6 +58,7 @@ class LinuxEventAdapterTests(unittest.TestCase):
 
         # Obsolete quota values from an older deployment are removed.
         collector["runtime"]["daily_download_limit"] = 600
+        collector["runtime"]["cdn_429_pause_seconds"] = 3600
         collector_path.write_text(json.dumps(collector), encoding="utf-8")
 
         manager_path = self.runtime / "manager" / "manager_config.json"
@@ -73,6 +74,7 @@ class LinuxEventAdapterTests(unittest.TestCase):
         prepare(self.root, [], runtime_root=self.runtime)
         collector_after = json.loads(collector_path.read_text(encoding="utf-8"))
         self.assertNotIn("daily_download_limit", collector_after["runtime"])
+        self.assertEqual(collector_after["runtime"]["cdn_429_pause_seconds"], 300)
         manager_after = json.loads(manager_path.read_text(encoding="utf-8"))
         self.assertTrue(manager_after["direct_public_enabled"])
         self.assertEqual(manager_after["direct_public_hosts"], ["status.example.invalid"])

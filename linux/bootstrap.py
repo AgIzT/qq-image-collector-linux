@@ -201,6 +201,7 @@ def reconcile_collector(path: Path, requested_groups: list[str]) -> bool:
     existing_runtime = existing.get("runtime")
     if isinstance(existing_runtime, dict):
         forced = {
+            "cdn_429_pause_seconds",
             "event_state_heartbeat_seconds",
             "worker_restart_delay_seconds",
             "worker_heartbeat_seconds",
