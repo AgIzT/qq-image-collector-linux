@@ -15,10 +15,8 @@ import httpx
 from metadata_reader import extension_for_format, inspect_image
 
 from .database import (
-    counter_sum,
     finish_image,
     increment_counter,
-    local_day_start,
     sha256_file,
     store_asset,
 )
@@ -126,8 +124,9 @@ class CdnDownloader:
         await self.client.aclose()
 
     def daily_remaining(self) -> int:
-        used = counter_sum(self.connection, "cdn_requests", local_day_start())
-        return max(0, self.daily_limit - used)
+        # Kept for API compatibility with older status/tests. Collection no
+        # longer has a request quota, regardless of a stale configured value.
+        return 2**63 - 1
 
     async def _stream_to_temp(self, url: str) -> tuple[Path, int, bytes]:
         url = validate_cdn_url(url)
@@ -138,9 +137,7 @@ class CdnDownloader:
         path = Path(name)
         size = 0
         prefix = bytearray()
-        # Count every outbound CDN request, including 403/429/timeouts.  The
-        # daily guard is an operational runaway limiter, while cdn_downloads
-        # below counts only complete non-empty 200 responses.
+        # Count every outbound CDN request, including 403/429/timeouts.
         increment_counter(self.connection, "cdn_requests")
         try:
             async with self.client.stream("GET", url) as response:
@@ -189,8 +186,6 @@ class CdnDownloader:
 
     async def process(self, row: sqlite3.Row) -> str:
         self.last_attempted_statuses = ()
-        if self.daily_remaining() <= 0:
-            raise DownloadPolicyError("daily CDN download limit reached")
         urls = candidate_urls(row, self.url_preference)
         if not urls:
             finish_image(

@@ -135,21 +135,17 @@ def collector_config(groups: list[str]) -> dict[str, Any]:
             "accelerated_interval_seconds": 5,
             "accelerate_queue_age_seconds": 1800,
             "resume_normal_queue_age_seconds": 900,
-            "daily_download_limit": 3000,
             "max_download_bytes": 128 * 1024 * 1024,
             "url_preference": "data",
             "url_expiry_urgent_seconds": 3600,
             "ws_ping_interval_seconds": 30,
+            "event_state_heartbeat_seconds": 10,
             "ws_disconnect_gap_seconds": 3,
             "history_page_size": 20,
-            "history_max_pages_per_gap": 5,
-            "history_hourly_limit": 6,
-            "history_daily_limit": 20,
-            "cdn_403_window_seconds": 600,
-            "cdn_403_trip_count": 3,
-            "cdn_circuit_seconds": 3600,
-            "cdn_429_pause_seconds": 3600,
-            "allow_403_history_refresh": False,
+            "history_page_interval_seconds": 2,
+            "cdn_429_pause_seconds": 300,
+            "worker_restart_delay_seconds": 5,
+            "worker_heartbeat_seconds": 10,
         },
     }
 
@@ -204,12 +200,15 @@ def reconcile_collector(path: Path, requested_groups: list[str]) -> bool:
                 payload["storage"][key] = existing_storage[key]
     existing_runtime = existing.get("runtime")
     if isinstance(existing_runtime, dict):
+        forced = {
+            "event_state_heartbeat_seconds",
+            "worker_restart_delay_seconds",
+            "worker_heartbeat_seconds",
+        }
         for key in tuple(payload["runtime"]):
             if key in existing_runtime:
-                value = existing_runtime[key]
-                if key == "daily_download_limit" and value == 600:
-                    value = 3000
-                payload["runtime"][key] = value
+                if key not in forced:
+                    payload["runtime"][key] = existing_runtime[key]
     return atomic_json(path, payload, force=True)
 
 

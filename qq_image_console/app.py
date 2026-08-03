@@ -15,7 +15,7 @@ from urllib.parse import urlparse
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from . import __version__
 from .config import ConsoleConfig
@@ -47,12 +47,11 @@ class GroupCreate(BaseModel):
 
 
 class SettingsPatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     download_interval_seconds: int | None = Field(default=None, ge=5, le=3600)
     download_jitter_seconds: int | None = Field(default=None, ge=0, le=60)
-    daily_download_limit: int | None = Field(default=None, ge=1, le=10000)
     url_preference: Literal["data", "raw"] | None = None
-    history_hourly_limit: int | None = Field(default=None, ge=0, le=100)
-    history_daily_limit: int | None = Field(default=None, ge=0, le=1000)
     collector_paused: bool | None = None
 
 
@@ -75,25 +74,45 @@ class AppContext:
     publisher: SnapshotPublisher | None = None
 
     def status(self) -> dict[str, Any]:
+        now = int(time.time())
         health = self.health.snapshot()
         services = dict(health["services"])
-        services["worker"] = self.supervisor.worker_status()
         statistics = self.repository.stats()
         event_state = statistics.get("events") or {}
         downloader = statistics.get("downloader") or {}
+        worker_runtime = statistics.get("worker") or {}
         queue = statistics.get("queue") or {}
         downloader_status = str(downloader.get("status") or "idle")
-        services["event_stream"] = {
-            "healthy": bool(event_state.get("connected")),
+        pid_state = self.supervisor.worker_status()
+        worker_heartbeat = int(worker_runtime.get("heartbeat_at") or 0)
+        worker_fresh = worker_heartbeat > 0 and now - worker_heartbeat <= 30
+        services["worker"] = {
+            **pid_state,
+            "healthy": bool(pid_state.get("healthy")) and worker_fresh,
             "detail": (
-                f"已连接，最后事件 {event_state.get('last_event_at') or '尚无'}"
+                str(pid_state.get("detail"))
+                if worker_fresh
+                else f"Worker 心跳已停止，最后 {worker_heartbeat or '从未'}"
+            ),
+        }
+        last_event_at = int(event_state.get("last_event_at") or 0)
+        event_heartbeat = int(event_state.get("heartbeat_at") or 0)
+        event_fresh = event_heartbeat > 0 and now - event_heartbeat <= 30
+        services["event_stream"] = {
+            "healthy": bool(event_state.get("connected")) and event_fresh and worker_fresh,
+            "detail": (
+                f"连接心跳正常，最后消息 {last_event_at or '尚无'}"
+                if event_state.get("connected") and event_fresh and worker_fresh
+                else f"连接心跳已过期，最后 {event_heartbeat or '从未'}"
                 if event_state.get("connected")
                 else str(event_state.get("last_error") or "未连接")
             ),
         }
+        downloader_heartbeat = int(downloader.get("heartbeat_at") or 0)
+        downloader_fresh = downloader_heartbeat > 0 and now - downloader_heartbeat <= 30
         services["downloader"] = {
-            "healthy": downloader_status not in {"circuit_open", "error"},
-            "detail": downloader_status,
+            "healthy": downloader_fresh,
+            "detail": downloader_status if downloader_fresh else "下载循环心跳已停止",
         }
         services["queue"] = {
             "healthy": int(queue.get("oldest_age_seconds") or 0) < 7200,
@@ -102,9 +121,13 @@ class AppContext:
                 f"最老 {int(queue.get('oldest_age_seconds') or 0)} 秒"
             ),
         }
-        services["circuit"] = {
-            "healthy": downloader_status != "circuit_open",
-            "detail": str(downloader.get("reason") or "未熔断"),
+        services["recovery"] = {
+            "healthy": bool(services["worker"]["healthy"]),
+            "detail": (
+                "断线或重启后自动从各群持久游标向前补齐"
+                if services["worker"]["healthy"]
+                else "Worker 恢复后将自动补齐断档"
+            ),
         }
         groups = self.repository.list_groups()
         return {
@@ -116,7 +139,7 @@ class AppContext:
             "statistics": statistics,
             "groups": groups,
             "jobs": self.repository.list_jobs(30),
-            "setup": self.repository.setup_status(),
+            "setup": self.repository.setup_status(groups),
             "remote": {
                 "enabled": self.config.remote_enabled,
                 "public_origin": self.config.remote_public_origin,
@@ -128,7 +151,7 @@ class AppContext:
         complete = self.status()
         health = {"account": complete.get("account")}
         services = complete["services"]
-        groups = self.repository.list_groups()
+        groups = complete["groups"]
         action = self.supervisor.action()
         return {
             "schema_version": 2,
@@ -374,7 +397,10 @@ def create_app(
                 )
             except Exception:
                 pass
-        response.headers["Cache-Control"] = "no-store"
+        if request.url.path.startswith("/assets/"):
+            response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        else:
+            response.headers["Cache-Control"] = "no-store"
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Referrer-Policy"] = "no-referrer"
         response.headers["X-Frame-Options"] = "DENY"
@@ -553,11 +579,11 @@ def create_app(
         dependencies=[Depends(require_mutation)],
     )
     def recover_gap(group_id: str) -> JSONResponse:
-        del group_id
-        return JSONResponse(
-            status_code=status.HTTP_410_GONE,
-            content={"detail": "普通断档恢复已停用；历史只允许内部限定时间窗口任务。"},
-        )
+        try:
+            job_id = context.repository.create_job(group_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return JSONResponse(status_code=status.HTTP_202_ACCEPTED, content={"job_id": job_id})
 
     @app.get("/api/v1/jobs", dependencies=[Depends(require_auth)])
     def jobs() -> list[dict[str, Any]]:
@@ -576,10 +602,7 @@ def create_app(
             allowed = {
                 "download_interval_seconds",
                 "download_jitter_seconds",
-                "daily_download_limit",
                 "url_preference",
-                "history_hourly_limit",
-                "history_daily_limit",
                 "collector_paused",
             }
             return {key: value for key, value in values.items() if key in allowed} | {
@@ -597,10 +620,7 @@ def create_app(
             allowed = {
                 "download_interval_seconds",
                 "download_jitter_seconds",
-                "daily_download_limit",
                 "url_preference",
-                "history_hourly_limit",
-                "history_daily_limit",
                 "collector_paused",
             }
             forbidden = sorted(set(values) - allowed)

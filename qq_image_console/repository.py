@@ -33,6 +33,7 @@ class Repository:
         self.config = config
         self._cache_lock = threading.Lock()
         self._stats_cache: tuple[float, dict[str, Any]] | None = None
+        self._groups_cache: tuple[float, list[dict[str, Any]]] | None = None
         self.bootstrap()
 
     def connect(self) -> sqlite3.Connection:
@@ -65,24 +66,36 @@ class Repository:
             for key in (
                 "download_interval_seconds",
                 "download_jitter_seconds",
-                "daily_download_limit",
                 "url_preference",
-                "history_hourly_limit",
-                "history_daily_limit",
                 "collector_paused",
             ):
                 current = get_setting(connection, key, None)
                 if current is None:
                     value = runtime.get(key, DEFAULT_RUNTIME[key])
-                    if key == "daily_download_limit" and value == 600:
-                        value = 3000
                     set_setting(connection, key, value)
-                elif key == "daily_download_limit" and current == 600:
-                    set_setting(connection, key, 3000)
+            connection.execute(
+                """
+                DELETE FROM app_settings
+                WHERE key IN (
+                    'daily_download_limit', 'history_hourly_limit',
+                    'history_daily_limit', 'history_max_pages_per_gap',
+                    'allow_403_history_refresh', 'cdn_403_window_seconds',
+                    'cdn_403_trip_count', 'cdn_circuit_seconds'
+                )
+                """
+            )
+            connection.commit()
             if get_setting(connection, "setup_completed", None) is None:
                 set_setting(connection, "setup_completed", bool(settings.get("groups")))
 
-    def list_groups(self) -> list[dict[str, Any]]:
+    def _invalidate_groups(self) -> None:
+        with self._cache_lock:
+            self._groups_cache = None
+
+    def list_groups(self, force: bool = False) -> list[dict[str, Any]]:
+        with self._cache_lock:
+            if not force and self._groups_cache and time.time() - self._groups_cache[0] < 5:
+                return [dict(row) for row in self._groups_cache[1]]
         with closing(self.connect()) as connection:
             rows = connection.execute(
                 """
@@ -111,7 +124,10 @@ class Repository:
                 ORDER BY g.enabled DESC, g.created_at, g.group_id
                 """
             ).fetchall()
-            return [dict(row) for row in rows]
+            result = [dict(row) for row in rows]
+        with self._cache_lock:
+            self._groups_cache = (time.time(), result)
+        return [dict(row) for row in result]
 
     def upsert_group(self, group_id: str, display_name: str | None = None) -> None:
         with closing(self.connect()) as connection:
@@ -123,6 +139,7 @@ class Repository:
             set_group_enabled(connection, group_id, True, display_name)
             if enabled_before == 0:
                 set_setting(connection, "rollout_started_at", int(time.time()))
+        self._invalidate_groups()
 
     def disable_group(self, group_id: str) -> None:
         with closing(self.connect()) as connection:
@@ -139,6 +156,7 @@ class Repository:
             )
             if enabled_after == 0:
                 set_setting(connection, "rollout_started_at", None)
+        self._invalidate_groups()
 
     def update_group_names(self, rows: list[dict[str, Any]]) -> None:
         now = int(time.time())
@@ -152,12 +170,14 @@ class Repository:
                         (name, now, group_id),
                     )
             connection.commit()
+        self._invalidate_groups()
 
     def create_job(self, group_id: str, _mode: str = "gap_recovery") -> int:
         with closing(self.connect()) as connection:
             configured = connection.execute(
                 """
-                SELECT g.enabled, r.last_message_id, r.last_message_seq
+                SELECT g.enabled, r.last_message_id, r.last_message_seq,
+                       r.last_message_time
                 FROM monitored_groups g
                 LEFT JOIN group_runtime r ON r.group_id=g.group_id
                 WHERE g.group_id=?
@@ -166,7 +186,11 @@ class Repository:
             ).fetchone()
             if not configured or not int(configured[0]):
                 raise ValueError("group is not enabled")
-            if not str(configured[1] or "") or not str(configured[2] or ""):
+            if (
+                not str(configured[1] or "")
+                or not str(configured[2] or "")
+                or int(configured[3] or 0) <= 0
+            ):
                 raise ValueError("group has not received an event cursor yet")
             return enqueue_job(connection, "gap_recovery", str(group_id))
 
@@ -195,14 +219,12 @@ class Repository:
                 for key in (
                     "download_interval_seconds",
                     "download_jitter_seconds",
-                    "daily_download_limit",
                     "url_preference",
-                    "history_hourly_limit",
-                    "history_daily_limit",
                     "collector_paused",
                 )
             }
         return values | {
+            "unlimited_collection": True,
             "storage_root": str(self.config.storage_root()),
             "deployment_mode": self.config.deployment_mode,
             "external_services": self.config.external_services,
@@ -212,10 +234,7 @@ class Repository:
         allowed = {
             "download_interval_seconds",
             "download_jitter_seconds",
-            "daily_download_limit",
             "url_preference",
-            "history_hourly_limit",
-            "history_daily_limit",
             "collector_paused",
         }
         invalid = set(values) - allowed
@@ -228,7 +247,7 @@ class Repository:
 
     def stats(self, force: bool = False) -> dict[str, Any]:
         with self._cache_lock:
-            if not force and self._stats_cache and time.time() - self._stats_cache[0] < 1.0:
+            if not force and self._stats_cache and time.time() - self._stats_cache[0] < 2.0:
                 return dict(self._stats_cache[1])
         with closing(self.connect()) as connection:
             unique_images = int(connection.execute("SELECT count(*) FROM assets").fetchone()[0])
@@ -280,15 +299,17 @@ class Repository:
                 "today": counters,
                 "events": get_runtime_state(connection, "event_stream", {}),
                 "downloader": get_runtime_state(connection, "downloader", {}),
+                "worker": get_runtime_state(connection, "worker", {}),
                 "window_recovery": get_runtime_state(connection, "window_recovery", {}),
             }
         with self._cache_lock:
             self._stats_cache = (time.time(), payload)
         return dict(payload)
 
-    def setup_status(self) -> dict[str, Any]:
+    def setup_status(self, groups: list[dict[str, Any]] | None = None) -> dict[str, Any]:
         settings = self.config.collector_settings()
         onebot = settings.get("onebot", {})
+        configured_groups = groups if groups is not None else self.list_groups()
         checks = [
             {
                 "key": "collector_config",
@@ -317,8 +338,8 @@ class Repository:
             {
                 "key": "groups",
                 "label": "监听群聊",
-                "ok": any(bool(row.get("enabled")) for row in self.list_groups()),
-                "detail": "已配置" if self.list_groups() else "尚未选择",
+                "ok": any(bool(row.get("enabled")) for row in configured_groups),
+                "detail": "已配置" if configured_groups else "尚未选择",
             },
         ]
         with closing(self.connect()) as connection:

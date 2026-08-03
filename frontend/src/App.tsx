@@ -65,15 +65,15 @@ const labels: Record<string, string> = {
   idle: "空闲", running: "运行中", connected: "已连接", disconnected: "已断开",
   queued: "排队中", cancelled: "已取消", completed: "已完成", failed: "失败",
   error: "异常", paused: "已暂停", recovered: "已恢复", incomplete: "未完全恢复",
-  no_gap: "无断档", downloading: "下载中", circuit_open: "已熔断", receiving: "接收中",
+  no_gap: "无断档", downloading: "下载中", receiving: "接收中",
   recovering: "恢复中", complete: "已恢复", partial: "部分恢复", deferred: "已延后",
 };
 
 function StatusPill({ value, good }: { value: string | null | undefined; good?: boolean }) {
   const normalized = value || "idle";
-  const tone = good || ["connected", "completed", "recovered", "no_gap"].includes(normalized)
+  const tone = good || ["connected", "completed", "complete", "recovered", "receiving", "no_gap"].includes(normalized)
     ? "good"
-    : ["failed", "error", "incomplete", "circuit_open", "disconnected"].includes(normalized)
+    : ["failed", "error", "incomplete", "disconnected"].includes(normalized)
       ? "bad"
       : ["running", "queued", "downloading"].includes(normalized) ? "active" : "neutral";
   return <span className={`pill ${tone}`}>{labels[normalized] ?? normalized}</span>;
@@ -160,8 +160,20 @@ export default function App() {
     if (!authorized) return;
     const source = new EventSource("/api/v1/events", { withCredentials: true });
     source.addEventListener("status", (event) => setDashboard(JSON.parse((event as MessageEvent).data) as DashboardStatus));
-    const fallback = window.setInterval(() => void refresh().catch(() => undefined), 7000);
-    return () => { source.close(); window.clearInterval(fallback); };
+    let fallback: number | null = null;
+    source.onopen = () => {
+      if (fallback !== null) window.clearInterval(fallback);
+      fallback = null;
+    };
+    source.onerror = () => {
+      if (fallback === null) {
+        fallback = window.setInterval(() => void refresh().catch(() => undefined), 7000);
+      }
+    };
+    return () => {
+      source.close();
+      if (fallback !== null) window.clearInterval(fallback);
+    };
   }, [authorized, refresh]);
 
   useEffect(() => {
@@ -205,16 +217,21 @@ export default function App() {
     catch (error) { notify(error instanceof Error ? error.message : "取消失败"); }
   };
 
+  const recoverGap = async (groupId: string) => {
+    try {
+      await api(`/api/v1/groups/${groupId}/recover-gap`, { method: "POST", body: "{}" });
+      notify(`群 ${groupId} 的断档恢复已排队`);
+      await refresh();
+    } catch (error) { notify(error instanceof Error ? error.message : "恢复任务创建失败"); }
+  };
+
   const saveSettings = async (event: FormEvent) => {
     event.preventDefault(); if (!settings) return;
     try {
       const payload = {
         download_interval_seconds: settings.download_interval_seconds,
         download_jitter_seconds: settings.download_jitter_seconds,
-        daily_download_limit: settings.daily_download_limit,
         url_preference: settings.url_preference,
-        history_hourly_limit: settings.history_hourly_limit,
-        history_daily_limit: settings.history_daily_limit,
         collector_paused: settings.collector_paused,
       };
       setSettings(await api<Settings>("/api/v1/settings", { method: "PATCH", body: JSON.stringify(payload) }));
@@ -244,14 +261,14 @@ export default function App() {
       <aside className="sidebar">
         <div className="brand"><div className="brand-mark">AI</div><div><strong>原图采集</strong><small>EVENT PIPELINE</small></div></div>
         <nav>{([
-          ["overview", "运行总览", "⌂"], ["groups", "监听群聊", "◎"], ["jobs", "断档任务", "↺"], ["settings", "限速设置", "⚙"],
+          ["overview", "运行总览", "⌂"], ["groups", "监听群聊", "◎"], ["jobs", "断档任务", "↺"], ["settings", "采集设置", "⚙"],
           ...(!remoteMode ? [["logs", "运行日志", "≡"]] : []),
         ] as [View, string, string][]).map(([key, label, icon]) => <button key={key} className={view === key ? "active" : ""} onClick={() => setView(key)}><span>{icon}</span>{label}</button>)}</nav>
         <div className="sidebar-footer"><span className={`live-dot ${workerRunning ? "on" : ""}`} /><div><strong>{workerRunning ? "事件采集中" : "Worker 已停止"}</strong><small>{accountName}</small></div></div>
       </aside>
 
       <main className="content">
-        <header className="topbar"><div><p className="eyebrow">QQ AI IMAGE COLLECTOR</p><h1>{{ overview: "运行总览", groups: "监听群聊", jobs: "断档恢复任务", settings: "限速与断路器", logs: "运行日志" }[view]}</h1></div><div className="top-actions"><button className="secondary" onClick={() => void systemAction("restart")}>重启 Worker</button>{workerRunning ? <button className="danger" onClick={() => void systemAction("stop")}>停止 Worker</button> : <button className="primary" onClick={() => void systemAction("start")}>启动 Worker</button>}</div></header>
+        <header className="topbar"><div><p className="eyebrow">QQ AI IMAGE COLLECTOR</p><h1>{{ overview: "运行总览", groups: "监听群聊", jobs: "断档恢复任务", settings: "采集设置", logs: "运行日志" }[view]}</h1></div><div className="top-actions"><button className="secondary" onClick={() => void systemAction("restart")}>重启 Worker</button>{workerRunning ? <button className="danger" onClick={() => void systemAction("stop")}>停止 Worker</button> : <button className="primary" onClick={() => void systemAction("start")}>启动 Worker</button>}</div></header>
 
         {remoteMode && <section className="remote-banner"><div><strong>Cloudflare Access 远程会话</strong><small>{session?.identity?.email}</small></div><span>控制权限受 Token、CSRF 与身份验证保护</span></section>}
         {dashboard.action.status !== "idle" && <section className={`action-banner ${dashboard.action.status}`}><div className={dashboard.action.status === "running" ? "spinner" : "action-icon"}>{dashboard.action.status === "completed" ? "✓" : dashboard.action.status === "failed" ? "!" : ""}</div><div><strong>{dashboard.action.message || "系统操作"}</strong><small>{dashboard.action.error || dashboard.action.stage || ""}</small></div></section>}
@@ -261,7 +278,7 @@ export default function App() {
           <section className="service-grid">
             <ServiceCard title="NapCat" state={dashboard.services.napcat} /><ServiceCard title="OneBot HTTP" state={dashboard.services.onebot} />
             <ServiceCard title="OneBot WS" state={dashboard.services.event_stream} /><ServiceCard title="持久队列" state={dashboard.services.queue} />
-            <ServiceCard title="CDN 下载器" state={dashboard.services.downloader} /><ServiceCard title="接口断路器" state={dashboard.services.circuit} />
+            <ServiceCard title="CDN 下载器" state={dashboard.services.downloader} /><ServiceCard title="自动断档恢复" state={dashboard.services.recovery} />
           </section>
           <section className="section-heading"><div><p className="eyebrow">TODAY</p><h2>事件与 CDN 链路</h2></div></section>
           <section className="metric-grid">
@@ -270,9 +287,9 @@ export default function App() {
             <Metric label="CDN 请求 / 完整下载" value={`${today.cdn_requests} / ${today.cdn_downloads}`} note={formatBytes(today.cdn_bytes)} />
             <Metric label="有效新增" value={today.accepted} note={`${today.duplicates} 个重复`} />
             <Metric label="CDN 400 / 403" value={`${today.cdn_400} / ${today.cdn_403}`} note="URL 失效候选 / 拒绝" />
-            <Metric label="CDN 429" value={today.cdn_429} note="触发一小时下载熔断" />
+            <Metric label="CDN 429" value={today.cdn_429} note="仅延后当前图片，其他任务继续" />
             <Metric label="URL 已失效" value={today.expired} note="独立告警，不并入普通失败" />
-            <Metric label="历史调用" value={today.history_calls} note={`窗口补漏 ${today.window_history_calls ?? 0}`} />
+            <Metric label="历史调用" value={today.history_calls} note={`仅断档/URL恢复 · 窗口补漏 ${today.window_history_calls ?? 0}`} />
             <Metric
               label="限定窗口补漏"
               value={`${Number(windowRecovery.groups_terminal ?? 0)} / ${Number(windowRecovery.groups_total ?? 0)}`}
@@ -297,18 +314,18 @@ export default function App() {
           <section className="group-list">{dashboard.groups.map((group) => <GroupCard key={group.group_id} group={group} onDisable={(id) => void disableGroup(id)} onEnable={(id, name) => void addGroup(id, name)} />)}</section>
         </>}
 
-        {view === "jobs" && <section className="panel"><div className="section-heading"><div><p className="eyebrow">LIVE ONLY</p><h2>普通断档恢复已停用</h2><p>常驻 Worker 不允许调用历史；当前一次性时间窗口补漏进度请在运行总览查看。</p></div></div><div className="job-table"><div className="job-row header"><span>任务</span><span>群号</span><span>状态</span><span>发现图片</span><span>更新时间</span><span /></div>{dashboard.jobs.map((job) => <div className="job-row" key={job.id}><span>#{job.id} · 已有任务</span><code>{job.group_id}</code><StatusPill value={job.status} /><span>{job.progress_pages}</span><span>{formatTime(job.updated_at)}</span><span>{["queued", "running"].includes(job.status) && <button className="danger-ghost" onClick={() => void cancelJob(job)}>安全取消</button>}</span>{job.error && <small className="job-error">{job.error}</small>}</div>)}{!dashboard.jobs.length && <div className="empty">没有普通历史任务</div>}</div></section>}
+        {view === "jobs" && <>
+          <section className="panel"><div className="section-heading"><div><p className="eyebrow">GAP RECOVERY</p><h2>按持久游标补断档</h2><p>断线和重启会自动补齐；这里可手动重跑当前游标之后的缺口，不会向更早历史倒扫。</p></div></div><div className="button-row compact">{dashboard.groups.filter((group) => group.enabled).map((group) => <button className="secondary" key={group.group_id} onClick={() => void recoverGap(group.group_id)}>恢复 {group.display_name || group.group_id}</button>)}</div></section>
+          <section className="panel"><div className="job-table"><div className="job-row header"><span>任务</span><span>群号</span><span>状态</span><span>页数</span><span>更新时间</span><span /></div>{dashboard.jobs.map((job) => <div className="job-row" key={job.id}><span>#{job.id} · 断档恢复</span><code>{job.group_id}</code><StatusPill value={job.status} /><span>{job.progress_pages}</span><span>{formatTime(job.updated_at)}</span><span>{["queued", "running"].includes(job.status) && <button className="danger-ghost" onClick={() => void cancelJob(job)}>安全取消</button>}</span>{job.error && <small className="job-error">{job.error}</small>}</div>)}{!dashboard.jobs.length && <div className="empty">当前没有断档任务</div>}</div></section>
+        </>}
 
         {view === "settings" && settings && <>
-          <form className="panel settings-form" onSubmit={(event) => void saveSettings(event)}><div className="section-heading"><div><p className="eyebrow">RATE LIMITS</p><h2>下载与历史调用上限</h2></div><button className="primary" type="submit">保存设置</button></div><div className="form-grid">
+          <form className="panel settings-form" onSubmit={(event) => void saveSettings(event)}><div className="section-heading"><div><p className="eyebrow">COLLECTION</p><h2>下载节奏</h2></div><button className="primary" type="submit">保存设置</button></div><div className="form-grid">
             <label><span>图片间隔（秒）</span><input type="number" min={5} max={3600} value={settings.download_interval_seconds} onChange={(event) => setSettings({ ...settings, download_interval_seconds: Number(event.target.value) })} /></label>
             <label><span>随机抖动（秒）</span><input type="number" min={0} max={60} value={settings.download_jitter_seconds} onChange={(event) => setSettings({ ...settings, download_jitter_seconds: Number(event.target.value) })} /></label>
-            <label><span>每日 CDN 请求防失控上限</span><input type="number" min={1} max={10000} value={settings.daily_download_limit} onChange={(event) => setSettings({ ...settings, daily_download_limit: Number(event.target.value) })} /></label>
             <label><span>CDN 首选通道</span><select value={settings.url_preference} onChange={(event) => setSettings({ ...settings, url_preference: event.target.value as "data" | "raw" })}><option value="data">标准 data.url</option><option value="raw">raw originImageUrl</option></select></label>
-            <label><span>每小时历史调用</span><input type="number" min={0} max={100} value={settings.history_hourly_limit} onChange={(event) => setSettings({ ...settings, history_hourly_limit: Number(event.target.value) })} /></label>
-            <label><span>每日历史调用</span><input type="number" min={0} max={1000} value={settings.history_daily_limit} onChange={(event) => setSettings({ ...settings, history_daily_limit: Number(event.target.value) })} /></label>
           </div><div className="toggle-grid"><label><input type="checkbox" checked={settings.collector_paused} onChange={(event) => setSettings({ ...settings, collector_paused: event.target.checked })} /><span><strong>暂停下载</strong><small>事件仍持久化，队列保留</small></span></label></div></form>
-          <section className="panel storage-panel"><div><p className="eyebrow">SAFETY</p><h2>账号会话断路器</h2><p>当前仓库：<code>{settings.storage_root}</code></p></div><small className="muted">生产 Worker 永不调用 get_image；403 默认不会触发历史接口，429 和连续 403 会熔断一小时。真正的风控边界是账号会话 API，而不是 CDN 字节量。</small></section>
+          <section className="panel storage-panel"><div><p className="eyebrow">UNLIMITED</p><h2>无限采集与自动恢复</h2><p>当前仓库：<code>{settings.storage_root}</code></p></div><small className="muted">没有每日数量、历史次数或 403/429 全局熔断。每个图片事件都会持久化并处理；网络失败持续延期重试，WS 断线后按群游标自动补齐。生产 Worker 仍不调用 get_image。</small></section>
         </>}
 
         {view === "logs" && <section className="panel logs-panel"><div className="section-heading"><div><p className="eyebrow">DIAGNOSTICS</p><h2>最近运行日志</h2></div><button className="secondary" onClick={() => void api<{ files: { path: string; lines: string[] }[] }>("/api/v1/logs?lines=250").then((value) => setLogs(value.files))}>刷新</button></div>{logs.map((file) => <div className="log-file" key={file.path}><strong>{file.path}</strong><pre>{file.lines.join("\n") || "（空）"}</pre></div>)}{!logs.length && <div className="empty">尚无日志</div>}</section>}

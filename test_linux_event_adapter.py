@@ -10,7 +10,7 @@ import sys
 import tempfile
 import time
 import unittest
-from contextlib import redirect_stdout
+from contextlib import closing, redirect_stdout
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -24,7 +24,7 @@ from linux import event_probe
 from linux.event_probe import receive_sample
 from linux.telemetry_report import report as telemetry_report
 from linux import url_lifecycle_probe
-from qq_image_collector.database import connect_database
+from qq_image_collector.database import connect_database, increment_counter
 
 
 class LinuxEventAdapterTests(unittest.TestCase):
@@ -53,10 +53,10 @@ class LinuxEventAdapterTests(unittest.TestCase):
         collector = json.loads(collector_path.read_text(encoding="utf-8"))
         self.assertNotIn("qce", collector)
         self.assertEqual(collector["groups"], ["100000001"])
-        self.assertEqual(collector["runtime"]["daily_download_limit"], 3000)
+        self.assertNotIn("daily_download_limit", collector["runtime"])
+        self.assertEqual(collector["runtime"]["event_state_heartbeat_seconds"], 10)
 
-        # 600 was the old production default.  A second prepare must upgrade
-        # that exact value without requiring a fresh runtime directory.
+        # Obsolete quota values from an older deployment are removed.
         collector["runtime"]["daily_download_limit"] = 600
         collector_path.write_text(json.dumps(collector), encoding="utf-8")
 
@@ -72,7 +72,7 @@ class LinuxEventAdapterTests(unittest.TestCase):
         )
         prepare(self.root, [], runtime_root=self.runtime)
         collector_after = json.loads(collector_path.read_text(encoding="utf-8"))
-        self.assertEqual(collector_after["runtime"]["daily_download_limit"], 3000)
+        self.assertNotIn("daily_download_limit", collector_after["runtime"])
         manager_after = json.loads(manager_path.read_text(encoding="utf-8"))
         self.assertTrue(manager_after["direct_public_enabled"])
         self.assertEqual(manager_after["direct_public_hosts"], ["status.example.invalid"])
@@ -84,7 +84,7 @@ class LinuxEventAdapterTests(unittest.TestCase):
     def test_compose_is_private_and_pinned(self) -> None:
         compose = (Path(__file__).parent / "linux" / "docker-compose.yml").read_text(encoding="utf-8")
         self.assertIn("sha256:e66a6e52", compose)
-        self.assertEqual(compose.count("qq-ai-image-collector-console:1.1.5-event"), 3)
+        self.assertEqual(compose.count("qq-ai-image-collector-console:1.1.6-event"), 3)
         self.assertIn('profiles: ["window-recovery"]', compose)
         self.assertIn("WINDOW_RECOVERY_NOT_BEFORE", compose)
         self.assertIn("WINDOW_RECOVERY_NOT_AFTER", compose)
@@ -94,6 +94,14 @@ class LinuxEventAdapterTests(unittest.TestCase):
         self.assertIn("ss.xingzhige.com:127.0.0.1", compose)
         self.assertIn("secret-service.bietiaop.com:127.0.0.1", compose)
         self.assertIn("restart: unless-stopped", compose)
+        self.assertIn('      - "-1"', compose)
+
+        nginx = (Path(__file__).parent / "linux" / "nginx-console-gateway.conf").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("gzip_proxied any", nginx)
+        self.assertIn("location = /api/v1/events", nginx)
+        self.assertEqual(nginx.count("proxy_buffering off"), 1)
 
     def test_cleanup_never_touches_nt_db_or_final(self) -> None:
         account = self.runtime / "qq-session" / "300000003"
@@ -425,7 +433,7 @@ class LinuxEventAdapterTests(unittest.TestCase):
             encoding="utf-8",
         )
         now = 2_000_000_000
-        with connect_database(database) as connection:
+        with closing(connect_database(database)) as connection:
             set_setting(connection, "rollout_started_at", now - 3600)
 
         with patch("linux.telemetry_report.time.time", return_value=now):
@@ -436,6 +444,31 @@ class LinuxEventAdapterTests(unittest.TestCase):
         self.assertFalse(payload["duration_requirement_met"])
         self.assertEqual(payload["observation_seconds"], 3600)
         self.assertEqual(payload["required_observation_seconds"], 72 * 3600)
+
+    def test_telemetry_allows_audited_gap_history_after_full_window(self) -> None:
+        database = self.root / "telemetry-history.sqlite3"
+        config = self.root / "telemetry-history.json"
+        config.write_text(
+            json.dumps(
+                {
+                    "storage": {
+                        "root": str(self.root / "repository"),
+                        "database": str(database),
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        now = 2_000_000_000
+        with closing(connect_database(database)) as connection:
+            set_setting(connection, "rollout_started_at", now - 73 * 3600)
+            increment_counter(connection, "history_calls", 5, timestamp=now - 60)
+
+        with patch("linux.telemetry_report.time.time", return_value=now):
+            payload, gate = telemetry_report(config, 72)
+        self.assertTrue(gate)
+        self.assertEqual(payload["counters"]["history_calls"], 5)
+        self.assertEqual(payload["steady_state_gate"], "pass")
 
     def test_get_image_diagnostic_consumes_sentinel_before_request(self) -> None:
         source = (Path(__file__).parent / "linux" / "diagnostic_compare.py").read_text(

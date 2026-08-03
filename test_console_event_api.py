@@ -127,13 +127,14 @@ class ConsoleEventApiTests(unittest.TestCase):
         self.client_context.__exit__(None, None, None)
         self.temporary.cleanup()
 
-    def test_status_has_event_queue_downloader_and_circuit(self) -> None:
+    def test_status_has_event_queue_downloader_and_recovery(self) -> None:
         response = self.client.get("/api/v1/status")
         self.assertEqual(response.status_code, 200)
         payload = response.json()
         self.assertEqual(payload["account"]["user_id"], "300000003")
-        for key in ("event_stream", "queue", "downloader", "circuit"):
+        for key in ("event_stream", "queue", "downloader", "recovery"):
             self.assertIn(key, payload["services"])
+        self.assertNotIn("circuit", payload["services"])
         self.assertEqual(payload["statistics"]["today"]["get_image_blocked"], 0)
 
     def test_group_gap_api_and_retired_backfill(self) -> None:
@@ -147,7 +148,7 @@ class ConsoleEventApiTests(unittest.TestCase):
         self.assertEqual(retired.status_code, 410)
         self.assertEqual(
             self.client.post(f"/api/v1/groups/{GROUP}/recover-gap", json={}).status_code,
-            410,
+            409,
         )
         import sqlite3
 
@@ -155,27 +156,29 @@ class ConsoleEventApiTests(unittest.TestCase):
             connection.execute(
                 """
                 UPDATE group_runtime SET last_message_id='9000000000000000001',
-                    last_message_seq='12345' WHERE group_id=?
+                    last_message_seq='12345', last_message_time=1785670000
+                WHERE group_id=?
                 """,
                 (GROUP,),
             )
             connection.commit()
         recovery = self.client.post(f"/api/v1/groups/{GROUP}/recover-gap", json={})
-        self.assertEqual(recovery.status_code, 410)
+        self.assertEqual(recovery.status_code, 202)
         jobs = self.client.get("/api/v1/jobs").json()
-        self.assertEqual(jobs, [])
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0]["kind"], "gap_recovery")
 
     def test_safe_runtime_settings(self) -> None:
-        self.assertEqual(self.client.get("/api/v1/settings").json()["daily_download_limit"], 3000)
+        current = self.client.get("/api/v1/settings").json()
+        self.assertTrue(current["unlimited_collection"])
+        self.assertNotIn("daily_download_limit", current)
+        self.assertNotIn("history_hourly_limit", current)
         updated = self.client.patch(
             "/api/v1/settings",
             json={
                 "download_interval_seconds": 20,
                 "download_jitter_seconds": 2,
-                "daily_download_limit": 500,
                 "url_preference": "raw",
-                "history_hourly_limit": 4,
-                "history_daily_limit": 12,
                 "collector_paused": True,
             },
         )
@@ -184,10 +187,24 @@ class ConsoleEventApiTests(unittest.TestCase):
         self.assertEqual(updated.json()["url_preference"], "raw")
         self.assertTrue(updated.json()["collector_paused"])
 
+        obsolete = self.client.patch(
+            "/api/v1/settings", json={"daily_download_limit": 1}
+        )
+        self.assertEqual(obsolete.status_code, 422)
+
         rejected = self.client.patch(
             "/api/v1/settings", json={"url_preference": "unverified"}
         )
         self.assertEqual(rejected.status_code, 422)
+
+    def test_static_assets_are_immutable_but_html_is_not_cached(self) -> None:
+        asset = self.client.get("/assets/not-found.js")
+        self.assertEqual(
+            asset.headers.get("cache-control"),
+            "public, max-age=31536000, immutable",
+        )
+        root = self.client.get("/")
+        self.assertEqual(root.headers.get("cache-control"), "no-store")
 
 
 if __name__ == "__main__":

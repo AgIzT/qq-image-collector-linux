@@ -4,6 +4,12 @@
 OneBot 正向 WS 事件中的 CDN URL；生产 Worker 不调用 `get_image`，不做连续历史
 回填，也不依赖 QCE。
 
+当前生产版本为 v1.1.6：每个图片事件先进入 SQLite，没有每日下载、历史小时/每日、
+每群页数或队列总量额度；400/403/404/410 会刷新对应消息 URL，429 只延后当前图片，
+网络错误持续退避。WS 断线或服务器重启后按每群 live raw 游标向前补到重连时刻，
+不会倒扫游标之前的长期历史。Worker、WS 和下载循环都有独立心跳，任一后台任务退出
+都会触发自动重建。
+
 ## 服务与端口
 
 | Endpoint | 宿主机绑定 | 用途 |
@@ -11,7 +17,7 @@ OneBot 正向 WS 事件中的 CDN URL；生产 Worker 不调用 `get_image`，�
 | NapCat WebUI | `0.0.0.0:10058` | 扫码与 NapCat 管理，使用独立强 Token |
 | NapCat WebUI rescue | `127.0.0.1:16099` | SSH 本机救援 |
 | Collector | `127.0.0.1:17890` | 由现有 Nginx `18080` 反代并验证 Token |
-| OneBot HTTP | 仅 Compose `napcat:3000` | 健康、群列表和受限断档恢复 |
+| OneBot HTTP | 仅 Compose `napcat:3000` | 健康、群列表、断档与 URL 恢复 |
 | OneBot WS | 仅 Compose `napcat:3001` | 消息事件 |
 
 不存在 QCE 服务或 `40653`，OneBot `3000/3001` 不映射到宿主机。Docker 日志限制
@@ -38,18 +44,17 @@ chmod 600 .env
 `debug=true`，然后只重启 NapCat。控制台会等待 WebUI、登录信息和 WS 健康后再运行
 唯一 Worker。
 
-## 上线前冻结状态
+## 可选隔离诊断
 
-在完成 Test A–F 前，必须在控制台同时满足：
+重新验证 NapCat/CDN 行为时，可在隔离测试窗口临时满足：
 
 - `collector_paused=true`；
 - 原有六个生产群全部停用；
 - 只使用自己的账号和隔离测试群；
-- 不触发“恢复本次断档”，不创建任何历史任务；
-- `allow_403_history_refresh=false`。
+- 不触发手动断档恢复。
 
-该键沿用旧名称以避免扩大迁移面，实际只控制具备严格到期证据的 HTTP 400/403 单次
-历史刷新；默认关闭，且不通过公网控制台开放。
+`allow_403_history_refresh` 及历史/CDN 额度设置已从 v1.1.6 删除，旧配置值在 prepare
+和控制台启动时清除，不能再用它们暂停生产队列。
 
 测试图片放到宿主持久目录 `${QQAI_RUNTIME_ROOT}/diagnostics/`；容器内只读路径为
 `/diagnostics/`。每项测试必须保留命令的完整原始 JSON/终端输出，不能只记录结论。
@@ -242,9 +247,8 @@ sentinel，生产 Worker 从未获得这项能力。
 结论确定后可在控制台“CDN 首选通道”中选择 `data` 或 `raw`；值写入 SQLite，
 Worker 下一循环生效并跨重启保留。
 
-`daily_download_limit=3000` 表示 CDN 请求失控保护，不是防封阈值；`cdn_requests`
-统计所有尝试，`cdn_downloads` 只统计完整成功的 200。账号风险边界是 OneBot 动作，
-不是 CDN 字节量。
+`cdn_requests` 统计所有尝试，`cdn_downloads` 只统计完整成功的 200。生产没有每日
+请求额度；下载仍保持单并发与默认 15 秒节奏。
 
 ## Test E：original 分布与接受率
 
@@ -301,7 +305,9 @@ NapCatQQ `v4.18.13` 发布资产比对一致，对应标签源码提交为
 `data.url` 时仍会调用 NapCat `FileApi.getImageUrl()`。NTV2 图片会先尝试缓存的原生
 `FetchRkey`，失败后尝试两个第三方 rkey 服务，再回退。因此 Test F 不只是验证域名
 阻断，也要观察原生 rkey 刷新；不能把“使用事件 URL”简化成“NapCat 内部绝无账号
-动作”。这条不改变生产禁令：Worker 仍不得逐图调用 `get_image`，稳态历史调用仍为 0。
+动作”。这条不改变生产禁令：Worker 仍不得逐图调用 `get_image`。`history_calls` 在
+WS 断档或 CDN URL 失效时可以非零，必须结合原因与队列状态判断，不能再把非零本身
+当作故障。
 
 ## Test G：单群 72 小时稳态门禁
 
@@ -320,27 +326,24 @@ history_calls / get_image_blocked
 accepted / rejected / duplicates / failed / expired / filtered_gif
 ```
 
-硬门禁为：
+持续观察项为：
 
 - `duration_requirement_met=true`；
-- `steady_state_gate=pass`；
-- `history_calls=0`；
 - `get_image_blocked=0`。
 
-任一不满足就暂停扩群并定位路径。通过后每次只增加一个群，每次至少观察 48 小时。
+`history_calls` 应能对应到明确的 WS 断档或 URL 刷新；无原因持续增长时再定位路径。
 
 ## 明确禁止的回退方案
 
 - 不增加国内中继、双机下载或 CDN 代理；现有证据不支持“境外 IP/字节量导致风控”。
 - 不恢复 QCE、启动轮询、任意日期回填或连续历史回填。
 - 不允许生产代码调用 `get_image/downloadRichMedia`。
-- 不放宽 OneBot 动作白名单，不把 400/403 默认转换为历史调用。
-- 不在 A–F 原始证据不完整时启用原有六群。
+- 不放宽 OneBot 动作白名单；历史接口只用于游标后的断档与单张 URL 刷新。
 
 ## 一次性时间窗口补漏
 
-普通 `backfill` 与 `recover-gap` 已永久返回 410，常驻 Worker 也会在网络调用前硬拒绝
-history。若已有断档经过审计，可在 `.env` 写入闭区间 Unix 时间：
+普通任意日期 `backfill` 永久返回 410；`recover-gap` 按 live 游标向前恢复并返回 202。
+若已有明确的旧断档需要固定时间窗恢复，可在 `.env` 写入闭区间 Unix 时间：
 
 ```text
 WINDOW_RECOVERY_NOT_BEFORE=<审计后的下界>
@@ -357,9 +360,9 @@ WINDOW_RECOVERY_NOT_AFTER=<生产切换时间>
 
 恢复器优先从切换点之后的当前 WS raw `msgId` 向旧消息翻页；安静群没有当前锚点时只用
 最新一页建立起点。旧 QCE `msgId` 不会复用。每群首屏先完整验证后退方向，验证前不
-入队，通过后才处理同一响应，不重复拉取探测页。随后每 10 分钟最多一页、每小时 6 次、每天 20 次；
-全局下载队列不为空时等待。只有硬时间窗内图片会进入原有事件 CDN 队列。它不更新
-实时游标、不调用 `get_image`、不提高常驻历史预算。脱敏汇总写入
+入队，通过后才处理同一响应，不重复拉取探测页。随后默认每 2 秒一页，没有小时、
+每日、每群页数或队列清空限制。只有硬时间窗内图片会进入原有事件 CDN 队列。它不更新
+实时游标、不调用 `get_image`。脱敏汇总写入
 `repository/state/diagnostics/window-recovery-report.json`，完整群号与锚点只留在 SQLite。
 
 ## 日常命令

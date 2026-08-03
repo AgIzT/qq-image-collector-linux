@@ -9,6 +9,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import httpx
 import websockets
@@ -537,6 +538,68 @@ class EventPipelineTests(unittest.TestCase):
                 )
 
         asyncio.run(scenario())
+
+    def test_quiet_websocket_updates_connection_heartbeat(self) -> None:
+        async def scenario() -> None:
+            async def handler(_connection) -> None:
+                await asyncio.sleep(4)
+
+            async with websockets.serve(handler, "127.0.0.1", 0) as server:
+                port = server.sockets[0].getsockname()[1]
+
+                async def no_event(_event: dict) -> None:
+                    return
+
+                async def no_gap(_seconds: float) -> None:
+                    return
+
+                listener = EventListener(
+                    self.connection,
+                    f"ws://127.0.0.1:{port}",
+                    "",
+                    no_event,
+                    no_gap,
+                    state_heartbeat_interval=2,
+                )
+                task = asyncio.create_task(listener.run())
+                deadline = time.monotonic() + 2
+                first = 0
+                while time.monotonic() < deadline:
+                    state = get_runtime_state(self.connection, "event_stream", {})
+                    first = int(state.get("heartbeat_at") or 0)
+                    if first:
+                        break
+                    await asyncio.sleep(0.05)
+                await asyncio.sleep(2.2)
+                state = get_runtime_state(self.connection, "event_stream", {})
+                self.assertTrue(state.get("connected"))
+                self.assertGreater(int(state.get("heartbeat_at") or 0), first)
+                self.assertFalse(state.get("last_event_at"))
+                listener.stop()
+                await asyncio.wait_for(task, timeout=3)
+
+        asyncio.run(scenario())
+
+    def test_runtime_lock_is_nonfatal_to_event_state(self) -> None:
+        async def no_event(_event: dict) -> None:
+            return
+
+        async def no_gap(_seconds: float) -> None:
+            return
+
+        listener = EventListener(
+            self.connection,
+            "ws://127.0.0.1:9",
+            "",
+            no_event,
+            no_gap,
+        )
+        with mock.patch(
+            "qq_image_collector.events.set_runtime_state",
+            side_effect=sqlite3.OperationalError("database is locked"),
+        ):
+            state = listener._state(force=True, connected=True)
+        self.assertTrue(state["connected"])
 
 
 if __name__ == "__main__":

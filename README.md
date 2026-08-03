@@ -1,9 +1,9 @@
 # QQ Image Collector for Linux
 
-面向“账号会话接口最小化”的 QQ 群 AI 原图采集器。生产链路只接收 NapCat
-标准 OneBot 正向 WebSocket 事件，先把图片任务写入 SQLite，再由单并发 Worker
-直连 QQ CDN。它不轮询群历史、不自动回填、不使用 QCE，生产代码也不能调用
-`get_image`。
+QQ 群 AI 原图采集器。生产链路接收 NapCat 标准 OneBot 正向 WebSocket 事件，
+先把每个图片任务写入 SQLite，再由单并发 Worker 直连 QQ CDN。它不轮询历史、
+不做任意日期回填、不使用 QCE，生产代码也不能调用 `get_image`；WS 断线、
+服务器重启和 CDN URL 失效时，会按持久游标自动恢复必要的消息或 URL。
 
 ```text
 NapCat OneBot WS（debug raw）
@@ -21,24 +21,26 @@ NapCat OneBot WS（debug raw）
 - `original=true`、未知、非原图/小图/疑似表情只影响优先级，不直接淘汰。若
   `original` 缺失，尺寸、扩展名与表情信号共同决定优先级。
 - 下载并发恒为 1，默认间隔 15 秒；队列最老任务超过 30 分钟时降到 5 秒。
-  每日 3000 次 CDN 请求上限只是本地防失控护栏，不是账号风控措施；请求尝试
-  与完整下载分别统计。
+  没有每日数量、小时次数或队列总量上限；请求尝试与完整下载分别统计。
 - 只允许 `gchat.qpic.cn` 与 `multimedia.nt.qq.com.cn` HTTPS 地址，单文件最大
-  128 MiB。首选 URL 无效或返回 403/404/410 时，先尝试事件自带的第二条合法
-  CDN URL；5xx/408/425 最多退避三次。
+  128 MiB。首选 URL 无效时先尝试事件自带的第二条合法 CDN URL；400/403/404/410
+  会用对应消息游标刷新 URL，429 只延后当前图片，网络错误和 5xx 持续退避重试，
+  不会因为次数达到阈值而永久放弃。
 - rkey URL 带一个明确标注“尚未实测”的 6 小时调度提示，临期项可越过普通
   优先级。`expired` 独立告警；后续事件带来新 URL 时可原地复活，无需会话 API。
 - GIF 以文件魔数最终确认，并在读到头部后立即中止；普通评论、作者名、链接、
   水印和无结构参数会被淘汰。
-- 常驻 Worker 的普通断档恢复和过期 URL 历史刷新均被生产策略硬禁用；即使误改
-  小时/每日额度也不会调用 `get_group_msg_history`。
-- 唯一例外是内部一次性时间窗口恢复器：从窗口前已保存的 raw NT `msgId` 向当前
-  低频翻页，先探测方向，只把硬时间范围内的图片入队；它不开放公网 API、不覆盖
-  live raw 游标，并使用独立的每小时 6、每天 20 次额度。
-- 403 默认不调用历史刷新。生产 `get_image` 在发包前被拦截、记录严重告警并
-  停止 Worker；账号会话 API 次数才是主要安全边界，CDN 字节量不是。
+- WS 中断超过 3 秒后，常驻 Worker 从每群最后一个持久 raw `msgId` 向前补到
+  重连时刻；没有历史页数或调用次数上限，但不会向该游标之前倒扫。
+- 过期 CDN URL 可反复刷新；若历史接口仍返回同一个失效 URL，任务按指数退避
+  留在持久队列，不形成紧密循环，也不转成静默终止。
+- 内部一次性时间窗口恢复器只处理固定 `not_before/not_after` 范围，不开放任意
+  历史日期；它同样没有小时、每日、每群页数或“队列必须清空”的停止条件。
+- 生产 `get_image` 在发包前被拦截并记录严重告警，但不会因此暂停其他事件采集。
 - 终态删除 URL/rkey，只保留主机、URL 指纹和诊断结论。Compose 服务使用
-  `restart: unless-stopped`，SQLite、队列、群游标和图库跨重启保留。
+  `restart: unless-stopped`，SQLite、队列、群游标和图库跨重启保留。Worker、WS
+  和下载循环均有独立心跳；任一后台协程异常退出都会触发进程内重建，避免“PID
+  仍在但采集已停”的假活。
 
 ## 元数据与四分类
 
@@ -68,10 +70,8 @@ NapCat WebUI 使用公网 `10058`；控制台由宿主机 Nginx 的 `18080` 转�
 loopback `17890`。OneBot HTTP/WS `3000/3001` 不映射到宿主机，旧 QCE
 `40653` 不再存在。
 
-在 URL 形态、字节、元数据、生命周期、`original` 标志与 rkey 外联完成 Test
-A–F 前，Worker 必须保持暂停且六个生产群全部禁用。随后只启用一个群运行满
-72 小时；`history_calls` 和 `get_image_blocked` 均为 0 才能逐群扩展。完整命令、
-原始输出字段、切换与缓存规则见 [linux/README.md](linux/README.md)，架构不变量见
+控制台会分别显示 Worker、WS 连接心跳、下载循环、队列和自动断档恢复。完整命令、
+诊断工具、切换与缓存规则见 [linux/README.md](linux/README.md)，当前生产不变量见
 [EVENT_PIPELINE.md](EVENT_PIPELINE.md)。
 
 ## 测试

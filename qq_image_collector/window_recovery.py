@@ -1,11 +1,11 @@
 """Strict, one-shot recovery for a closed production outage window.
 
-This runner is deliberately separate from the always-on worker.  The worker's
-normal history budgets must remain zero while this process is active.  History
+This runner is deliberately separate from the always-on worker. History
 pagination starts at a current-session raw NT ``msgId`` at or after the fixed
 upper bound, moves towards older messages, and never changes the live WS cursor.
-If a quiet group has no current-session anchor, one latest-history page is used
-only to bootstrap the same backwards traversal.
+It has no hourly, daily, queue-depth or per-group page quota; the immutable time
+window and source-progress checks are the boundaries. If a quiet group has no
+current-session anchor, one latest-history page bootstraps the same traversal.
 """
 
 from __future__ import annotations
@@ -26,7 +26,6 @@ from .database import (
     connect_database,
     enqueue_image,
     increment_counter,
-    local_day_start,
     queue_snapshot,
     set_runtime_state,
 )
@@ -143,21 +142,21 @@ class WindowRecoveryRunner:
         not_after: int,
         expected_groups: int = 6,
         page_size: int = 20,
-        interval_seconds: int = 600,
-        hourly_limit: int = 6,
-        daily_limit: int = 20,
-        max_calls_per_group: int = 200,
-        queue_threshold: int = 0,
-        poll_seconds: int = 30,
+        interval_seconds: int = 2,
+        hourly_limit: int = 0,
+        daily_limit: int = 0,
+        max_calls_per_group: int = 0,
+        queue_threshold: int = -1,
+        poll_seconds: int = 2,
         onebot: OneBotClient | None = None,
     ) -> None:
         if not_before <= 0 or not_after <= not_before:
             raise WindowPolicyError("invalid recovery window")
         if expected_groups <= 0 or page_size <= 1:
             raise WindowPolicyError("invalid recovery dimensions")
-        if interval_seconds < 60 or hourly_limit <= 0 or daily_limit <= 0:
-            raise WindowPolicyError("unsafe recovery rate")
-        if max_calls_per_group <= 0 or queue_threshold < 0:
+        if interval_seconds < 0 or hourly_limit < 0 or daily_limit < 0:
+            raise WindowPolicyError("invalid recovery rate")
+        if max_calls_per_group < 0 or queue_threshold < -1:
             raise WindowPolicyError("invalid recovery limits")
 
         self.config_path = Path(config_path)
@@ -225,12 +224,6 @@ class WindowRecoveryRunner:
             != self.not_after
         ):
             raise WindowPolicyError("recovery upper bound differs from production marker")
-        if int(_setting(self.connection, "history_hourly_limit", -1)) != 0:
-            raise WindowPolicyError("always-on hourly history budget is not disabled")
-        if int(_setting(self.connection, "history_daily_limit", -1)) != 0:
-            raise WindowPolicyError("always-on daily history budget is not disabled")
-        if _setting(self.connection, "allow_403_history_refresh", False) is not False:
-            raise WindowPolicyError("expired-URL history refresh is enabled")
         active_gap_jobs = int(
             self.connection.execute(
                 """
@@ -375,15 +368,14 @@ class WindowRecoveryRunner:
         ).fetchall()
         calls = [int(row[0]) for row in rows]
         waits = [0]
-        if calls:
+        if calls and self.interval_seconds > 0:
             waits.append(max(0, calls[-1] + self.interval_seconds - now))
         hourly = [value for value in calls if value > now - 3600]
-        if len(hourly) >= self.hourly_limit:
+        if self.hourly_limit > 0 and len(hourly) >= self.hourly_limit:
             waits.append(max(1, hourly[-self.hourly_limit] + 3601 - now))
-        start_of_day = local_day_start(now)
-        daily = [value for value in calls if value >= start_of_day]
-        if len(daily) >= self.daily_limit:
-            waits.append(max(1, local_day_start(now + 86400) - now))
+        daily = [value for value in calls if value >= now - 86400]
+        if self.daily_limit > 0 and len(daily) >= self.daily_limit:
+            waits.append(max(1, daily[-self.daily_limit] + 86401 - now))
         return max(waits)
 
     def _record_call(self, group_id: str) -> tuple[int, int]:
@@ -491,7 +483,7 @@ class WindowRecoveryRunner:
         now = int(time.time())
         retries = int(job["retry_count"] or 0) + 1
         short_anchor = str(job["next_anchor_id"]) != str(job["start_anchor_id"])
-        if short_anchor and int(job["replay_count"] or 0) < 3:
+        if short_anchor:
             # A NapCat restart invalidates the in-memory short-ID map.  Reset
             # to the immutable raw NT msgId and safely replay using real_seq
             # deduplication instead of substituting msgSeq as an API anchor.
@@ -510,25 +502,8 @@ class WindowRecoveryRunner:
                 """,
                 (
                     retries,
-                    now + 1800,
+                    now + max(2, self.interval_seconds),
                     f"short anchor reset after {type(exc).__name__}",
-                    now,
-                    int(job["id"]),
-                ),
-            )
-        elif short_anchor:
-            self.connection.execute(
-                """
-                UPDATE window_recovery_jobs
-                SET status='failed_anchor', retry_count=?,
-                    history_calls=history_calls+1,
-                    last_error=?, updated_at=?, finished_at=?
-                WHERE id=?
-                """,
-                (
-                    retries,
-                    "short anchor failed after three safe replays",
-                    now,
                     now,
                     int(job["id"]),
                 ),
@@ -559,7 +534,8 @@ class WindowRecoveryRunner:
                     int(job["id"]),
                 ),
             )
-        elif retries < 3:
+        else:
+            retry_delay = min(300, 30 * (2 ** min(4, max(0, retries - 1))))
             self.connection.execute(
                 """
                 UPDATE window_recovery_jobs
@@ -569,25 +545,8 @@ class WindowRecoveryRunner:
                 """,
                 (
                     retries,
-                    now + 1800,
+                    now + retry_delay,
                     f"latest bootstrap retry after {type(exc).__name__}",
-                    now,
-                    int(job["id"]),
-                ),
-            )
-        else:
-            self.connection.execute(
-                """
-                UPDATE window_recovery_jobs
-                SET status='failed_anchor', retry_count=?,
-                    history_calls=history_calls+1,
-                    last_error=?, updated_at=?, finished_at=?
-                WHERE id=?
-                """,
-                (
-                    retries,
-                    f"latest bootstrap failed: {type(exc).__name__}",
-                    now,
                     now,
                     int(job["id"]),
                 ),
@@ -597,7 +556,10 @@ class WindowRecoveryRunner:
     def process_one_page(self) -> bool:
         self._safety_check()
         now = int(time.time())
-        if queue_snapshot(self.connection)["depth"] > self.queue_threshold:
+        if (
+            self.queue_threshold >= 0
+            and queue_snapshot(self.connection)["depth"] > self.queue_threshold
+        ):
             self._publish_state("waiting_queue")
             return False
         wait = self._budget_wait_seconds(now)
@@ -608,7 +570,10 @@ class WindowRecoveryRunner:
         if not job:
             self._publish_state("finished")
             return False
-        if self._job_call_count(str(job["group_id"])) >= self.max_calls_per_group:
+        if (
+            self.max_calls_per_group > 0
+            and self._job_call_count(str(job["group_id"])) >= self.max_calls_per_group
+        ):
             self._fail_job(job, "partial_max_calls", "per-group call limit reached")
             self._publish_state("running")
             return True
@@ -840,12 +805,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--not-after", type=int, required=True)
     parser.add_argument("--expected-groups", type=int, default=6)
     parser.add_argument("--page-size", type=int, default=20)
-    parser.add_argument("--interval-seconds", type=int, default=600)
-    parser.add_argument("--hourly-limit", type=int, default=6)
-    parser.add_argument("--daily-limit", type=int, default=20)
-    parser.add_argument("--max-calls-per-group", type=int, default=200)
-    parser.add_argument("--queue-threshold", type=int, default=0)
-    parser.add_argument("--poll-seconds", type=int, default=30)
+    parser.add_argument("--interval-seconds", type=int, default=2)
+    parser.add_argument("--hourly-limit", type=int, default=0)
+    parser.add_argument("--daily-limit", type=int, default=0)
+    parser.add_argument("--max-calls-per-group", type=int, default=0)
+    parser.add_argument("--queue-threshold", type=int, default=-1)
+    parser.add_argument("--poll-seconds", type=int, default=2)
     return parser
 
 

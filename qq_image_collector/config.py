@@ -13,26 +13,17 @@ DEFAULT_RUNTIME: dict[str, Any] = {
     "accelerated_interval_seconds": 5,
     "accelerate_queue_age_seconds": 1800,
     "resume_normal_queue_age_seconds": 900,
-    # This limits CDN HTTP attempts, not successful files.  CDN bytes are not
-    # part of the account-session risk boundary; the generous cap only guards
-    # against a local runaway loop.
-    "daily_download_limit": 3000,
     "max_download_bytes": 128 * 1024 * 1024,
     "url_preference": "data",
     "url_expiry_urgent_seconds": 3600,
     "ws_ping_interval_seconds": 30,
+    "event_state_heartbeat_seconds": 10,
     "ws_disconnect_gap_seconds": 3,
     "history_page_size": 20,
-    "history_max_pages_per_gap": 5,
-    "history_hourly_limit": 6,
-    "history_daily_limit": 20,
-    "cdn_403_window_seconds": 600,
-    "cdn_403_trip_count": 3,
-    "cdn_circuit_seconds": 3600,
-    "cdn_429_pause_seconds": 3600,
-    # A 403 must not silently create account-session history traffic before
-    # URL lifetime tests have established that this recovery is necessary.
-    "allow_403_history_refresh": False,
+    "history_page_interval_seconds": 2,
+    "cdn_429_pause_seconds": 300,
+    "worker_restart_delay_seconds": 5,
+    "worker_heartbeat_seconds": 10,
 }
 
 

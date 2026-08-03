@@ -17,6 +17,7 @@ from .config import ConsoleConfig
 
 
 WORKER_START_TIMEOUT_SECONDS = 30
+HEALTH_CACHE_SECONDS = 5.0
 
 
 def _error_text(exc: BaseException) -> str:
@@ -58,7 +59,11 @@ class HealthService:
 
     def snapshot(self, force: bool = False) -> dict[str, Any]:
         with self._cache_lock:
-            if not force and self._cache and time.time() - self._cache[0] < 1.0:
+            if (
+                not force
+                and self._cache
+                and time.time() - self._cache[0] < HEALTH_CACHE_SECONDS
+            ):
                 return dict(self._cache[1])
         onebot_settings = self.config.collector_settings().get("onebot", {})
         webui_url = str(onebot_settings.get("webui_url") or "http://napcat:6099")

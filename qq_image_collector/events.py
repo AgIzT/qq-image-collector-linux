@@ -347,6 +347,7 @@ class EventListener:
         reconnect_handler: ReconnectHandler,
         *,
         ping_interval: int = 30,
+        state_heartbeat_interval: int = 10,
     ) -> None:
         self.connection = connection
         self.ws_url = ws_url
@@ -354,18 +355,64 @@ class EventListener:
         self.handler = handler
         self.reconnect_handler = reconnect_handler
         self.ping_interval = ping_interval
+        self.state_heartbeat_interval = max(2, int(state_heartbeat_interval))
+        self._state_write_interval = min(10, self.state_heartbeat_interval)
         self._stopping = asyncio.Event()
+        self._runtime_state: dict[str, Any] | None = None
+        self._last_state_write = 0.0
 
-    def _state(self, **updates: Any) -> dict[str, Any]:
+    def _state(self, *, force: bool = False, **updates: Any) -> dict[str, Any]:
         from .database import get_runtime_state
 
-        state = get_runtime_state(self.connection, "event_stream", {}) or {}
+        if self._runtime_state is None:
+            self._runtime_state = get_runtime_state(self.connection, "event_stream", {}) or {}
+        state = self._runtime_state
         state.update(updates)
-        set_runtime_state(self.connection, "event_stream", state)
-        return state
+        now = time.monotonic()
+        if not force and now - self._last_state_write < self._state_write_interval:
+            return dict(state)
+        try:
+            set_runtime_state(self.connection, "event_stream", state)
+            self._last_state_write = now
+        except sqlite3.OperationalError as exc:
+            self.connection.rollback()
+            if "locked" not in str(exc).casefold():
+                raise
+        return dict(state)
 
     def stop(self) -> None:
         self._stopping.set()
+
+    def _mark_groups_connected(self) -> None:
+        try:
+            self.connection.execute(
+                """
+                UPDATE group_runtime SET event_status='connected', updated_at=?
+                WHERE group_id IN (
+                    SELECT group_id FROM monitored_groups WHERE enabled=1
+                )
+                """,
+                (int(time.time()),),
+            )
+            self.connection.commit()
+        except sqlite3.OperationalError as exc:
+            self.connection.rollback()
+            if "locked" not in str(exc).casefold():
+                raise
+
+    async def _connection_heartbeat(self) -> None:
+        while not self._stopping.is_set():
+            self._state(
+                connected=True,
+                heartbeat_at=int(time.time()),
+                last_error=None,
+            )
+            try:
+                await asyncio.wait_for(
+                    self._stopping.wait(), timeout=self.state_heartbeat_interval
+                )
+            except asyncio.TimeoutError:
+                pass
 
     async def run(self) -> None:
         delay = 1.0
@@ -389,48 +436,73 @@ class EventListener:
                 ) as websocket:
                     now = int(time.time())
                     self._state(
+                        force=True,
                         connected=True,
                         connected_at=now,
+                        heartbeat_at=now,
                         disconnected_at=None,
                         stopped_at=None,
                         last_error=None,
                     )
-                    boundary = disconnected_at or previous_disconnect
-                    if boundary is not None:
-                        await self.reconnect_handler(max(0.0, time.time() - float(boundary)))
-                    previous_disconnect = None
-                    disconnected_at = None
-                    delay = 1.0
-                    async for payload in websocket:
-                        if self._stopping.is_set():
-                            break
-                        try:
-                            event = json.loads(payload)
-                        except (TypeError, json.JSONDecodeError):
-                            continue
-                        if not isinstance(event, dict):
-                            continue
-                        increment_counter(self.connection, "events")
-                        self._state(
-                            connected=True,
-                            connected_at=now,
-                            last_event_at=int(time.time()),
-                            last_error=None,
-                        )
-                        await self.handler(event)
+                    self._mark_groups_connected()
+                    heartbeat_task = asyncio.create_task(
+                        self._connection_heartbeat(), name="event-stream-heartbeat"
+                    )
+                    try:
+                        boundary = disconnected_at or previous_disconnect
+                        if boundary is not None:
+                            await self.reconnect_handler(
+                                max(0.0, time.time() - float(boundary))
+                            )
+                        previous_disconnect = None
+                        disconnected_at = None
+                        delay = 1.0
+                        async for payload in websocket:
+                            if self._stopping.is_set():
+                                break
+                            try:
+                                event = json.loads(payload)
+                            except (TypeError, json.JSONDecodeError):
+                                continue
+                            if not isinstance(event, dict):
+                                continue
+                            try:
+                                increment_counter(self.connection, "events")
+                            except sqlite3.OperationalError as exc:
+                                self.connection.rollback()
+                                if "locked" not in str(exc).casefold():
+                                    raise
+                            self._state(
+                                connected=True,
+                                connected_at=now,
+                                heartbeat_at=int(time.time()),
+                                last_event_at=int(time.time()),
+                                last_error=None,
+                            )
+                            await self.handler(event)
+                    finally:
+                        heartbeat_task.cancel()
+                        await asyncio.gather(heartbeat_task, return_exceptions=True)
                     if not self._stopping.is_set():
                         raise ConnectionError("OneBot WebSocket closed without a close exception")
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 disconnected_at = disconnected_at or time.time()
-                self.connection.execute(
-                    "UPDATE group_runtime SET event_status='disconnected', updated_at=? WHERE group_id IN (SELECT group_id FROM monitored_groups WHERE enabled=1)",
-                    (int(time.time()),),
-                )
-                self.connection.commit()
+                try:
+                    self.connection.execute(
+                        "UPDATE group_runtime SET event_status='disconnected', updated_at=? WHERE group_id IN (SELECT group_id FROM monitored_groups WHERE enabled=1)",
+                        (int(time.time()),),
+                    )
+                    self.connection.commit()
+                except sqlite3.OperationalError as database_error:
+                    self.connection.rollback()
+                    if "locked" not in str(database_error).casefold():
+                        raise
                 self._state(
+                    force=True,
                     connected=False,
+                    heartbeat_at=int(time.time()),
                     disconnected_at=int(disconnected_at),
                     last_error=f"{type(exc).__name__}: {exc}",
                 )
@@ -440,7 +512,7 @@ class EventListener:
                     await asyncio.wait_for(self._stopping.wait(), timeout=wait)
                 except asyncio.TimeoutError:
                     pass
-        self._state(connected=False, stopped_at=int(time.time()), last_error=None)
+        self._state(force=True, connected=False, stopped_at=int(time.time()), last_error=None)
 
 
 def history_events(payload: Any) -> Iterable[dict[str, Any]]:

@@ -16,7 +16,7 @@ from PIL.PngImagePlugin import PngInfo
 
 from qq_image_collector.database import claim_next_image, connect_database, enqueue_image
 from qq_image_collector.events import parse_group_event
-from qq_image_collector.worker import CollectorWorker, HistoryBudgetExceeded
+from qq_image_collector.worker import CollectorWorker
 from test_event_pipeline import GROUP, MESSAGE, a1111_png, image_event
 
 
@@ -43,18 +43,15 @@ def write_config(root: Path, ws_url: str) -> Path:
                     "accelerated_interval_seconds": 1,
                     "accelerate_queue_age_seconds": 1800,
                     "resume_normal_queue_age_seconds": 900,
-                    "daily_download_limit": 600,
                     "max_download_bytes": 1024 * 1024,
                     "ws_ping_interval_seconds": 30,
+                    "event_state_heartbeat_seconds": 2,
                     "ws_disconnect_gap_seconds": 60,
                     "history_page_size": 20,
-                    "history_max_pages_per_gap": 5,
-                    "history_hourly_limit": 6,
-                    "history_daily_limit": 20,
-                    "cdn_403_window_seconds": 600,
-                    "cdn_403_trip_count": 3,
-                    "cdn_circuit_seconds": 3600,
-                    "cdn_429_pause_seconds": 3600,
+                    "history_page_interval_seconds": 0,
+                    "cdn_429_pause_seconds": 5,
+                    "worker_restart_delay_seconds": 1,
+                    "worker_heartbeat_seconds": 2,
                 },
             },
             ensure_ascii=False,
@@ -123,14 +120,9 @@ class WorkerIntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(connection.execute("SELECT count(*) FROM images").fetchone()[0], 1)
             self.assertEqual(connection.execute("SELECT count(*) FROM assets").fetchone()[0], 1)
 
-    async def test_403_refreshes_url_once_then_expires(self) -> None:
+    async def test_403_refreshes_repeatedly_without_terminal_drop(self) -> None:
         config = write_config(self.root, "ws://127.0.0.1:9")
         worker = CollectorWorker(config)
-        worker.connection.execute(
-            "INSERT INTO app_settings(key, value_json, updated_at) VALUES ('allow_403_history_refresh', 'true', ?)",
-            (int(time.time()),),
-        )
-        worker.connection.commit()
 
         async def forbidden(_request: httpx.Request) -> httpx.Response:
             return httpx.Response(403)
@@ -153,20 +145,25 @@ class WorkerIntegrationTests(unittest.IsolatedAsyncioTestCase):
         await worker._process_claimed(first)
         queued = worker.connection.execute("SELECT status, resolver_json FROM images").fetchone()
         self.assertEqual(queued[0], "queued")
-        self.assertTrue(json.loads(queued[1])["url_refresh_attempted"])
+        self.assertFalse(json.loads(queued[1])["url_refresh_attempted"])
+        self.assertEqual(json.loads(queued[1])["url_refresh_count"], 1)
         self.assertEqual(history_calls, 1)
         second = claim_next_image(worker.connection)
         await worker._process_claimed(second)
-        self.assertEqual(worker.connection.execute("SELECT status FROM images").fetchone()[0], "expired")
-        self.assertEqual(history_calls, 1)
+        status, retry_at = worker.connection.execute(
+            "SELECT status, next_retry_at FROM images"
+        ).fetchone()
+        self.assertEqual(status, "deferred")
+        self.assertGreater(retry_at, int(time.time()))
+        self.assertEqual(history_calls, 2)
         self.assertEqual(
             worker.connection.execute("SELECT sum(history_calls) FROM hourly_counters").fetchone()[0],
-            1,
+            2,
         )
         await worker.downloader.close()
         worker.connection.close()
 
-    async def test_403_default_never_calls_history(self) -> None:
+    async def test_403_always_attempts_history_and_defers_if_unavailable(self) -> None:
         worker = CollectorWorker(write_config(self.root, "ws://127.0.0.1:9"))
 
         async def forbidden(_request: httpx.Request) -> httpx.Response:
@@ -187,16 +184,16 @@ class WorkerIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
         worker.onebot.call_async = history  # type: ignore[method-assign]
         await worker._process_claimed(claim_next_image(worker.connection))
-        self.assertEqual(history_calls, 0)
+        self.assertEqual(history_calls, 1)
         status, expired = worker.connection.execute(
-            "SELECT status, (SELECT sum(expired) FROM hourly_counters) FROM images"
+            "SELECT status, (SELECT coalesce(sum(expired),0) FROM hourly_counters) FROM images"
         ).fetchone()
-        self.assertEqual(status, "expired")
-        self.assertEqual(expired, 1)
+        self.assertEqual(status, "deferred")
+        self.assertEqual(expired, 0)
         await worker.downloader.close()
         worker.connection.close()
 
-    async def test_400_default_never_calls_history_and_expires(self) -> None:
+    async def test_400_attempts_history_and_never_expires_silently(self) -> None:
         worker = CollectorWorker(write_config(self.root, "ws://127.0.0.1:9"))
 
         async def stale(_request: httpx.Request) -> httpx.Response:
@@ -224,30 +221,21 @@ class WorkerIntegrationTests(unittest.IsolatedAsyncioTestCase):
         status, resolver = worker.connection.execute(
             "SELECT status, resolver_json FROM images"
         ).fetchone()
-        self.assertEqual(status, "expired")
-        self.assertEqual(json.loads(resolver)["http_status"], 400)
-        self.assertEqual(history_calls, 0)
+        self.assertEqual(status, "deferred")
+        self.assertNotIn("http_status", json.loads(resolver))
+        self.assertEqual(history_calls, 1)
         counters = worker.connection.execute(
             """
             SELECT sum(cdn_400), sum(expired), sum(failed), sum(history_calls)
             FROM hourly_counters
             """
         ).fetchone()
-        self.assertEqual(tuple(counters), (1, 1, 0, 0))
+        self.assertEqual(tuple(counters), (1, 0, 0, 1))
         await worker.downloader.close()
         worker.connection.close()
 
     async def test_400_with_rkey_refreshes_once_then_new_url_succeeds(self) -> None:
         worker = CollectorWorker(write_config(self.root, "ws://127.0.0.1:9"))
-        worker.connection.execute(
-            """
-            INSERT INTO app_settings(key, value_json, updated_at)
-            VALUES ('allow_403_history_refresh', 'true', ?)
-            """,
-            (int(time.time()),),
-        )
-        worker.connection.commit()
-
         async def cdn(request: httpx.Request) -> httpx.Response:
             if "stale" in request.url.path:
                 return httpx.Response(400)
@@ -282,7 +270,7 @@ class WorkerIntegrationTests(unittest.IsolatedAsyncioTestCase):
         ).fetchone()
         flags = json.loads(queued[1])
         self.assertEqual(queued[0], "queued")
-        self.assertTrue(flags["url_refresh_attempted"])
+        self.assertFalse(flags["url_refresh_attempted"])
         self.assertTrue(flags["url_refreshed"])
         self.assertEqual(history_calls, 1)
 
@@ -303,16 +291,8 @@ class WorkerIntegrationTests(unittest.IsolatedAsyncioTestCase):
         await worker.downloader.close()
         worker.connection.close()
 
-    async def test_400_without_expiry_evidence_never_refreshes(self) -> None:
+    async def test_400_without_expiry_hint_still_refreshes(self) -> None:
         worker = CollectorWorker(write_config(self.root, "ws://127.0.0.1:9"))
-        worker.connection.execute(
-            """
-            INSERT INTO app_settings(key, value_json, updated_at)
-            VALUES ('allow_403_history_refresh', 'true', ?)
-            """,
-            (int(time.time()),),
-        )
-        worker.connection.commit()
 
         async def bad_request(_request: httpx.Request) -> httpx.Response:
             return httpx.Response(400)
@@ -334,29 +314,25 @@ class WorkerIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
         worker.onebot.call_async = history  # type: ignore[method-assign]
         await worker._process_claimed(claim_next_image(worker.connection))
-        self.assertEqual(history_calls, 0)
+        self.assertEqual(history_calls, 1)
         status, resolver = worker.connection.execute(
             "SELECT status, resolver_json FROM images"
         ).fetchone()
-        self.assertEqual(status, "expired")
-        self.assertEqual(json.loads(resolver)["http_status"], 400)
+        self.assertEqual(status, "deferred")
+        self.assertNotIn("http_status", json.loads(resolver))
         self.assertEqual(
             worker.connection.execute(
                 "SELECT sum(history_calls) FROM hourly_counters"
             ).fetchone()[0],
-            0,
+            1,
         )
         await worker.downloader.close()
         worker.connection.close()
 
-    async def test_400_refresh_budget_zero_defers_without_onebot_call(self) -> None:
+    async def test_obsolete_zero_budget_does_not_block_refresh(self) -> None:
         worker = CollectorWorker(write_config(self.root, "ws://127.0.0.1:9"))
         now = int(time.time())
-        for key, value in (
-            ("allow_403_history_refresh", "true"),
-            ("history_hourly_limit", "0"),
-            ("history_daily_limit", "0"),
-        ):
+        for key, value in (("history_hourly_limit", "0"), ("history_daily_limit", "0")):
             worker.connection.execute(
                 "INSERT INTO app_settings(key, value_json, updated_at) VALUES (?, ?, ?)",
                 (key, value, now),
@@ -381,7 +357,7 @@ class WorkerIntegrationTests(unittest.IsolatedAsyncioTestCase):
         async def forbidden_history(_action: str, _params: dict) -> dict:
             nonlocal history_calls
             history_calls += 1
-            raise AssertionError("history request must be blocked by the zero budget")
+            return {"messages": []}
 
         worker.onebot.call_async = forbidden_history  # type: ignore[method-assign]
         before = int(time.time())
@@ -390,18 +366,18 @@ class WorkerIntegrationTests(unittest.IsolatedAsyncioTestCase):
             "SELECT status, next_retry_at FROM images"
         ).fetchone()
         self.assertEqual(status, "deferred")
-        self.assertGreaterEqual(next_retry, before + 3590)
-        self.assertEqual(history_calls, 0)
+        self.assertGreaterEqual(next_retry, before + 299)
+        self.assertEqual(history_calls, 1)
         self.assertEqual(
             worker.connection.execute(
                 "SELECT sum(history_calls) FROM hourly_counters"
             ).fetchone()[0],
-            0,
+            1,
         )
         await worker.downloader.close()
         worker.connection.close()
 
-    async def test_404_and_410_never_call_history(self) -> None:
+    async def test_404_and_410_refresh_then_defer(self) -> None:
         for status_code in (404, 410):
             with self.subTest(status_code=status_code):
                 case_root = self.root / str(status_code)
@@ -409,15 +385,6 @@ class WorkerIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 worker = CollectorWorker(
                     write_config(case_root, "ws://127.0.0.1:9")
                 )
-                worker.connection.execute(
-                    """
-                    INSERT INTO app_settings(key, value_json, updated_at)
-                    VALUES ('allow_403_history_refresh', 'true', ?)
-                    """,
-                    (int(time.time()),),
-                )
-                worker.connection.commit()
-
                 async def missing(
                     _request: httpx.Request, code: int = status_code
                 ) -> httpx.Response:
@@ -445,40 +412,44 @@ class WorkerIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
                 worker.onebot.call_async = history  # type: ignore[method-assign]
                 await worker._process_claimed(claim_next_image(worker.connection))
-                self.assertEqual(history_calls, 0)
+                self.assertEqual(history_calls, 1)
                 status, resolver = worker.connection.execute(
                     "SELECT status, resolver_json FROM images"
                 ).fetchone()
-                self.assertEqual(status, "expired")
-                self.assertEqual(
-                    json.loads(resolver)["http_status"], status_code
-                )
+                self.assertEqual(status, "deferred")
+                self.assertNotIn("http_status", json.loads(resolver))
                 self.assertEqual(
                     worker.connection.execute(
                         "SELECT sum(history_calls) FROM hourly_counters"
                     ).fetchone()[0],
-                    0,
+                    1,
                 )
                 await worker.downloader.close()
                 worker.connection.close()
 
-    async def test_get_image_policy_violation_stops_and_pauses_worker(self) -> None:
+    async def test_get_image_policy_violation_is_blocked_without_stopping_worker(self) -> None:
         worker = CollectorWorker(write_config(self.root, "ws://127.0.0.1:9"))
         with self.assertRaises(Exception):
             await worker.onebot.call_async("get_image", {"file": "blocked"})
-        self.assertTrue(worker.stop_event.is_set())
+        self.assertFalse(worker.stop_event.is_set())
         paused = worker.connection.execute(
             "SELECT value_json FROM app_settings WHERE key='collector_paused'"
-        ).fetchone()[0]
-        self.assertEqual(paused, "true")
+        ).fetchone()
+        self.assertIsNone(paused)
         blocked = worker.connection.execute(
             "SELECT sum(get_image_blocked) FROM hourly_counters"
         ).fetchone()[0]
         self.assertEqual(blocked, 1)
+        alarm = json.loads(
+            worker.connection.execute(
+                "SELECT value_json FROM runtime_state WHERE key='critical_alarm'"
+            ).fetchone()[0]
+        )
+        self.assertTrue(alarm["active"])
         await worker.downloader.close()
         worker.connection.close()
 
-    async def test_429_defers_item_and_opens_one_hour_circuit(self) -> None:
+    async def test_429_defers_only_the_current_item(self) -> None:
         worker = CollectorWorker(write_config(self.root, "ws://127.0.0.1:9"))
         requested_hosts: list[str] = []
 
@@ -501,18 +472,19 @@ class WorkerIntegrationTests(unittest.IsolatedAsyncioTestCase):
             "SELECT status, next_retry_at, resolver_json FROM images"
         ).fetchone()
         self.assertEqual(status, "deferred")
-        self.assertGreaterEqual(next_retry, before + 3590)
-        self.assertGreaterEqual(worker.circuit_until, before + 3590)
+        self.assertGreaterEqual(next_retry, before + 4)
         self.assertIn("temporary", resolver)
         counters = worker.connection.execute(
             "SELECT sum(cdn_429), sum(history_calls) FROM hourly_counters"
         ).fetchone()
         self.assertEqual(tuple(counters), (1, 0))
         self.assertEqual(requested_hosts, ["gchat.qpic.cn"])
+        state = worker._downloader_state
+        self.assertNotIn("circuit_until", state)
         await worker.downloader.close()
         worker.connection.close()
 
-    async def test_fallback_does_not_hide_403_from_circuit_breaker(self) -> None:
+    async def test_fallback_403_and_400_defer_without_global_circuit(self) -> None:
         worker = CollectorWorker(write_config(self.root, "ws://127.0.0.1:9"))
         requested_hosts: list[str] = []
 
@@ -526,7 +498,6 @@ class WorkerIntegrationTests(unittest.IsolatedAsyncioTestCase):
         worker.downloader.client = httpx.AsyncClient(
             transport=httpx.MockTransport(expired_candidates)
         )
-        before = int(time.time())
         for index in range(3):
             event = image_event(
                 url=f"https://gchat.qpic.cn/forbidden-{index}?rkey=old"
@@ -547,7 +518,7 @@ class WorkerIntegrationTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             worker.connection.execute(
-                "SELECT count(*) FROM images WHERE status='expired'"
+                "SELECT count(*) FROM images WHERE status='deferred'"
             ).fetchone()[0],
             3,
         )
@@ -558,13 +529,12 @@ class WorkerIntegrationTests(unittest.IsolatedAsyncioTestCase):
             FROM hourly_counters
             """
         ).fetchone()
-        self.assertEqual(tuple(counters), (6, 3, 3, 3, 0))
-        self.assertEqual(len(worker.recent_403), 3)
-        self.assertGreaterEqual(worker.circuit_until, before + 3590)
+        self.assertEqual(tuple(counters), (6, 3, 3, 0, 3))
+        self.assertNotIn("circuit_until", worker._downloader_state)
         await worker.downloader.close()
         worker.connection.close()
 
-    async def test_transient_cdn_status_retries_twice_then_stops(self) -> None:
+    async def test_transient_cdn_status_keeps_retrying(self) -> None:
         for status_code in (408, 503):
             with self.subTest(status_code=status_code):
                 case_root = self.root / str(status_code)
@@ -595,25 +565,26 @@ class WorkerIntegrationTests(unittest.IsolatedAsyncioTestCase):
                         "SELECT status, attempts FROM images"
                     ).fetchone()
                     self.assertEqual(attempts, expected_attempt)
-                    self.assertEqual(
-                        status,
-                        "failed_terminal" if expected_attempt == 3 else "deferred",
-                    )
+                    self.assertEqual(status, "deferred")
                     worker.connection.execute(
                         "UPDATE images SET next_retry_at=0 WHERE status='deferred'"
                     )
                     worker.connection.commit()
 
                 self.assertEqual(calls, 3)
-                self.assertIsNone(claim_next_image(worker.connection))
+                worker.connection.execute(
+                    "UPDATE images SET next_retry_at=0 WHERE status='deferred'"
+                )
+                worker.connection.commit()
+                self.assertIsNotNone(claim_next_image(worker.connection))
                 failed = worker.connection.execute(
-                    "SELECT sum(failed) FROM hourly_counters"
+                    "SELECT coalesce(sum(failed),0) FROM hourly_counters"
                 ).fetchone()[0]
-                self.assertEqual(failed, 1)
+                self.assertEqual(failed, 0)
                 await worker.downloader.close()
                 worker.connection.close()
 
-    async def test_gap_recovery_is_bounded_to_five_pages(self) -> None:
+    async def test_gap_recovery_continues_past_five_pages_until_source_end(self) -> None:
         worker = CollectorWorker(write_config(self.root, "ws://127.0.0.1:9"))
         worker.connection.execute(
             """
@@ -629,7 +600,8 @@ class WorkerIntegrationTests(unittest.IsolatedAsyncioTestCase):
             nonlocal calls
             calls += 1
             messages = []
-            for offset in range(1, 21):
+            page_length = 1 if calls == 7 else 20
+            for offset in range(1, page_length + 1):
                 event = image_event(
                     url=f"https://gchat.qpic.cn/gap-{calls}-{offset}?rkey=short-lived"
                 )
@@ -641,19 +613,19 @@ class WorkerIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
         worker.onebot.call_async = history  # type: ignore[method-assign]
         discovered = await worker.recover_gap(GROUP)
-        self.assertEqual(discovered, 100)
-        self.assertEqual(calls, 5)
+        self.assertEqual(discovered, 121)
+        self.assertEqual(calls, 7)
         self.assertEqual(
             worker.connection.execute("SELECT gap_status FROM group_runtime WHERE group_id=?", (GROUP,)).fetchone()[0],
-            "partial",
+            "complete",
         )
         self.assertEqual(
             worker.connection.execute("SELECT sum(history_calls) FROM hourly_counters").fetchone()[0],
-            5,
+            7,
         )
         self.assertEqual(
             worker.connection.execute("SELECT count(*) FROM images WHERE status='queued'").fetchone()[0],
-            100,
+            121,
         )
         durable = worker.connection.execute(
             "SELECT last_message_id, last_message_seq FROM group_runtime WHERE group_id=?",
@@ -663,7 +635,7 @@ class WorkerIntegrationTests(unittest.IsolatedAsyncioTestCase):
         await worker.downloader.close()
         worker.connection.close()
 
-    async def test_live_only_marker_blocks_ordinary_history_before_network(self) -> None:
+    async def test_legacy_live_only_marker_does_not_block_gap_recovery(self) -> None:
         worker = CollectorWorker(write_config(self.root, "ws://127.0.0.1:9"))
         now = int(time.time())
         worker.connection.execute(
@@ -674,8 +646,11 @@ class WorkerIntegrationTests(unittest.IsolatedAsyncioTestCase):
             (now,),
         )
         worker.connection.execute(
-            "UPDATE group_runtime SET last_message_id=?, last_message_seq=? WHERE group_id=?",
-            (MESSAGE, "12345", GROUP),
+            """
+            UPDATE group_runtime SET last_message_id=?, last_message_seq=?,
+                last_message_time=? WHERE group_id=?
+            """,
+            (MESSAGE, "12345", 1_704_067_200, GROUP),
         )
         worker.connection.commit()
         calls = 0
@@ -686,17 +661,26 @@ class WorkerIntegrationTests(unittest.IsolatedAsyncioTestCase):
             return {"messages": []}
 
         worker.onebot.call_async = history  # type: ignore[method-assign]
-        with self.assertRaisesRegex(HistoryBudgetExceeded, "live-only production policy"):
-            await worker.recover_gap(GROUP)
-        self.assertEqual(calls, 0)
+        self.assertEqual(await worker.recover_gap(GROUP), 0)
+        self.assertEqual(calls, 1)
         self.assertEqual(
             worker.connection.execute(
                 "SELECT coalesce(sum(history_calls),0) FROM hourly_counters"
             ).fetchone()[0],
-            0,
+            1,
         )
         await worker.downloader.close()
         worker.connection.close()
+
+    async def test_background_task_exit_fails_fast_instead_of_fake_alive(self) -> None:
+        worker = CollectorWorker(write_config(self.root, "ws://127.0.0.1:9"))
+
+        async def listener_failure() -> None:
+            raise RuntimeError("synthetic listener failure")
+
+        worker.listener.run = listener_failure  # type: ignore[method-assign]
+        with self.assertRaisesRegex(RuntimeError, "synthetic listener failure"):
+            await asyncio.wait_for(worker.run(), timeout=3)
 
 
 if __name__ == "__main__":

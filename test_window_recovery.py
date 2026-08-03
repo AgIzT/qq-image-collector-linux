@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import datetime as dt
 import json
 import sqlite3
 import tempfile
@@ -606,64 +605,17 @@ class WindowRecoveryTests(unittest.TestCase):
         self.assertEqual(fake.calls, [])
         self.assertEqual(phases[-1], "waiting_queue")
 
-    def test_interval_hourly_daily_and_per_group_budgets(self) -> None:
+    def test_zero_limits_ignore_prior_calls_queue_depth_and_group_count(self) -> None:
         fake = FakeOneBot(page(history_message(104, NOT_AFTER + 1)))
         runner = self.make_runner(
             fake,
-            interval_seconds=600,
-            hourly_limit=2,
-            daily_limit=3,
-            max_calls_per_group=2,
+            interval_seconds=0,
+            hourly_limit=0,
+            daily_limit=0,
+            max_calls_per_group=0,
+            queue_threshold=-1,
         )
         runner.initialize()
-        midday = int(
-            dt.datetime(
-                2026,
-                8,
-                2,
-                12,
-                tzinfo=dt.timezone(dt.timedelta(hours=8)),
-            ).timestamp()
-        )
-
-        def insert_calls(*timestamps: int) -> None:
-            runner.connection.execute("DELETE FROM window_recovery_calls")
-            runner.connection.executemany(
-                """
-                INSERT INTO window_recovery_calls(
-                    group_id, not_before, not_after, called_at, outcome
-                ) VALUES (?, ?, ?, ?, 'ok')
-                """,
-                [(GROUP, NOT_BEFORE, NOT_AFTER, value) for value in timestamps],
-            )
-            runner.connection.commit()
-
-        insert_calls(midday - 100)
-        self.assertEqual(runner._budget_wait_seconds(midday), 500)
-        insert_calls(midday - 1800, midday - 1000)
-        self.assertGreaterEqual(runner._budget_wait_seconds(midday), 1801)
-        day_start = int(
-            dt.datetime(
-                2026,
-                8,
-                2,
-                tzinfo=dt.timezone(dt.timedelta(hours=8)),
-            ).timestamp()
-        )
-        insert_calls(day_start + 100, day_start + 200, day_start + 300)
-        self.assertEqual(runner._budget_wait_seconds(midday), day_start + 86400 - midday)
-
-        # A positive wait is a hard API gate.
-        insert_calls(midday - 100)
-        phases: list[str] = []
-        runner._publish_state = lambda phase, **_extra: phases.append(phase) or {}  # type: ignore[method-assign]
-        with mock.patch("qq_image_collector.window_recovery.time.time", return_value=midday):
-            self.assertFalse(runner.process_one_page())
-        self.assertEqual(fake.calls, [])
-        self.assertEqual(phases[-1], "waiting_budget")
-
-        # The per-group cap also terminates locally without an API call.
-        runner.connection.execute("DELETE FROM window_recovery_calls")
         runner.connection.executemany(
             """
             INSERT INTO window_recovery_calls(
@@ -671,18 +623,24 @@ class WindowRecoveryTests(unittest.TestCase):
             ) VALUES (?, ?, ?, ?, 'ok')
             """,
             [
-                (GROUP, NOT_BEFORE, NOT_AFTER, midday - 2000),
-                (GROUP, NOT_BEFORE, NOT_AFTER, midday - 1000),
+                (GROUP, NOT_BEFORE, NOT_AFTER, NOT_AFTER + index)
+                for index in range(500)
             ],
         )
-        runner.connection.commit()
-        runner._budget_wait_seconds = lambda _now: 0  # type: ignore[method-assign]
-        self.assertTrue(runner.process_one_page())
-        self.assertEqual(fake.calls, [])
-        self.assertEqual(
-            runner.connection.execute("SELECT status FROM window_recovery_jobs").fetchone()[0],
-            "partial_max_calls",
+        runner.connection.execute(
+            """
+            INSERT INTO images(
+                group_id, message_id, message_seq, image_index, sent_at,
+                status, updated_at, resolver, resolver_json, discovered_at
+            ) VALUES (?, 'queued-test', 'queued-test', 0, ?, 'queued', ?,
+                      'event-cdn', '{}', ?)
+            """,
+            (GROUP, NOT_AFTER, NOT_AFTER, NOT_AFTER),
         )
+        runner.connection.commit()
+        self.assertEqual(runner._budget_wait_seconds(NOT_AFTER + 1000), 0)
+        self.assertTrue(runner.process_one_page())
+        self.assertEqual(len(fake.calls), 1)
 
     def test_page_crossing_lower_bound_completes_without_an_extra_call(self) -> None:
         fake = FakeOneBot(
@@ -736,7 +694,7 @@ class WindowRecoveryTests(unittest.TestCase):
             runner.process_one_page()
         self.assertEqual(fake.calls, [])
 
-    def test_short_anchor_failures_stop_after_three_safe_replays(self) -> None:
+    def test_short_anchor_failures_keep_replaying_from_durable_anchor(self) -> None:
         fake = FakeOneBot(OneBotError("short id expired"), OneBotError("expired again"))
         runner = self.make_runner(fake, queue_threshold=10)
         runner.initialize()
@@ -758,8 +716,8 @@ class WindowRecoveryTests(unittest.TestCase):
         self.assertEqual(job["replay_count"], 3)
         self.assertEqual(job["next_anchor_id"], RAW_ANCHOR)
 
-        # Simulate making backward progress once more after the third raw replay;
-        # the next short-ID failure must terminate instead of starting replay 4.
+        # A later short-ID failure starts another safe replay instead of
+        # permanently abandoning the bounded recovery window.
         runner.connection.execute(
             """
             UPDATE window_recovery_jobs
@@ -772,9 +730,9 @@ class WindowRecoveryTests(unittest.TestCase):
         self.assertTrue(runner.process_one_page())
 
         job = runner.connection.execute("SELECT * FROM window_recovery_jobs").fetchone()
-        self.assertEqual(job["status"], "failed_anchor")
-        self.assertEqual(job["replay_count"], 3)
-        self.assertIn("three safe replays", job["last_error"])
+        self.assertEqual(job["status"], "probe")
+        self.assertEqual(job["replay_count"], 4)
+        self.assertEqual(job["next_anchor_id"], RAW_ANCHOR)
         self.assertEqual(len(fake.calls), 2)
 
 

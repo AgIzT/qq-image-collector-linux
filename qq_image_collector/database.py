@@ -7,7 +7,7 @@ import os
 import sqlite3
 import time
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 from urllib.parse import urlsplit
 
 
@@ -85,12 +85,14 @@ def connect_database(
 ) -> sqlite3.Connection:
     database = Path(path)
     database.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(database, timeout=60)
-    connection.execute("PRAGMA busy_timeout=60000")
+    connection = sqlite3.connect(database, timeout=5)
+    connection.execute("PRAGMA busy_timeout=5000")
     connection.execute("PRAGMA foreign_keys=ON")
     if not initialize:
         return connection
     connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("PRAGMA synchronous=NORMAL")
+    connection.execute("PRAGMA wal_autocheckpoint=10000")
     connection.execute(
         """
         CREATE TABLE IF NOT EXISTS images (
@@ -426,16 +428,38 @@ def connect_database(
     return connection
 
 
+def _retry_locked_write(
+    connection: sqlite3.Connection,
+    operation: Callable[[], None],
+    *,
+    attempts: int = 4,
+) -> None:
+    for attempt in range(max(1, attempts)):
+        try:
+            operation()
+            connection.commit()
+            return
+        except sqlite3.OperationalError as exc:
+            connection.rollback()
+            if "locked" not in str(exc).casefold() or attempt + 1 >= attempts:
+                raise
+            time.sleep(min(1.0, 0.1 * (2**attempt)))
+
+
 def set_runtime_state(connection: sqlite3.Connection, key: str, value: Any) -> None:
     now = int(time.time())
-    connection.execute(
-        """
-        INSERT INTO runtime_state(key, value_json, updated_at) VALUES (?, ?, ?)
-        ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json, updated_at=excluded.updated_at
-        """,
-        (key, json.dumps(value, ensure_ascii=False), now),
-    )
-    connection.commit()
+    payload = json.dumps(value, ensure_ascii=False)
+
+    def write() -> None:
+        connection.execute(
+            """
+            INSERT INTO runtime_state(key, value_json, updated_at) VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json, updated_at=excluded.updated_at
+            """,
+            (key, payload, now),
+        )
+
+    _retry_locked_write(connection, write)
 
 
 def get_runtime_state(connection: sqlite3.Connection, key: str, default: Any = None) -> Any:
@@ -459,15 +483,17 @@ def increment_counter(
         raise ValueError(f"unknown counter: {column}")
     now = int(timestamp or time.time())
     bucket = now - now % 3600
-    connection.execute(
-        "INSERT OR IGNORE INTO hourly_counters(bucket_start, updated_at) VALUES (?, ?)",
-        (bucket, now),
-    )
-    connection.execute(
-        f"UPDATE hourly_counters SET {column}={column}+?, updated_at=? WHERE bucket_start=?",
-        (int(amount), now, bucket),
-    )
-    connection.commit()
+    def write() -> None:
+        connection.execute(
+            "INSERT OR IGNORE INTO hourly_counters(bucket_start, updated_at) VALUES (?, ?)",
+            (bucket, now),
+        )
+        connection.execute(
+            f"UPDATE hourly_counters SET {column}={column}+?, updated_at=? WHERE bucket_start=?",
+            (int(amount), now, bucket),
+        )
+
+    _retry_locked_write(connection, write)
 
 
 def counter_sum(

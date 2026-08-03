@@ -84,11 +84,7 @@ def report(config: Path, hours: int) -> tuple[dict[str, object], bool]:
     finally:
         connection.close()
     duration_met = observation_seconds >= max(1, hours) * 3600
-    gate = (
-        duration_met
-        and counters.get("history_calls", 0) == 0
-        and counters.get("get_image_blocked", 0) == 0
-    )
+    gate = duration_met and counters.get("get_image_blocked", 0) == 0
     return (
         {
             "schema": 1,
@@ -103,7 +99,7 @@ def report(config: Path, hours: int) -> tuple[dict[str, object], bool]:
             "original_flag_distribution": original,
             "original_flag_by_status": original_status,
             "steady_state_gate": "pass" if gate else "fail",
-            "gate_rule": "history_calls == 0 and get_image_blocked == 0",
+            "gate_rule": "get_image_blocked == 0; history is diagnostic only",
             "privacy": "no account, group, sender, filename or URL values are emitted",
         },
         gate,

@@ -40,7 +40,7 @@ services:
     build:
       context: ..
       dockerfile: linux/Dockerfile
-    image: qq-ai-image-collector-console:1.1.5-event
+    image: qq-ai-image-collector-console:1.1.6-event
     container_name: qqai-collector-console
     restart: unless-stopped
     init: true
@@ -72,7 +72,7 @@ services:
       options: {max-size: "10m", max-file: "3"}
 
   cache-cleaner:
-    image: qq-ai-image-collector-console:1.1.5-event
+    image: qq-ai-image-collector-console:1.1.6-event
     container_name: qqai-cache-cleaner
     restart: unless-stopped
     init: true
@@ -115,7 +115,7 @@ services:
 
   window-recovery:
     profiles: ["window-recovery"]
-    image: qq-ai-image-collector-console:1.1.5-event
+    image: qq-ai-image-collector-console:1.1.6-event
     container_name: qqai-window-recovery
     restart: unless-stopped
     init: true
@@ -139,17 +139,17 @@ services:
       - --page-size
       - "20"
       - --interval-seconds
-      - "600"
+      - "2"
       - --hourly-limit
-      - "6"
-      - --daily-limit
-      - "20"
-      - --max-calls-per-group
-      - "200"
-      - --queue-threshold
       - "0"
+      - --daily-limit
+      - "0"
+      - --max-calls-per-group
+      - "0"
+      - --queue-threshold
+      - "-1"
       - --poll-seconds
-      - "30"
+      - "2"
     environment:
       QQ_IMAGE_COLLECTOR_CONFIG: /data/qq-image-collector/config/collector_config.json
       TZ: Asia/Shanghai

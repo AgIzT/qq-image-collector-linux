@@ -118,11 +118,9 @@ export type Settings = {
   external_services?: boolean;
   download_interval_seconds: number;
   download_jitter_seconds: number;
-  daily_download_limit: number;
   url_preference: "data" | "raw";
-  history_hourly_limit: number;
-  history_daily_limit: number;
   collector_paused: boolean;
+  unlimited_collection: boolean;
   remote_restricted?: boolean;
 };
 

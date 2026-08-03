@@ -3,12 +3,21 @@
 本文记录生产链路的不可变约束。流程、解析或风险模型更新时，必须同时更新本文、
 测试和控制台字段。
 
+## 2026-08-03 停采纠正
+
+服务器在 2026-08-02 夜间发生 `sqlite3.OperationalError: database is locked`：事件
+协程在异常处理里再次写库并退出，而父 Worker 只等待停止信号，留下 PID 存活、WS/CDN
+连接均不存在的假活。v1.1.6 增加数据库锁恢复、后台任务监管和三路心跳，并删除此前
+基于一次封号而加入的每日下载、历史小时/每日、每群页数、队列清空等待、连续 403
+熔断及三次失败永久终止。必要的固定时间边界、GIF/元数据筛选、SHA-256 去重、QQ CDN
+主机校验和 128 MiB 单文件边界不属于数量配额，继续保留。
+
 ## 风险模型
 
-现有对照数据表明，账号存活差异与 `get_image/downloadRichMedia`、批量
-`get_group_msg_history` 等账号会话动作相关，而不是 CDN 下载字节量或境外 IP。
-因此安全边界是 OneBot 动作白名单、历史调用配额和可审计计数；15 秒下载间隔与
-每日 3000 次请求上限仅防止本地队列失控，不能被描述为防封手段。
+现有对照数据没有证明 CDN 下载字节量或境外 IP 会导致账号失效。生产仍使用 OneBot
+动作白名单和可审计计数，但不再把未经验证的账号风险假设实现为会漏图的配额：CDN
+下载、断档恢复、URL 刷新均没有每日、每小时、每群页数或总队列上限。15 秒间隔、
+单并发和错误退避只控制处理节奏，不得导致任务永久失效。
 
 ## 事件与图片身份
 
@@ -20,8 +29,8 @@ NapCat HTTP/WS 均为 `messagePostFormat=array`、`debug=true`，且只存在于
 - 标准图片与 raw `picElement` 先按文件名、再按 MD5 一对一匹配。
 - 有标识但不匹配时禁止按数组位置回退；双方均无标识且只有一个候选时才允许
   `position-unverified`。
-- 未匹配 raw `picElement` 仍以 `raw-only` 入队。即使没有可用 URL，也必须形成
-  明确的 `expired` 告警，不能静默消失。
+- 未匹配 raw `picElement` 仍以 `raw-only` 入队。即使暂时没有可用 URL，也必须
+  保持 `deferred` 并尝试按消息游标刷新，不能静默消失。
 - live raw `msgId` 是持久实时锚点，raw `msgSeq`/历史 `real_seq` 用于跨实时与
   历史去重。NapCat 历史短 `message_id/message_seq` 仅作当次响应标识，不得覆盖
   live 锚点。
@@ -35,7 +44,7 @@ NapCat HTTP/WS 均为 `messagePostFormat=array`、`debug=true`，且只存在于
 ```text
 queued/deferred -> downloading
   -> accepted | rejected_no_metadata | filtered_gif
-  -> expired | failed_terminal
+  -> failed_terminal（仅文件/URL 安全策略不可满足）
 ```
 
 `original` 只参与优先级；NULL 时使用大小、宽高、扩展名和表情信号降级判断。
@@ -43,10 +52,10 @@ rkey URL 记录 `url_expires_at` 为“保守 6 小时、尚未实测”的调�
 最后一小时才越过普通优先级。Test D 完成后才能把该提示改成真实 TTL。
 
 候选 URL 按配置顺序逐个做 HTTPS/主机白名单验证。首选非法、400、403、404 或 410
-时先尝试事件已有的第二个合法候选，不产生账号会话请求。5xx/408/425 最多退避
-三次；429 熔断一小时。`expired` 与普通失败分开统计。终态保存两路 URL 指纹，
-后续直接事件或已经发生的有限断档若带来不同 URL，可原地复活；同一 URL 不会
-循环复活。
+时先尝试事件已有的第二个合法候选；两条均失效后用该消息的 raw `msgId` 刷新 URL。
+历史仍返回相同 URL 时按 1 分钟到 1 小时指数退避，网络错误、408/425/5xx 也持续
+退避重试。429 只延后当前任务 5 分钟，不建立全局熔断。网络响应次数本身不能把
+图片转成永久失败。
 
 终态从 `resolver_json` 删除完整 URL/rkey，只保留主机、URL 指纹、HTTP 状态与
 诊断字段。错误字符串不得包含 URL。
@@ -56,7 +65,7 @@ PNG 原始 `tEXt/iTXt/zTXt` 扫描必须由八字节 PNG 魔数
 `89 50 4E 47 0D 0A 1A 0A`（并结合实际解码格式）驱动，禁止因为临时后缀不是 `.png`
 而跳过。最终扩展名只能在识别真实字节格式后确定。
 
-## 账号会话断路器
+## 账号会话与自动恢复
 
 生产 OneBot 客户端只允许：
 
@@ -65,13 +74,18 @@ PNG 原始 `tEXt/iTXt/zTXt` 扫描必须由八字节 PNG 魔数
 - `get_version_info`
 - `get_group_msg_history`
 
-`get_image` 在网络前硬拒绝，递增 `get_image_blocked`、设置
-`collector_paused=true`、写 `critical_alarm` 并停止 Worker。400/403 默认不会刷新
-历史 URL；只有显式启用、且 400 同时具备 event-cdn、原始消息序号与 rkey/到期证据
-时才允许尝试。生产 live-only 标记存在时，常驻 Worker 在预算检查的最前面硬拒绝
-所有普通 history 调用；手动 `recover-gap` 与任意 `backfill` API 都返回 410。即使误把
-小时/每日额度改成非零，WS 重连和过期 URL 也不能发出请求。历史结果不能更新 live
-游标。任意日期回填、连续回填、启动轮询和 QCE 运行时均不存在。
+`get_image` 在网络前硬拒绝，递增 `get_image_blocked` 并写 `critical_alarm`；这次违规
+调用本身失败，但不会设置 `collector_paused` 或停止其余采集。
+
+WS 中断超过 3 秒时，常驻 Worker 从每群最后持久化的 raw `msgId/msgSeq/time` 向前
+翻页到本次重连时刻。历史消息只能入队，不能覆盖 live 游标；首次没有 live 游标时
+从当前事件开始。手动 `recover-gap` 复用同一规则，任意日期 `backfill` 仍返回 410。
+URL 失效时只按该图片消息刷新，不倒扫历史。QCE、启动轮询和连续历史回填不存在。
+
+Worker、事件流和下载循环每 10 秒写独立心跳。父协程使用 `FIRST_COMPLETED` 监管所有
+后台任务：任一任务异常退出时整个 Worker 清理连接并在 5 秒后重建。SQLite runtime
+和计数写入对 `database is locked` 做有限本地重试；事件状态写失败不能终止 WS 重连。
+因此 PID 存活不再被单独视为健康，控制台同时校验进程与心跳新鲜度。
 
 `linux/diagnostic_compare.py` 与生产 Worker 隔离：Test B 只有显式危险参数才调用
 一次 `get_image`，并在请求前写入不可重复 sentinel；Test C 默认只比较源文件与
@@ -121,12 +135,11 @@ raw `msgSeq`；返回的稳定持久身份是 `real_seq`。恢复器使用 `reve
 4. 历史中的 `message_sent` 强制规范化为 `message`，避免漏掉登录账号自己发送的图；
 5. 时间随递增 `real_seq` 不倒退时，首个 `min(page_time)<not_before` 的跨界页处理
    完成后即可结束；短页、空页、锚点不进、方向异常或字段缺失均不能伪装完成；
-6. 每 10 分钟至多一页、每小时 6 次、每天 20 次、每群最多 200 次；全局图片队列未
-   清空时不取下一页，避免历史 URL 等待过久失效；
+6. 每页之间默认等待 2 秒；没有每小时、每日、每群页数或队列深度停止条件；
 7. NapCat short ID 映射失效时回到当前 raw 上界重扫；该 raw ID 也不可用时退回最新页
    引导，依赖 `real_seq` 去重；绝不把 raw `msgSeq` 冒充 API 锚点；
-8. 普通 history 预算始终为 0，恢复调用另计 `window_history_calls`；完成后停止并移除
-   profile 容器，实时 WS 采集全程继续。
+8. 恢复调用另计 `window_history_calls`；完成后停止并移除 profile 容器，实时 WS
+   采集全程继续。
 
 Test A 与主动发图诊断分开，以降低用户负担。它必须在 Worker 暂停、所有生产群停用
 时，对一个明确指定的目标群进行只读 WS 被动累计，直到取得不少于 200 个图片段；必须
