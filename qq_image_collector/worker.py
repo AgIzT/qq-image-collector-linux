@@ -319,7 +319,12 @@ class CollectorWorker:
         data = resolver_data(row)
         if data.get("url_refresh_attempted"):
             return "unavailable"
-        raw_anchor = str(data.get("raw_message_id") or row["message_id"] or "")
+        raw_anchor = str(
+            data.get("raw_message_id")
+            or data.get("history_message_id")
+            or row["message_id"]
+            or ""
+        )
         if not raw_anchor:
             return "unavailable"
         async with self._history_lock:
@@ -516,6 +521,25 @@ class CollectorWorker:
         )
         self.connection.commit()
 
+    def _requires_bounded_page_replay(
+        self,
+        row: sqlite3.Row,
+        data: dict[str, Any],
+    ) -> bool:
+        if str(data.get("history_source") or "") == "window-recovery":
+            return True
+        if data.get("raw_message_id"):
+            return False
+        message_id = str(row["message_id"] or "")
+        if not message_id.isdecimal() or len(message_id) >= 15:
+            return False
+        sent_at = int(row["sent_at"] or 0)
+        lower = int(_setting(self.connection, "production_history_floor", 0) or 0)
+        upper = int(
+            _setting(self.connection, "production_live_only_started_at", 0) or 0
+        )
+        return lower > 0 and lower <= sent_at <= upper
+
     async def _process_claimed(
         self,
         row: sqlite3.Row,
@@ -523,7 +547,23 @@ class CollectorWorker:
         allow_refresh: bool = True,
     ) -> None:
         try:
-            if not candidate_urls(row, self.downloader.url_preference):
+            candidates = candidate_urls(row, self.downloader.url_preference)
+            if not candidates:
+                data = resolver_data(row)
+                if self._requires_bounded_page_replay(row, data):
+                    defer_image(
+                        self.connection,
+                        row,
+                        delay_seconds=86400,
+                        error="expired history short ID; awaiting bounded page replay",
+                    )
+                    self._persist_downloader_state(
+                        status="running",
+                        last_success_at=int(time.time()),
+                        last_result="awaiting_page_replay",
+                        last_error=None,
+                    )
+                    return
                 if not allow_refresh:
                     self._defer_refresh_retry(
                         row,

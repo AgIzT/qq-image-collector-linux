@@ -335,6 +335,57 @@ class WorkerIntegrationTests(unittest.IsolatedAsyncioTestCase):
         await worker.downloader.close()
         worker.connection.close()
 
+    async def test_expired_window_short_id_waits_for_page_replay_without_network(self) -> None:
+        worker = CollectorWorker(write_config(self.root, "ws://127.0.0.1:9"))
+        event = image_event(
+            url="https://multimedia.nt.qq.com.cn/window-stale?rkey=old"
+        )
+        event.pop("raw")
+        event["message_id"] = 123456789
+        event["real_seq"] = 654321
+        _cursor, items = parse_group_event(event)
+        sent_at = int(items[0]["sent_at"])
+        items[0]["resolver_data"]["url_expires_at"] = int(time.time()) - 1
+        enqueue_image(worker.connection, items[0])
+        now = int(time.time())
+        worker.connection.executemany(
+            "INSERT INTO app_settings(key,value_json,updated_at) VALUES (?,?,?)",
+            (
+                ("production_history_floor", json.dumps(sent_at - 1), now),
+                ("production_live_only_started_at", json.dumps(sent_at + 1), now),
+            ),
+        )
+        worker.connection.commit()
+
+        async def forbidden_cdn(_request: httpx.Request) -> httpx.Response:
+            raise AssertionError("expired window row must not call CDN")
+
+        async def forbidden_history(_action: str, _params: dict) -> dict:
+            raise AssertionError("expired short ID must not call OneBot history")
+
+        await worker.downloader.client.aclose()
+        worker.downloader.client = httpx.AsyncClient(
+            transport=httpx.MockTransport(forbidden_cdn)
+        )
+        worker.onebot.call_async = forbidden_history  # type: ignore[method-assign]
+        before = int(time.time())
+        await worker._process_claimed(claim_next_image(worker.connection))
+        status, next_retry, error = worker.connection.execute(
+            "SELECT status,next_retry_at,error FROM images"
+        ).fetchone()
+        self.assertEqual(status, "deferred")
+        self.assertGreaterEqual(next_retry, before + 86399)
+        self.assertIn("awaiting bounded page replay", error)
+        counters = worker.connection.execute(
+            """
+            SELECT coalesce(sum(cdn_requests),0), coalesce(sum(history_calls),0)
+            FROM hourly_counters
+            """
+        ).fetchone()
+        self.assertEqual(tuple(counters), (0, 0))
+        await worker.downloader.close()
+        worker.connection.close()
+
     async def test_400_without_expiry_hint_still_refreshes(self) -> None:
         worker = CollectorWorker(write_config(self.root, "ws://127.0.0.1:9"))
 
