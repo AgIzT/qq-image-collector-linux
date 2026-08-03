@@ -23,6 +23,7 @@ from typing import Any
 
 from .config import load_settings
 from .database import (
+    TERMINAL_IMAGE_STATUSES,
     connect_database,
     enqueue_image,
     increment_counter,
@@ -148,6 +149,8 @@ class WindowRecoveryRunner:
         max_calls_per_group: int = 0,
         queue_threshold: int = -1,
         poll_seconds: int = 2,
+        drain_pages: bool = False,
+        pending_timeout_seconds: int = 1200,
         onebot: OneBotClient | None = None,
     ) -> None:
         if not_before <= 0 or not_after <= not_before:
@@ -158,6 +161,8 @@ class WindowRecoveryRunner:
             raise WindowPolicyError("invalid recovery rate")
         if max_calls_per_group < 0 or queue_threshold < -1:
             raise WindowPolicyError("invalid recovery limits")
+        if pending_timeout_seconds <= 0:
+            raise WindowPolicyError("invalid pending-page timeout")
 
         self.config_path = Path(config_path)
         self.settings = load_settings(self.config_path)
@@ -173,6 +178,8 @@ class WindowRecoveryRunner:
         self.max_calls_per_group = int(max_calls_per_group)
         self.queue_threshold = int(queue_threshold)
         self.poll_seconds = max(1, int(poll_seconds))
+        self.drain_pages = bool(drain_pages)
+        self.pending_timeout_seconds = int(pending_timeout_seconds)
         self.onebot = onebot or OneBotClient.from_settings(self.settings["onebot"])
         self.stop_event = threading.Event()
         self._last_state_publish_at = 0.0
@@ -417,6 +424,88 @@ class WindowRecoveryRunner:
             (self.not_before, self.not_after, now),
         ).fetchone()
 
+    def _pending_job(self) -> sqlite3.Row | None:
+        return self.connection.execute(
+            """
+            SELECT * FROM window_recovery_jobs
+            WHERE not_before=? AND not_after=?
+              AND pending_page_json IS NOT NULL AND pending_page_json<>''
+            ORDER BY updated_at, id
+            LIMIT 1
+            """,
+            (self.not_before, self.not_after),
+        ).fetchone()
+
+    def _service_pending_page(self, now: int) -> bool | None:
+        job = self._pending_job()
+        if job is None:
+            return None
+        try:
+            pending = json.loads(str(job["pending_page_json"] or "{}"))
+        except (TypeError, ValueError):
+            pending = {}
+        items = pending.get("items") if isinstance(pending, dict) else None
+        if not isinstance(items, list):
+            items = []
+        active = 0
+        for value in items:
+            if not isinstance(value, list) or len(value) != 2:
+                continue
+            row = self.connection.execute(
+                """
+                SELECT status FROM images
+                WHERE group_id=? AND message_seq=? AND image_index=?
+                ORDER BY discovered_at LIMIT 1
+                """,
+                (str(job["group_id"]), str(value[0]), int(value[1])),
+            ).fetchone()
+            if row and str(row[0]) not in TERMINAL_IMAGE_STATUSES:
+                active += 1
+        if active == 0:
+            self.connection.execute(
+                """
+                UPDATE window_recovery_jobs
+                SET pending_page_json=NULL, last_error=NULL, updated_at=?
+                WHERE id=?
+                """,
+                (now, int(job["id"])),
+            )
+            self.connection.commit()
+            self._publish_state("running", pending_images=0)
+            return True
+
+        captured_at = int(pending.get("captured_at") or now)
+        if now - captured_at >= self.pending_timeout_seconds:
+            status_before = str(pending.get("status_before") or "queued")
+            if status_before not in NONTERMINAL_STATUSES:
+                status_before = "queued"
+            self.connection.execute(
+                """
+                UPDATE window_recovery_jobs
+                SET status=?, probe_ok=?, next_anchor_id=?, next_anchor_seq=?,
+                    next_anchor_time=?, next_retry_at=0,
+                    last_page_fingerprint=NULL, pending_page_json=NULL,
+                    last_error='pending page did not drain; replaying the same page',
+                    updated_at=?, finished_at=NULL
+                WHERE id=?
+                """,
+                (
+                    status_before,
+                    int(pending.get("probe_ok_before") or 0),
+                    str(pending.get("anchor_id") or "0"),
+                    str(pending.get("anchor_seq") or "0"),
+                    int(pending.get("anchor_time") or 0),
+                    now,
+                    int(job["id"]),
+                ),
+            )
+            self.connection.commit()
+            self._publish_state("replaying_page", pending_images=active)
+            return True
+
+        self._publish_state("draining_page", pending_images=active)
+        return False
+
     def _job_call_count(self, group_id: str) -> int:
         return int(
             self.connection.execute(
@@ -558,6 +647,10 @@ class WindowRecoveryRunner:
     def process_one_page(self) -> bool:
         self._safety_check()
         now = int(time.time())
+        if self.drain_pages:
+            pending_result = self._service_pending_page(now)
+            if pending_result is not None:
+                return pending_result
         if (
             self.queue_threshold >= 0
             and queue_snapshot(self.connection)["depth"] > self.queue_threshold
@@ -673,6 +766,7 @@ class WindowRecoveryRunner:
         messages_in_window = 0
         images_enqueued = 0
         duplicates = 0
+        pending_items: set[tuple[str, int]] = set()
         for row in page:
             sent_at = int(row["sent_at"])
             if not (self.not_before <= sent_at <= self.not_after):
@@ -685,6 +779,13 @@ class WindowRecoveryRunner:
                 item_time = int(item.get("sent_at") or 0)
                 if not (self.not_before <= item_time <= self.not_after):
                     raise WindowPolicyError("parser emitted an out-of-window image")
+                resolver = dict(item.get("resolver_data") or {})
+                resolver["history_source"] = "window-recovery"
+                resolver["history_message_id"] = str(row["message_id"])
+                resolver["history_real_seq"] = str(row["real_seq"])
+                item["resolver_data"] = resolver
+                sequence = str(item.get("message_seq") or row["real_seq"])
+                pending_items.add((sequence, int(item.get("image_index") or 0)))
                 if enqueue_image(self.connection, item, commit=False):
                     increment_counter(self.connection, "images_seen", commit=False)
                     increment_counter(self.connection, "image_segments", commit=False)
@@ -698,6 +799,20 @@ class WindowRecoveryRunner:
         # bound, every subsequent page is older than the outage window.
         completed = min(page_times) < self.not_before
         status = "completed" if completed else "queued"
+        pending_page = None
+        if self.drain_pages and pending_items:
+            pending_page = json.dumps(
+                {
+                    "captured_at": now,
+                    "anchor_id": str(job["next_anchor_id"]),
+                    "anchor_seq": str(job["next_anchor_seq"]),
+                    "anchor_time": int(job["next_anchor_time"]),
+                    "status_before": str(job["status"]),
+                    "probe_ok_before": int(job["probe_ok"] or 0),
+                    "items": [list(value) for value in sorted(pending_items)],
+                },
+                ensure_ascii=False,
+            )
         self.connection.execute(
             """
             UPDATE window_recovery_jobs
@@ -707,7 +822,7 @@ class WindowRecoveryRunner:
                 images_enqueued=images_enqueued+?, duplicates=duplicates+?,
                 next_anchor_id=?, next_anchor_seq=?, next_anchor_time=?,
                 next_retry_at=?, last_page_fingerprint=?, retry_count=0,
-                last_error=NULL, updated_at=?, finished_at=?
+                pending_page_json=?, last_error=NULL, updated_at=?, finished_at=?
             WHERE id=?
             """,
             (
@@ -721,6 +836,7 @@ class WindowRecoveryRunner:
                 int(oldest["sent_at"]),
                 now + self.interval_seconds,
                 fingerprint,
+                pending_page,
                 now,
                 now if completed else None,
                 int(job["id"]),
@@ -759,13 +875,24 @@ class WindowRecoveryRunner:
             )
         }
         terminal = sum(statuses.get(value, 0) for value in TERMINAL_STATUSES)
+        pending_pages = int(
+            self.connection.execute(
+                """
+                SELECT count(*) FROM window_recovery_jobs
+                WHERE not_before=? AND not_after=?
+                  AND pending_page_json IS NOT NULL AND pending_page_json<>''
+                """,
+                (self.not_before, self.not_after),
+            ).fetchone()[0]
+        )
         result = {
-            "active": terminal < self.expected_groups,
+            "active": terminal < self.expected_groups or pending_pages > 0,
             "phase": phase,
             "not_before": self.not_before,
             "not_after": self.not_after,
             "groups_total": self.expected_groups,
             "groups_terminal": terminal,
+            "pending_pages": pending_pages,
             "statuses": statuses,
             **totals,
             "queue_depth": int(queue_snapshot(self.connection)["depth"]),
@@ -822,6 +949,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-calls-per-group", type=int, default=0)
     parser.add_argument("--queue-threshold", type=int, default=-1)
     parser.add_argument("--poll-seconds", type=int, default=2)
+    parser.add_argument("--drain-pages", action="store_true")
+    parser.add_argument("--pending-timeout-seconds", type=int, default=1200)
     return parser
 
 
@@ -839,6 +968,8 @@ def main() -> int:
         max_calls_per_group=args.max_calls_per_group,
         queue_threshold=args.queue_threshold,
         poll_seconds=args.poll_seconds,
+        drain_pages=args.drain_pages,
+        pending_timeout_seconds=args.pending_timeout_seconds,
     )
     signal.signal(signal.SIGTERM, runner.request_stop)
     signal.signal(signal.SIGINT, runner.request_stop)

@@ -8,7 +8,7 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlsplit
 
 import httpx
 
@@ -61,16 +61,48 @@ def resolver_data(row: sqlite3.Row) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
-def candidate_urls(row: sqlite3.Row, preference: str = "data") -> list[str]:
+def _row_value(row: sqlite3.Row, key: str) -> Any:
+    try:
+        return row[key]
+    except (IndexError, KeyError, TypeError):
+        return None
+
+
+def _url_has_rkey(url: str) -> bool:
+    try:
+        return any(key.casefold() == "rkey" for key, _value in parse_qsl(urlsplit(url).query))
+    except ValueError:
+        return False
+
+
+def candidate_urls(
+    row: sqlite3.Row,
+    preference: str = "data",
+    *,
+    now: int | None = None,
+) -> list[str]:
     data = resolver_data(row)
+    expiry = int(_row_value(row, "url_expires_at") or data.get("url_expires_at") or 0)
+    expired = expiry > 0 and expiry <= int(now or time.time())
     if preference == "raw":
-        candidates = (data.get("origin_url"), data.get("url"))
+        candidates = (
+            (data.get("origin_url"), data.get("origin_url_has_rkey")),
+            (data.get("url"), data.get("data_url_has_rkey")),
+        )
     else:
-        candidates = (data.get("url"), data.get("origin_url"))
+        candidates = (
+            (data.get("url"), data.get("data_url_has_rkey")),
+            (data.get("origin_url"), data.get("origin_url_has_rkey")),
+        )
     result: list[str] = []
-    for value in candidates:
+    for value, stored_has_rkey in candidates:
         url = str(value or "").strip()
         if not url or url in result:
+            continue
+        # The deadline is deliberately conservative. Once it passes, a URL
+        # carrying rkey must be refreshed instead of issuing a request that is
+        # already known to return 400. A stable no-rkey fallback remains usable.
+        if expired and (bool(stored_has_rkey) or _url_has_rkey(url)):
             continue
         try:
             result.append(validate_cdn_url(url))

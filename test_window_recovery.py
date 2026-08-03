@@ -413,6 +413,56 @@ class WindowRecoveryTests(unittest.TestCase):
         self.assertEqual(job["images_enqueued"], 3)
         self.assertEqual(job["status"], "completed")
 
+    def test_drain_pages_persists_and_blocks_next_history_page(self) -> None:
+        fake = FakeOneBot(
+            page(
+                history_message(103, NOT_AFTER - 1, image=True),
+                history_message(104, NOT_AFTER + 1),
+            ),
+            page(
+                history_message(100, NOT_BEFORE - 1),
+                history_message(103, NOT_AFTER - 1),
+            ),
+        )
+        runner = self.make_runner(
+            fake,
+            drain_pages=True,
+            pending_timeout_seconds=1200,
+            queue_threshold=-1,
+            interval_seconds=0,
+        )
+        runner.initialize()
+        self.mark_probe_complete(runner)
+
+        self.assertTrue(runner.process_one_page())
+        job = runner.connection.execute(
+            "SELECT pending_page_json FROM window_recovery_jobs"
+        ).fetchone()
+        pending = json.loads(job[0])
+        self.assertEqual(pending["items"], [["103", 0]])
+        resolver = json.loads(
+            runner.connection.execute(
+                "SELECT resolver_json FROM images WHERE message_seq='103'"
+            ).fetchone()[0]
+        )
+        self.assertEqual(resolver["history_source"], "window-recovery")
+        self.assertEqual(resolver["history_message_id"], "800103")
+
+        self.assertFalse(runner.process_one_page())
+        self.assertEqual(len(fake.calls), 1)
+        runner.connection.execute(
+            "UPDATE images SET status='accepted' WHERE message_seq='103'"
+        )
+        runner.connection.commit()
+        self.assertTrue(runner.process_one_page())
+        self.assertEqual(len(fake.calls), 1)
+        self.assertTrue(runner.process_one_page())
+        self.assertEqual(len(fake.calls), 2)
+        completed = runner.connection.execute(
+            "SELECT status, pending_page_json FROM window_recovery_jobs"
+        ).fetchone()
+        self.assertEqual(tuple(completed), ("completed", None))
+
     def test_overlapping_pages_deduplicate_by_real_sequence(self) -> None:
         fake = FakeOneBot(
             page(

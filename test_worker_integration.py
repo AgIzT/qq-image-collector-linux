@@ -289,6 +289,52 @@ class WorkerIntegrationTests(unittest.IsolatedAsyncioTestCase):
         await worker.downloader.close()
         worker.connection.close()
 
+    async def test_expired_rkey_refreshes_before_any_cdn_request(self) -> None:
+        worker = CollectorWorker(write_config(self.root, "ws://127.0.0.1:9"))
+        requested_paths: list[str] = []
+
+        async def cdn(request: httpx.Request) -> httpx.Response:
+            requested_paths.append(request.url.path)
+            return httpx.Response(200, content=a1111_png())
+
+        await worker.downloader.client.aclose()
+        worker.downloader.client = httpx.AsyncClient(
+            transport=httpx.MockTransport(cdn)
+        )
+        _cursor, items = parse_group_event(
+            image_event(url="https://multimedia.nt.qq.com.cn/stale?rkey=old")
+        )
+        items[0]["resolver_data"]["url_expires_at"] = int(time.time()) - 1
+        enqueue_image(worker.connection, items[0])
+        history_calls = 0
+
+        async def history(action: str, _params: dict) -> dict:
+            nonlocal history_calls
+            history_calls += 1
+            self.assertEqual(action, "get_group_msg_history")
+            return {
+                "messages": [
+                    image_event(
+                        url="https://multimedia.nt.qq.com.cn/fresh?rkey=new"
+                    )
+                ]
+            }
+
+        worker.onebot.call_async = history  # type: ignore[method-assign]
+        await worker._process_claimed(claim_next_image(worker.connection))
+        self.assertEqual(requested_paths, ["/fresh"])
+        self.assertEqual(history_calls, 1)
+        counters = worker.connection.execute(
+            """
+            SELECT sum(history_calls), sum(cdn_requests), sum(cdn_downloads),
+                   sum(cdn_400)
+            FROM hourly_counters
+            """
+        ).fetchone()
+        self.assertEqual(tuple(counters), (1, 1, 1, 0))
+        await worker.downloader.close()
+        worker.connection.close()
+
     async def test_400_without_expiry_hint_still_refreshes(self) -> None:
         worker = CollectorWorker(write_config(self.root, "ws://127.0.0.1:9"))
 

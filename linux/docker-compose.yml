@@ -150,6 +150,9 @@ services:
       - "-1"
       - --poll-seconds
       - "10"
+      - --drain-pages
+      - --pending-timeout-seconds
+      - "1200"
     environment:
       QQ_IMAGE_COLLECTOR_CONFIG: /data/qq-image-collector/config/collector_config.json
       TZ: Asia/Shanghai

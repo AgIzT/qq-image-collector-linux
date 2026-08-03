@@ -293,7 +293,13 @@ class EventPipelineTests(unittest.TestCase):
             (
                 GROUP,
                 MESSAGE,
-                json.dumps({"priority": 0, "url_expires_at": 111 + 21600}),
+                json.dumps(
+                    {
+                        "priority": 0,
+                        "url_expires_at": 111 + 21601,
+                        "url_expiry_basis": "conservative-any-rkey-6h-hint",
+                    }
+                ),
                 111,
             ),
         )
@@ -304,7 +310,7 @@ class EventPipelineTests(unittest.TestCase):
         try:
             row = tuple(
                 migrated.execute(
-                    "SELECT queue_priority, url_expires_at, discovered_at FROM images"
+                    "SELECT queue_priority, url_expires_at, discovered_at, resolver_json FROM images"
                 ).fetchone()
             )
             index_sql = " ".join(
@@ -346,7 +352,13 @@ class EventPipelineTests(unittest.TestCase):
             )
         finally:
             migrated.close()
-        self.assertEqual(row, (0, 111 + 1800, 111))
+        resolver = json.loads(row[3])
+        self.assertEqual(row[0:3], (0, 111 + 1801, 111))
+        self.assertEqual(resolver["url_expires_at"], 111 + 1801)
+        self.assertEqual(
+            resolver["url_expiry_basis"],
+            "observed-any-rkey-30m-scheduling-window",
+        )
         self.assertNotIn("json_extract", index_sql.casefold())
         self.assertIn("idx_images_claim_fifo", fifo_plan)
         self.assertNotIn("TEMP B-TREE", fifo_plan)
@@ -643,6 +655,44 @@ class EventPipelineTests(unittest.TestCase):
                 """
             ).fetchone()
             self.assertEqual(tuple(counters), (2, 1, 1, 0, 0))
+            await downloader.close()
+
+        asyncio.run(scenario())
+
+    def test_expired_rkey_is_skipped_for_stable_fallback(self) -> None:
+        async def scenario() -> None:
+            event = image_event(
+                url="https://multimedia.nt.qq.com.cn/stale?rkey=old"
+            )
+            event["raw"]["elements"][0]["picElement"]["originImageUrl"] = (
+                "https://gchat.qpic.cn/stable"
+            )
+            _cursor, items = parse_group_event(event)
+            items[0]["resolver_data"]["url_expires_at"] = int(time.time()) - 1
+            enqueue_image(self.connection, items[0])
+            requested: list[str] = []
+
+            async def handler(request: httpx.Request) -> httpx.Response:
+                requested.append(str(request.url))
+                return httpx.Response(200, content=a1111_png())
+
+            downloader = CdnDownloader(
+                self.connection, self.root, max_bytes=1024 * 1024, daily_limit=10
+            )
+            await downloader.client.aclose()
+            downloader.client = httpx.AsyncClient(
+                transport=httpx.MockTransport(handler)
+            )
+            self.assertEqual(
+                await downloader.process(claim_next_image(self.connection)),
+                "accepted",
+            )
+            self.assertEqual(requested, ["https://gchat.qpic.cn/stable"])
+            counters = self.connection.execute(
+                "SELECT sum(cdn_requests), sum(cdn_downloads), sum(cdn_400) "
+                "FROM hourly_counters"
+            ).fetchone()
+            self.assertEqual(tuple(counters), (1, 1, 0))
             await downloader.close()
 
         asyncio.run(scenario())

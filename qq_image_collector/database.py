@@ -186,14 +186,35 @@ def connect_database(
             """
         )
     # The original six-hour hint was contradicted by production probes: rkey
-    # URLs worked near 30 minutes and returned 400 near 60 minutes.  Tighten
-    # existing active rows without reparsing resolver_json on the hot path.
+    # URLs worked near 30 minutes and returned 400 near 60 minutes. Tighten
+    # exact legacy rows first, then migrate rows whose discovery timestamp was
+    # one or more seconds earlier than URL capture. The JSON marker makes the
+    # second migration idempotent and keeps parsing out of the claim hot path.
     connection.execute(
         """
         UPDATE images SET url_expires_at=discovered_at+1800
         WHERE status IN ('queued','deferred','downloading')
           AND discovered_at>0
           AND url_expires_at=discovered_at+21600
+        """
+    )
+    connection.execute(
+        """
+        UPDATE images SET
+            url_expires_at=
+                CAST(json_extract(resolver_json, '$.url_expires_at') AS INTEGER)-19800,
+            resolver_json=json_set(
+                resolver_json,
+                '$.url_expires_at',
+                CAST(json_extract(resolver_json, '$.url_expires_at') AS INTEGER)-19800,
+                '$.url_expiry_basis',
+                'observed-any-rkey-30m-scheduling-window'
+            )
+        WHERE status IN ('queued','deferred','downloading')
+          AND json_valid(resolver_json)
+          AND json_extract(resolver_json, '$.url_expiry_basis')=
+              'conservative-any-rkey-6h-hint'
+          AND CAST(json_extract(resolver_json, '$.url_expires_at') AS INTEGER)>19800
         """
     )
     connection.execute(
@@ -386,6 +407,7 @@ def connect_database(
             replay_count INTEGER NOT NULL DEFAULT 0,
             next_retry_at INTEGER NOT NULL DEFAULT 0,
             last_page_fingerprint TEXT,
+            pending_page_json TEXT,
             last_error TEXT,
             created_at INTEGER NOT NULL,
             updated_at INTEGER NOT NULL,
@@ -397,7 +419,10 @@ def connect_database(
     _ensure_columns(
         connection,
         "window_recovery_jobs",
-        {"anchor_mode": "TEXT NOT NULL DEFAULT 'legacy-forward'"},
+        {
+            "anchor_mode": "TEXT NOT NULL DEFAULT 'legacy-forward'",
+            "pending_page_json": "TEXT",
+        },
     )
     connection.execute(
         """
