@@ -144,6 +144,11 @@ class EventPipelineTests(unittest.TestCase):
         self.assertEqual(items[0]["original_flag"], 1)
         self.assertEqual(items[0]["sender_uin"], SENDER)
         self.assertEqual(items[0]["resolver_data"]["width"], 1024)
+        self.assertEqual(
+            items[0]["resolver_data"]["url_expires_at"]
+            - items[0]["discovered_at"],
+            30 * 60,
+        )
         self.assertTrue(items[1]["resolver_data"]["emoji_signal"])
         self.assertIsNone(items[1]["original_flag"])
 
@@ -288,7 +293,7 @@ class EventPipelineTests(unittest.TestCase):
             (
                 GROUP,
                 MESSAGE,
-                json.dumps({"priority": 0, "url_expires_at": 123456}),
+                json.dumps({"priority": 0, "url_expires_at": 111 + 21600}),
                 111,
             ),
         )
@@ -341,7 +346,7 @@ class EventPipelineTests(unittest.TestCase):
             )
         finally:
             migrated.close()
-        self.assertEqual(row, (0, 123456, 111))
+        self.assertEqual(row, (0, 111 + 1800, 111))
         self.assertNotIn("json_extract", index_sql.casefold())
         self.assertIn("idx_images_claim_fifo", fifo_plan)
         self.assertNotIn("TEMP B-TREE", fifo_plan)

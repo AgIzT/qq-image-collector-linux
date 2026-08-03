@@ -185,6 +185,17 @@ def connect_database(
             WHERE status IN ('queued','deferred','downloading')
             """
         )
+    # The original six-hour hint was contradicted by production probes: rkey
+    # URLs worked near 30 minutes and returned 400 near 60 minutes.  Tighten
+    # existing active rows without reparsing resolver_json on the hot path.
+    connection.execute(
+        """
+        UPDATE images SET url_expires_at=discovered_at+1800
+        WHERE status IN ('queued','deferred','downloading')
+          AND discovered_at>0
+          AND url_expires_at=discovered_at+21600
+        """
+    )
     connection.execute(
         """
         CREATE TABLE IF NOT EXISTS assets (

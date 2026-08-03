@@ -16,7 +16,10 @@ from .database import increment_counter, set_runtime_state
 
 
 MD5_TOKEN = re.compile(r"(?i)(?<![0-9a-f])([0-9a-f]{32})(?![0-9a-f])")
-RKEY_TTL_HINT_SECONDS = 6 * 3600
+# A production header-only probe on 2026-08-03 observed 200 responses through
+# 30 minutes and 400 responses around 60 minutes.  This is a scheduling window,
+# not a claim about the server-side token's exact TTL.
+RKEY_TTL_HINT_SECONDS = 30 * 60
 
 
 def _text(value: Any) -> str | None:
@@ -220,7 +223,7 @@ def parse_group_event(message: dict[str, Any]) -> tuple[dict[str, Any] | None, l
             "url_expires_at": discovered_at + RKEY_TTL_HINT_SECONDS
             if selected_has_rkey
             else None,
-            "url_expiry_basis": "conservative-any-rkey-6h-hint"
+            "url_expiry_basis": "observed-any-rkey-30m-scheduling-window"
             if selected_has_rkey
             else None,
             "raw_message_id": raw_nt_message_id or None,
