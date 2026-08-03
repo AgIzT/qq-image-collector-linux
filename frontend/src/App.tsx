@@ -321,7 +321,7 @@ export default function App() {
 
         {view === "settings" && settings && <>
           <form className="panel settings-form" onSubmit={(event) => void saveSettings(event)}><div className="section-heading"><div><p className="eyebrow">COLLECTION</p><h2>下载节奏</h2></div><button className="primary" type="submit">保存设置</button></div><div className="form-grid">
-            <label><span>图片间隔（秒）</span><input type="number" min={5} max={3600} value={settings.download_interval_seconds} onChange={(event) => setSettings({ ...settings, download_interval_seconds: Number(event.target.value) })} /></label>
+            <label><span>图片间隔（秒）</span><input type="number" min={0} max={3600} value={settings.download_interval_seconds} onChange={(event) => setSettings({ ...settings, download_interval_seconds: Number(event.target.value) })} /></label>
             <label><span>随机抖动（秒）</span><input type="number" min={0} max={60} value={settings.download_jitter_seconds} onChange={(event) => setSettings({ ...settings, download_jitter_seconds: Number(event.target.value) })} /></label>
             <label><span>CDN 首选通道</span><select value={settings.url_preference} onChange={(event) => setSettings({ ...settings, url_preference: event.target.value as "data" | "raw" })}><option value="data">标准 data.url</option><option value="raw">raw originImageUrl</option></select></label>
           </div><div className="toggle-grid"><label><input type="checkbox" checked={settings.collector_paused} onChange={(event) => setSettings({ ...settings, collector_paused: event.target.checked })} /><span><strong>暂停下载</strong><small>事件仍持久化，队列保留</small></span></label></div></form>

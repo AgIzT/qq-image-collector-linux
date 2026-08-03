@@ -54,7 +54,7 @@ class GroupCreate(BaseModel):
 class SettingsPatch(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    download_interval_seconds: int | None = Field(default=None, ge=5, le=3600)
+    download_interval_seconds: int | None = Field(default=None, ge=0, le=3600)
     download_jitter_seconds: int | None = Field(default=None, ge=0, le=60)
     url_preference: Literal["data", "raw"] | None = None
     collector_paused: bool | None = None

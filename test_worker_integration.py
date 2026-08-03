@@ -143,11 +143,16 @@ class WorkerIntegrationTests(unittest.IsolatedAsyncioTestCase):
         worker.onebot.call_async = history  # type: ignore[method-assign]
         first = claim_next_image(worker.connection)
         await worker._process_claimed(first)
-        queued = worker.connection.execute("SELECT status, resolver_json FROM images").fetchone()
-        self.assertEqual(queued[0], "queued")
-        self.assertFalse(json.loads(queued[1])["url_refresh_attempted"])
-        self.assertEqual(json.loads(queued[1])["url_refresh_count"], 1)
+        deferred = worker.connection.execute(
+            "SELECT status, next_retry_at, resolver_json FROM images"
+        ).fetchone()
+        self.assertEqual(deferred[0], "deferred")
+        self.assertGreater(deferred[1], int(time.time()))
+        self.assertFalse(json.loads(deferred[2])["url_refresh_attempted"])
+        self.assertEqual(json.loads(deferred[2])["url_refresh_count"], 1)
         self.assertEqual(history_calls, 1)
+        worker.connection.execute("UPDATE images SET next_retry_at=0")
+        worker.connection.commit()
         second = claim_next_image(worker.connection)
         await worker._process_claimed(second)
         status, retry_at = worker.connection.execute(
@@ -265,20 +270,13 @@ class WorkerIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
         worker.onebot.call_async = history  # type: ignore[method-assign]
         await worker._process_claimed(claim_next_image(worker.connection))
-        queued = worker.connection.execute(
+        completed = worker.connection.execute(
             "SELECT status, resolver_json FROM images"
         ).fetchone()
-        flags = json.loads(queued[1])
-        self.assertEqual(queued[0], "queued")
+        flags = json.loads(completed[1])
+        self.assertEqual(completed[0], "accepted")
         self.assertFalse(flags["url_refresh_attempted"])
         self.assertTrue(flags["url_refreshed"])
-        self.assertEqual(history_calls, 1)
-
-        await worker._process_claimed(claim_next_image(worker.connection))
-        self.assertEqual(
-            worker.connection.execute("SELECT status FROM images").fetchone()[0],
-            "accepted",
-        )
         self.assertEqual(history_calls, 1)
         counters = worker.connection.execute(
             """

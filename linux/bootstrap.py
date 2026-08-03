@@ -130,11 +130,8 @@ def collector_config(groups: list[str]) -> dict[str, Any]:
         "runtime": {
             "pid_file": "/data/qq-image-collector/state/collector.pid",
             "collector_paused": False,
-            "download_interval_seconds": 15,
-            "download_jitter_seconds": 3,
-            "accelerated_interval_seconds": 5,
-            "accelerate_queue_age_seconds": 1800,
-            "resume_normal_queue_age_seconds": 900,
+            "download_interval_seconds": 0,
+            "download_jitter_seconds": 0,
             "max_download_bytes": 128 * 1024 * 1024,
             "url_preference": "data",
             "url_expiry_urgent_seconds": 3600,

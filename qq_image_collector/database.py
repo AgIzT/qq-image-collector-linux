@@ -71,11 +71,14 @@ def _ensure_columns(
     connection: sqlite3.Connection,
     table: str,
     columns: dict[str, str],
-) -> None:
+) -> set[str]:
     existing = {str(row[1]) for row in connection.execute(f"PRAGMA table_info({table})")}
+    added: set[str] = set()
     for name, declaration in columns.items():
         if name not in existing:
             connection.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
+            added.add(name)
+    return added
 
 
 def connect_database(
@@ -88,6 +91,7 @@ def connect_database(
     connection = sqlite3.connect(database, timeout=5)
     connection.execute("PRAGMA busy_timeout=5000")
     connection.execute("PRAGMA foreign_keys=ON")
+    connection.execute("PRAGMA temp_store=MEMORY")
     if not initialize:
         return connection
     connection.execute("PRAGMA journal_mode=WAL")
@@ -125,13 +129,15 @@ def connect_database(
             is_imported INTEGER,
             is_online INTEGER,
             original_flag INTEGER,
+            queue_priority INTEGER NOT NULL DEFAULT 2,
+            url_expires_at INTEGER NOT NULL DEFAULT 0,
             discovered_at INTEGER,
             collected_at INTEGER,
             PRIMARY KEY (group_id, message_id, image_index)
         )
         """
     )
-    _ensure_columns(
+    added_image_columns = _ensure_columns(
         connection,
         "images",
         {
@@ -159,10 +165,26 @@ def connect_database(
             "is_imported": "INTEGER",
             "is_online": "INTEGER",
             "original_flag": "INTEGER",
+            "queue_priority": "INTEGER NOT NULL DEFAULT 2",
+            "url_expires_at": "INTEGER NOT NULL DEFAULT 0",
             "discovered_at": "INTEGER",
             "collected_at": "INTEGER",
         },
     )
+    if {"queue_priority", "url_expires_at"} & added_image_columns:
+        connection.execute(
+            """
+            UPDATE images SET
+                queue_priority=coalesce(
+                    CAST(json_extract(resolver_json, '$.priority') AS INTEGER), 2
+                ),
+                url_expires_at=coalesce(
+                    CAST(json_extract(resolver_json, '$.url_expires_at') AS INTEGER), 0
+                ),
+                discovered_at=coalesce(discovered_at, updated_at)
+            WHERE status IN ('queued','deferred','downloading')
+            """
+        )
     connection.execute(
         """
         CREATE TABLE IF NOT EXISTS assets (
@@ -380,6 +402,14 @@ def connect_database(
         """
     )
     connection.execute("CREATE INDEX IF NOT EXISTS idx_images_status_queue ON images(status, next_retry_at, discovered_at)")
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_images_claim_fifo
+        ON images(discovered_at, queue_priority, sent_at, group_id, message_id,
+                  image_index, next_retry_at)
+        WHERE status IN ('queued','deferred')
+        """
+    )
     connection.execute("CREATE INDEX IF NOT EXISTS idx_images_sha256 ON images(sha256)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_images_group_sent ON images(group_id, sent_at)")
     connection.execute(
@@ -541,6 +571,7 @@ def enqueue_image(connection: sqlite3.Connection, item: dict[str, Any]) -> bool:
     priority = _priority(item)
     resolver_data = dict(item.get("resolver_data") or {})
     resolver_data["priority"] = priority
+    url_expires_at = int(resolver_data.get("url_expires_at") or 0)
     url_material = "\0".join(
         str(resolver_data.get(key) or "") for key in ("url", "origin_url")
     )
@@ -583,6 +614,7 @@ def enqueue_image(connection: sqlite3.Connection, item: dict[str, Any]) -> bool:
                     status='queued', sha256=NULL, local_path=NULL, metadata_source=NULL,
                     metadata_json=NULL, error=NULL, updated_at=?, attempts=0,
                     next_retry_at=0, resolver='event-cdn', resolver_json=?,
+                    queue_priority=?, url_expires_at=?,
                     group_uin=coalesce(?, group_uin), group_name=coalesce(?, group_name),
                     sender_uin=coalesce(?, sender_uin), sender_uid=coalesce(?, sender_uid),
                     sender_member_name=coalesce(?, sender_member_name),
@@ -599,6 +631,8 @@ def enqueue_image(connection: sqlite3.Connection, item: dict[str, Any]) -> bool:
                     int(item.get("declared_size") or 0),
                     now,
                     json.dumps(resolver_data, ensure_ascii=False),
+                    priority,
+                    url_expires_at,
                     str(item.get("group_uin") or group_id),
                     item.get("group_name"),
                     item.get("sender_uin"),
@@ -625,9 +659,9 @@ def enqueue_image(connection: sqlite3.Connection, item: dict[str, Any]) -> bool:
             resolver, resolver_json, group_uin, group_name, sender_uin,
             sender_uid, sender_member_name, sender_nickname, sender_remark_name,
             message_text, is_imported, is_online, original_flag,
-            discovered_at, collected_at
+            queue_priority, url_expires_at, discovered_at, collected_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, 0, 0, 'event-cdn', ?,
-                  ?, ?, ?, ?, ?, ?, ?, ?, 0, 1, ?, ?, NULL)
+                  ?, ?, ?, ?, ?, ?, ?, ?, 0, 1, ?, ?, ?, ?, NULL)
         ON CONFLICT(group_id, message_id, image_index) DO UPDATE SET
             message_seq=excluded.message_seq,
             sent_at=coalesce(images.sent_at, excluded.sent_at),
@@ -654,6 +688,14 @@ def enqueue_image(connection: sqlite3.Connection, item: dict[str, Any]) -> bool:
             sender_remark_name=coalesce(images.sender_remark_name, excluded.sender_remark_name),
             message_text=coalesce(images.message_text, excluded.message_text),
             original_flag=coalesce(images.original_flag, excluded.original_flag),
+            queue_priority=CASE
+                WHEN images.status IN ('accepted','rejected_no_metadata','filtered_gif',
+                    'failed_terminal','expired','legacy_failed')
+                THEN images.queue_priority ELSE excluded.queue_priority END,
+            url_expires_at=CASE
+                WHEN images.status IN ('accepted','rejected_no_metadata','filtered_gif',
+                    'failed_terminal','expired','legacy_failed')
+                THEN images.url_expires_at ELSE excluded.url_expires_at END,
             updated_at=excluded.updated_at
         """,
         (
@@ -675,6 +717,8 @@ def enqueue_image(connection: sqlite3.Connection, item: dict[str, Any]) -> bool:
             item.get("sender_remark_name"),
             item.get("message_text"),
             item.get("original_flag"),
+            priority,
+            url_expires_at,
             int(item.get("discovered_at") or now),
         ),
     )
@@ -699,23 +743,22 @@ def claim_next_image(
     *,
     expiry_urgent_seconds: int = 3600,
 ) -> sqlite3.Row | None:
+    # Kept for API compatibility. FIFO prevents old event URLs from aging
+    # behind newer work; URL refresh is handled immediately by the worker.
+    del expiry_urgent_seconds
     connection.row_factory = sqlite3.Row
     now = int(time.time())
     connection.execute("BEGIN IMMEDIATE")
     try:
         row = connection.execute(
             """
-            SELECT * FROM images
+            SELECT * FROM images INDEXED BY idx_images_claim_fifo
             WHERE status IN ('queued','deferred') AND next_retry_at<=?
-            ORDER BY
-                CASE WHEN coalesce(CAST(json_extract(resolver_json, '$.url_expires_at') AS INTEGER), 0)
-                               BETWEEN 1 AND ? THEN 0 ELSE 1 END,
-                coalesce(CAST(json_extract(resolver_json, '$.priority') AS INTEGER), 2),
-                coalesce(CAST(json_extract(resolver_json, '$.url_expires_at') AS INTEGER), 9223372036854775807),
-                discovered_at, sent_at, group_id, message_id, image_index
+            ORDER BY discovered_at, queue_priority, sent_at,
+                     group_id, message_id, image_index
             LIMIT 1
             """,
-            (now, now + max(0, int(expiry_urgent_seconds))),
+            (now,),
         ).fetchone()
         if row:
             connection.execute(
@@ -825,12 +868,11 @@ def queue_snapshot(connection: sqlite3.Connection) -> dict[str, Any]:
     row = connection.execute(
         """
         SELECT count(*), min(discovered_at),
-               sum(CASE WHEN coalesce(CAST(json_extract(resolver_json, '$.priority') AS INTEGER), 2)=0 THEN 1 ELSE 0 END),
-               sum(CASE WHEN coalesce(CAST(json_extract(resolver_json, '$.priority') AS INTEGER), 2)=1 THEN 1 ELSE 0 END),
-               sum(CASE WHEN coalesce(CAST(json_extract(resolver_json, '$.priority') AS INTEGER), 2)=2 THEN 1 ELSE 0 END),
-               sum(CASE WHEN coalesce(CAST(json_extract(resolver_json, '$.url_expires_at') AS INTEGER), 0)>0 THEN 1 ELSE 0 END),
-               sum(CASE WHEN coalesce(CAST(json_extract(resolver_json, '$.url_expires_at') AS INTEGER), 0)
-                              BETWEEN 1 AND ? THEN 1 ELSE 0 END)
+               sum(CASE WHEN queue_priority=0 THEN 1 ELSE 0 END),
+               sum(CASE WHEN queue_priority=1 THEN 1 ELSE 0 END),
+               sum(CASE WHEN queue_priority=2 THEN 1 ELSE 0 END),
+               sum(CASE WHEN url_expires_at>0 THEN 1 ELSE 0 END),
+               sum(CASE WHEN url_expires_at BETWEEN 1 AND ? THEN 1 ELSE 0 END)
         FROM images WHERE status IN ('queued','deferred','downloading')
         """,
         (now + 3600,),

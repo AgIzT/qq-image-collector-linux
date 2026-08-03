@@ -23,7 +23,6 @@ from .database import (
     finish_image,
     get_runtime_state,
     increment_counter,
-    queue_snapshot,
     recover_inflight,
     set_runtime_state,
 )
@@ -110,7 +109,6 @@ class CollectorWorker:
         state = get_runtime_state(self.connection, "downloader", {}) or {}
         self._downloader_state = dict(state)
         self._downloader_state_written_at = 0.0
-        self.accelerated = bool((state or {}).get("accelerated", False))
 
     def request_stop(self) -> None:
         self.listener.stop()
@@ -317,13 +315,13 @@ class CollectorWorker:
         self._set_gap(group_id, "complete", None, finished=True)
         return discovered
 
-    async def refresh_url(self, row: sqlite3.Row) -> bool:
+    async def refresh_url(self, row: sqlite3.Row) -> str:
         data = resolver_data(row)
         if data.get("url_refresh_attempted"):
-            return False
+            return "unavailable"
         raw_anchor = str(data.get("raw_message_id") or row["message_id"] or "")
         if not raw_anchor:
-            return False
+            return "unavailable"
         async with self._history_lock:
             data["url_refresh_attempted"] = True
             self.connection.execute(
@@ -353,7 +351,7 @@ class CollectorWorker:
             )
         messages = list(history_events(payload))
         if not messages:
-            return False
+            return "unavailable"
         target = messages[0]
         for message in messages:
             raw = message.get("raw") if isinstance(message.get("raw"), dict) else {}
@@ -375,11 +373,11 @@ class CollectorWorker:
         )
         index = int(row["image_index"])
         if index >= len(items):
-            return False
+            return "unavailable"
         refreshed = items[index].get("resolver_data") or {}
         url = str(refreshed.get("url") or "")
         if not url:
-            return False
+            return "unavailable"
         previous_url = str(data.get("url") or "")
         previous_origin_url = str(data.get("origin_url") or "")
         data["url"] = url
@@ -409,11 +407,13 @@ class CollectorWorker:
         )
         self.connection.execute(
             """
-            UPDATE images SET resolver_json=?, status=?, next_retry_at=?, error=?, updated_at=?
+            UPDATE images SET resolver_json=?, url_expires_at=?, status=?,
+                next_retry_at=?, error=?, updated_at=?
             WHERE group_id=? AND message_id=? AND image_index=?
             """,
             (
                 json.dumps(data, ensure_ascii=False),
+                int(data.get("url_expires_at") or 0),
                 "deferred" if unchanged else "queued",
                 now + retry_delay if unchanged else 0,
                 "history returned the same expired CDN URL; retry scheduled"
@@ -426,6 +426,23 @@ class CollectorWorker:
             ),
         )
         self.connection.commit()
+        return "unchanged" if unchanged else "changed"
+
+    async def _process_refreshed_url(self, row: sqlite3.Row, outcome: str) -> bool:
+        if outcome == "unchanged":
+            return True
+        if outcome != "changed":
+            return False
+        refreshed = self.connection.execute(
+            """
+            SELECT * FROM images
+            WHERE group_id=? AND message_id=? AND image_index=?
+            """,
+            (row["group_id"], row["message_id"], row["image_index"]),
+        ).fetchone()
+        if refreshed is None:
+            return False
+        await self._process_claimed(refreshed, allow_refresh=False)
         return True
 
     def _persist_downloader_state(self, *, force: bool = False, **updates: Any) -> None:
@@ -436,8 +453,9 @@ class CollectorWorker:
             if key != "heartbeat_at"
         )
         state.update(updates)
-        state["accelerated"] = self.accelerated
         state["unlimited"] = True
+        state["interval_seconds"] = float(self.runtime("download_interval_seconds") or 0)
+        state.pop("accelerated", None)
         state.pop("circuit_until", None)
         state.pop("recent_403", None)
         state.pop("reason", None)
@@ -498,11 +516,23 @@ class CollectorWorker:
         )
         self.connection.commit()
 
-    async def _process_claimed(self, row: sqlite3.Row) -> None:
+    async def _process_claimed(
+        self,
+        row: sqlite3.Row,
+        *,
+        allow_refresh: bool = True,
+    ) -> None:
         try:
             if not candidate_urls(row, self.downloader.url_preference):
+                if not allow_refresh:
+                    self._defer_refresh_retry(
+                        row,
+                        delay_seconds=60,
+                        error="refreshed history row still has no usable CDN URL",
+                    )
+                    return
                 try:
-                    refreshed = await self.refresh_url(row)
+                    outcome = await self.refresh_url(row)
                 except Exception as refresh_error:
                     self._defer_refresh_retry(
                         row,
@@ -510,7 +540,9 @@ class CollectorWorker:
                         error=f"missing URL refresh retry after {type(refresh_error).__name__}",
                     )
                     return
-                if not refreshed:
+                if await self._process_refreshed_url(row, outcome):
+                    return
+                if outcome == "unavailable":
                     self._defer_refresh_retry(
                         row,
                         delay_seconds=300,
@@ -526,8 +558,15 @@ class CollectorWorker:
             )
         except CdnHttpError as exc:
             if exc.status_code in {400, 403, 404, 410}:
+                if not allow_refresh:
+                    self._defer_refresh_retry(
+                        row,
+                        delay_seconds=60,
+                        error=f"refreshed CDN URL returned {exc.status_code}; retry scheduled",
+                    )
+                    return
                 try:
-                    refreshed = await self.refresh_url(row)
+                    outcome = await self.refresh_url(row)
                 except Exception as refresh_error:
                     self._defer_refresh_retry(
                         row,
@@ -535,7 +574,7 @@ class CollectorWorker:
                         error=f"URL refresh retry after {type(refresh_error).__name__}",
                     )
                     return
-                if refreshed:
+                if await self._process_refreshed_url(row, outcome):
                     return
                 self._defer_refresh_retry(
                     row,
@@ -584,7 +623,6 @@ class CollectorWorker:
             raise
 
     async def download_loop(self) -> None:
-        runtime = self.settings["runtime"]
         while not self.stop_event.is_set():
             self._persist_downloader_state(heartbeat_at=int(time.time()))
             self.downloader.url_preference = str(self.runtime("url_preference") or "data")
@@ -597,23 +635,19 @@ class CollectorWorker:
                 expiry_urgent_seconds=int(self.runtime("url_expiry_urgent_seconds")),
             )
             if row is None:
-                self.accelerated = False
                 self._persist_downloader_state(status="idle", last_error=None)
                 await asyncio.sleep(1)
                 continue
             await self._process_claimed(row)
-            snapshot = queue_snapshot(self.connection)
-            oldest_age = int(snapshot["oldest_age_seconds"])
-            if not self.accelerated and oldest_age >= int(runtime["accelerate_queue_age_seconds"]):
-                self.accelerated = True
-            elif self.accelerated and oldest_age <= int(runtime["resume_normal_queue_age_seconds"]):
-                self.accelerated = False
-            if self.accelerated:
-                base = float(runtime["accelerated_interval_seconds"])
-            else:
-                base = float(self.runtime("download_interval_seconds"))
-            jitter = float(self.runtime("download_jitter_seconds"))
-            delay = max(1.0, base + random.uniform(-jitter, jitter))
+            base = max(0.0, float(self.runtime("download_interval_seconds") or 0))
+            if base <= 0:
+                await asyncio.sleep(0)
+                continue
+            jitter = max(0.0, float(self.runtime("download_jitter_seconds") or 0))
+            delay = max(0.0, base + random.uniform(-jitter, jitter))
+            if delay <= 0:
+                await asyncio.sleep(0)
+                continue
             try:
                 await asyncio.wait_for(self.stop_event.wait(), timeout=delay)
             except asyncio.TimeoutError:

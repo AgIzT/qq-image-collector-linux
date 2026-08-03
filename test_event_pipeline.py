@@ -185,6 +185,105 @@ class EventPipelineTests(unittest.TestCase):
         self.assertEqual(stored["priority"], 2)
         self.assertEqual(queue_snapshot(self.connection)["depth"], 1)
 
+    def test_queue_claims_oldest_event_before_newer_priority_work(self) -> None:
+        older_event = image_event(
+            url="https://gchat.qpic.cn/older?rkey=old",
+            original=False,
+        )
+        older_event["raw"]["msgId"] = str(int(MESSAGE) + 1)
+        older_event["raw"]["msgSeq"] = "12346"
+        _cursor, older_items = parse_group_event(older_event)
+        older_items[0]["discovered_at"] = int(time.time()) - 120
+
+        newer_event = image_event(
+            url="https://gchat.qpic.cn/newer?rkey=new",
+            original=True,
+        )
+        newer_event["raw"]["msgId"] = str(int(MESSAGE) + 2)
+        newer_event["raw"]["msgSeq"] = "12347"
+        _cursor, newer_items = parse_group_event(newer_event)
+        newer_items[0]["discovered_at"] = int(time.time())
+
+        enqueue_image(self.connection, older_items[0])
+        enqueue_image(self.connection, newer_items[0])
+        priorities = dict(
+            self.connection.execute(
+                "SELECT message_id, queue_priority FROM images ORDER BY message_id"
+            )
+        )
+        self.assertEqual(priorities[older_items[0]["message_id"]], 2)
+        self.assertEqual(priorities[newer_items[0]["message_id"]], 0)
+
+        statements: list[str] = []
+        self.connection.set_trace_callback(statements.append)
+        claimed = claim_next_image(self.connection)
+        snapshot = queue_snapshot(self.connection)
+        self.connection.set_trace_callback(None)
+
+        self.assertEqual(claimed["message_id"], older_items[0]["message_id"])
+        self.assertEqual(snapshot["depth"], 2)
+        self.assertNotIn("json_extract", "\n".join(statements).casefold())
+
+    def test_queue_columns_migrate_once_from_resolver_json(self) -> None:
+        self.connection.close()
+        database = self.root / "queue-migration.sqlite3"
+        legacy = sqlite3.connect(database)
+        legacy.execute(
+            """
+            CREATE TABLE images (
+                group_id TEXT, message_id TEXT, image_index INTEGER,
+                status TEXT, resolver TEXT, resolver_json TEXT,
+                updated_at INTEGER, discovered_at INTEGER,
+                PRIMARY KEY(group_id, message_id, image_index)
+            )
+            """
+        )
+        legacy.execute(
+            """
+            INSERT INTO images VALUES (?, ?, 0, 'queued', 'event-cdn', ?, ?, NULL)
+            """,
+            (
+                GROUP,
+                MESSAGE,
+                json.dumps({"priority": 0, "url_expires_at": 123456}),
+                111,
+            ),
+        )
+        legacy.commit()
+        legacy.close()
+
+        migrated = connect_database(database)
+        try:
+            row = tuple(
+                migrated.execute(
+                    "SELECT queue_priority, url_expires_at, discovered_at FROM images"
+                ).fetchone()
+            )
+            index_sql = migrated.execute(
+                "SELECT sql FROM sqlite_master WHERE name='idx_images_claim_fifo'"
+            ).fetchone()[0]
+            plan = " ".join(
+                str(item[3])
+                for item in migrated.execute(
+                    """
+                    EXPLAIN QUERY PLAN SELECT * FROM images
+                    INDEXED BY idx_images_claim_fifo
+                    WHERE status IN ('queued','deferred') AND next_retry_at<=?
+                    ORDER BY discovered_at, queue_priority, sent_at,
+                             group_id, message_id, image_index LIMIT 1
+                    """,
+                    (int(time.time()),),
+                )
+            )
+        finally:
+            migrated.close()
+        self.assertEqual(row, (0, 123456, 111))
+        self.assertNotIn("json_extract", index_sql.casefold())
+        self.assertIn("idx_images_claim_fifo", plan)
+        self.assertNotIn("TEMP B-TREE", plan)
+        self.connection = connect_database(self.root / "state.sqlite3")
+        self.connection.row_factory = sqlite3.Row
+
     def test_raw_pictures_match_by_filename_and_unmatched_raw_is_not_lost(self) -> None:
         event = image_event(url="https://gchat.qpic.cn/first", two=True)
         event["raw"]["elements"].reverse()
