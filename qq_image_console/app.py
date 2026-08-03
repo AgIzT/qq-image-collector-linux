@@ -255,11 +255,17 @@ class AppContext:
             "healthy": downloader_fresh,
             "detail": downloader_status if downloader_fresh else "下载循环心跳已停止",
         }
+        queue_depth = int(queue.get("depth") or 0)
+        queue_oldest_age = int(queue.get("oldest_age_seconds") or 0)
         services["queue"] = {
-            "healthy": int(queue.get("oldest_age_seconds") or 0) < 7200,
+            # Reaching this point already proves the persistent store was read.
+            # Backlog age is workload, not readiness; stalled processing is
+            # reported independently by the Worker and downloader heartbeats.
+            "healthy": True,
             "detail": (
-                f"{int(queue.get('depth') or 0)} 张，"
-                f"最老 {int(queue.get('oldest_age_seconds') or 0)} 秒"
+                f"处理中 {queue_depth} 张，最老 {queue_oldest_age} 秒"
+                if queue_depth
+                else "队列已清空"
             ),
         }
         services["recovery"] = {

@@ -140,6 +140,25 @@ class ConsoleEventApiTests(unittest.TestCase):
         self.assertNotIn("circuit", payload["services"])
         self.assertEqual(payload["statistics"]["today"]["get_image_blocked"], 0)
 
+    def test_old_backlog_is_processing_not_queue_unready(self) -> None:
+        context = self.client.app.state.context
+        with context.repository.connect() as connection:
+            now = int(time.time())
+            connection.execute(
+                """
+                INSERT INTO images (
+                    group_id, message_id, image_index, status,
+                    updated_at, discovered_at
+                ) VALUES (?, ?, 0, 'queued', ?, ?)
+                """,
+                (GROUP, "9000000000000000001", now, now - 86400),
+            )
+            connection.commit()
+
+        queue_service = context._compute_status()["services"]["queue"]
+        self.assertTrue(queue_service["healthy"])
+        self.assertIn("处理中 1 张", queue_service["detail"])
+
     def test_status_snapshot_never_waits_for_background_database_refresh(self) -> None:
         base = self.client.app.state.context
         entered = threading.Event()
