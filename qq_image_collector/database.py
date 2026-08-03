@@ -410,6 +410,14 @@ def connect_database(
         WHERE status IN ('queued','deferred')
         """
     )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_images_claim_fresh
+        ON images(url_expires_at, discovered_at, queue_priority, sent_at,
+                  group_id, message_id, image_index, next_retry_at)
+        WHERE status IN ('queued','deferred') AND url_expires_at>0
+        """
+    )
     connection.execute("CREATE INDEX IF NOT EXISTS idx_images_sha256 ON images(sha256)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_images_group_sent ON images(group_id, sent_at)")
     connection.execute(
@@ -762,14 +770,26 @@ def claim_next_image(
     *,
     expiry_urgent_seconds: int = 3600,
 ) -> sqlite3.Row | None:
-    # Kept for API compatibility. FIFO prevents old event URLs from aging
-    # behind newer work; URL refresh is handled immediately by the worker.
+    # Kept for API compatibility. Structured deadline columns replaced the
+    # former resolver_json sort; stale work falls back to deterministic FIFO.
     del expiry_urgent_seconds
     connection.row_factory = sqlite3.Row
     now = int(time.time())
     connection.execute("BEGIN IMMEDIATE")
     try:
         row = connection.execute(
+            """
+            SELECT * FROM images INDEXED BY idx_images_claim_fresh
+            WHERE status IN ('queued','deferred') AND next_retry_at<=?
+              AND url_expires_at>0 AND url_expires_at>?
+            ORDER BY url_expires_at, discovered_at, queue_priority, sent_at,
+                     group_id, message_id, image_index
+            LIMIT 1
+            """,
+            (now, now),
+        ).fetchone()
+        if row is None:
+            row = connection.execute(
             """
             SELECT * FROM images INDEXED BY idx_images_claim_fifo
             WHERE status IN ('queued','deferred') AND next_retry_at<=?
@@ -778,7 +798,7 @@ def claim_next_image(
             LIMIT 1
             """,
             (now,),
-        ).fetchone()
+            ).fetchone()
         if row:
             connection.execute(
                 """

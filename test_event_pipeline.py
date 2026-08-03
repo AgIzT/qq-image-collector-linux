@@ -225,6 +225,27 @@ class EventPipelineTests(unittest.TestCase):
         self.assertEqual(snapshot["depth"], 2)
         self.assertNotIn("json_extract", "\n".join(statements).casefold())
 
+    def test_fresh_deadline_precedes_stale_fifo_backlog(self) -> None:
+        now = int(time.time())
+        stale_event = image_event(url="https://gchat.qpic.cn/stale?rkey=old")
+        stale_event["raw"]["msgId"] = str(int(MESSAGE) + 10)
+        stale_event["raw"]["msgSeq"] = "12355"
+        _cursor, stale_items = parse_group_event(stale_event)
+        stale_items[0]["discovered_at"] = now - 3600
+        stale_items[0]["resolver_data"]["url_expires_at"] = now - 1
+
+        fresh_event = image_event(url="https://gchat.qpic.cn/fresh?rkey=new")
+        fresh_event["raw"]["msgId"] = str(int(MESSAGE) + 11)
+        fresh_event["raw"]["msgSeq"] = "12356"
+        _cursor, fresh_items = parse_group_event(fresh_event)
+        fresh_items[0]["discovered_at"] = now
+        fresh_items[0]["resolver_data"]["url_expires_at"] = now + 3600
+
+        enqueue_image(self.connection, stale_items[0])
+        enqueue_image(self.connection, fresh_items[0])
+        claimed = claim_next_image(self.connection)
+        self.assertEqual(claimed["message_id"], fresh_items[0]["message_id"])
+
     def test_batched_enqueue_and_counters_share_one_transaction(self) -> None:
         _cursor, items = parse_group_event(
             image_event(url="https://gchat.qpic.cn/batched?rkey=secret")
@@ -281,10 +302,17 @@ class EventPipelineTests(unittest.TestCase):
                     "SELECT queue_priority, url_expires_at, discovered_at FROM images"
                 ).fetchone()
             )
-            index_sql = migrated.execute(
-                "SELECT sql FROM sqlite_master WHERE name='idx_images_claim_fifo'"
-            ).fetchone()[0]
-            plan = " ".join(
+            index_sql = " ".join(
+                str(item[0])
+                for item in migrated.execute(
+                    """
+                    SELECT sql FROM sqlite_master
+                    WHERE name IN ('idx_images_claim_fifo','idx_images_claim_fresh')
+                    ORDER BY name
+                    """
+                )
+            )
+            fifo_plan = " ".join(
                 str(item[3])
                 for item in migrated.execute(
                     """
@@ -297,12 +325,28 @@ class EventPipelineTests(unittest.TestCase):
                     (int(time.time()),),
                 )
             )
+            fresh_plan = " ".join(
+                str(item[3])
+                for item in migrated.execute(
+                    """
+                    EXPLAIN QUERY PLAN SELECT * FROM images
+                    INDEXED BY idx_images_claim_fresh
+                    WHERE status IN ('queued','deferred') AND next_retry_at<=?
+                      AND url_expires_at>0 AND url_expires_at>?
+                    ORDER BY url_expires_at, discovered_at, queue_priority, sent_at,
+                             group_id, message_id, image_index LIMIT 1
+                    """,
+                    (int(time.time()), int(time.time())),
+                )
+            )
         finally:
             migrated.close()
         self.assertEqual(row, (0, 123456, 111))
         self.assertNotIn("json_extract", index_sql.casefold())
-        self.assertIn("idx_images_claim_fifo", plan)
-        self.assertNotIn("TEMP B-TREE", plan)
+        self.assertIn("idx_images_claim_fifo", fifo_plan)
+        self.assertNotIn("TEMP B-TREE", fifo_plan)
+        self.assertIn("idx_images_claim_fresh", fresh_plan)
+        self.assertNotIn("TEMP B-TREE", fresh_plan)
         self.connection = connect_database(self.root / "state.sqlite3")
         self.connection.row_factory = sqlite3.Row
 
