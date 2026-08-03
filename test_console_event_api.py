@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import json
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
 from fastapi.testclient import TestClient
 
-from qq_image_console.app import create_app
+from qq_image_console.app import AppContext, create_app
 from qq_image_console.config import ConsoleConfig
+from qq_image_console.storage import StorageMigrationManager
 
 
 TOKEN = "local-test-token-" + "x" * 32
@@ -136,6 +139,47 @@ class ConsoleEventApiTests(unittest.TestCase):
             self.assertIn(key, payload["services"])
         self.assertNotIn("circuit", payload["services"])
         self.assertEqual(payload["statistics"]["today"]["get_image_blocked"], 0)
+
+    def test_status_snapshot_never_waits_for_background_database_refresh(self) -> None:
+        base = self.client.app.state.context
+        entered = threading.Event()
+        release = threading.Event()
+
+        class BlockingRepository:
+            def stats(self):
+                entered.set()
+                release.wait(2)
+                return base.repository.stats()
+
+            def __getattr__(self, name):
+                return getattr(base.repository, name)
+
+        context = AppContext(
+            config=self.config,
+            token=TOKEN,
+            repository=BlockingRepository(),
+            health=FakeHealth(),
+            supervisor=FakeSupervisor(),
+            migration=StorageMigrationManager(),
+            status_cache_enabled=True,
+        )
+        try:
+            context.start_status_refresh()
+            self.assertTrue(entered.wait(1))
+            started = time.perf_counter()
+            placeholder = context.status()
+            self.assertLess(time.perf_counter() - started, 0.25)
+            self.assertIsNone(placeholder["account"])
+        finally:
+            release.set()
+
+        deadline = time.time() + 2
+        while time.time() < deadline:
+            current = context.status()
+            if current["account"]:
+                break
+            time.sleep(0.01)
+        self.assertEqual(current["account"]["user_id"], "300000003")
 
     def test_group_gap_api_and_retired_backfill(self) -> None:
         self.assertEqual(

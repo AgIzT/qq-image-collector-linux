@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import ipaddress
 import json
+import logging
 import os
 import secrets
+import threading
 import time
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlparse
@@ -35,6 +38,8 @@ from .storage import StorageMigrationManager
 SESSION_COOKIE = "qqic_session"
 REMOTE_PERMISSIONS = ["status", "system", "groups", "gap_recovery", "safe_settings", "audit"]
 STATE_CHANGING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+STATUS_SNAPSHOT_SECONDS = 15.0
+LOGGER = logging.getLogger(__name__)
 
 
 class SystemActionRequest(BaseModel):
@@ -72,8 +77,144 @@ class AppContext:
     supervisor: ProcessSupervisor
     migration: StorageMigrationManager
     publisher: SnapshotPublisher | None = None
+    status_cache_enabled: bool = True
+    _status_cache_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+    _status_cache: tuple[float, dict[str, Any]] | None = field(default=None, init=False, repr=False)
+    _status_refreshing: bool = field(default=False, init=False, repr=False)
 
-    def status(self) -> dict[str, Any]:
+    def __post_init__(self) -> None:
+        if self.status_cache_enabled:
+            self._status_cache = (0.0, self._placeholder_status())
+
+    def _placeholder_status(self) -> dict[str, Any]:
+        unavailable = {"healthy": False, "detail": "状态正在后台刷新"}
+        today_keys = (
+            "events",
+            "images_seen",
+            "image_segments",
+            "cdn_requests",
+            "cdn_downloads",
+            "cdn_bytes",
+            "cdn_400",
+            "cdn_403",
+            "cdn_429",
+            "history_calls",
+            "window_history_calls",
+            "get_image_blocked",
+            "accepted",
+            "rejected",
+            "duplicates",
+            "failed",
+            "expired",
+            "filtered_gif",
+        )
+        return {
+            "timestamp": int(time.time()),
+            "services": {
+                key: dict(unavailable)
+                for key in (
+                    "napcat",
+                    "onebot",
+                    "worker",
+                    "event_stream",
+                    "queue",
+                    "downloader",
+                    "recovery",
+                )
+            },
+            "account": None,
+            "action": {
+                "name": None,
+                "status": "idle",
+                "stage": None,
+                "message": None,
+                "error": None,
+            },
+            "migration": {
+                "status": "idle",
+                "stage": None,
+                "current": 0,
+                "total": 0,
+                "error": None,
+            },
+            "statistics": {
+                "unique_images": 0,
+                "accepted_records": 0,
+                "novelai": 0,
+                "comfyui": 0,
+                "novelai_unreadable": 0,
+                "other_models": 0,
+                "disk_bytes": 0,
+                "queue": {
+                    "depth": 0,
+                    "oldest_at": None,
+                    "oldest_age_seconds": 0,
+                    "high": 0,
+                    "medium": 0,
+                    "low": 0,
+                    "expiring": 0,
+                    "expiry_urgent": 0,
+                },
+                "today": {key: 0 for key in today_keys},
+                "events": {},
+                "downloader": {"status": "loading"},
+                "worker": {},
+                "window_recovery": {},
+            },
+            "groups": [],
+            "jobs": [],
+            "setup": {"completed": False, "checks": []},
+            "remote": {
+                "enabled": self.config.remote_enabled,
+                "public_origin": self.config.remote_public_origin,
+                "snapshot": {"enabled": False},
+            },
+        }
+
+    def start_status_refresh(self) -> None:
+        if not self.status_cache_enabled:
+            return
+        with self._status_cache_lock:
+            if self._status_refreshing:
+                return
+            self._status_refreshing = True
+        threading.Thread(
+            target=self._refresh_status,
+            name="console-status-refresh",
+            daemon=True,
+        ).start()
+
+    def _refresh_status(self) -> None:
+        try:
+            payload = self._compute_status()
+        except Exception:
+            LOGGER.exception("background status refresh failed")
+        else:
+            with self._status_cache_lock:
+                self._status_cache = (time.monotonic(), payload)
+        finally:
+            with self._status_cache_lock:
+                self._status_refreshing = False
+
+    def status(self, *, force: bool = False) -> dict[str, Any]:
+        if not self.status_cache_enabled:
+            return self._compute_status()
+        if force:
+            payload = self._compute_status()
+            with self._status_cache_lock:
+                self._status_cache = (time.monotonic(), payload)
+            return copy.deepcopy(payload)
+
+        with self._status_cache_lock:
+            assert self._status_cache is not None
+            cached_at, cached = self._status_cache
+            should_refresh = time.monotonic() - cached_at >= STATUS_SNAPSHOT_SECONDS
+            payload = copy.deepcopy(cached)
+        if should_refresh:
+            self.start_status_refresh()
+        return payload
+
+    def _compute_status(self) -> dict[str, Any]:
         now = int(time.time())
         health = self.health.snapshot()
         services = dict(health["services"])
@@ -252,6 +393,7 @@ def create_app(
         health=health,
         supervisor=supervisor,
         migration=StorageMigrationManager(),
+        status_cache_enabled=not testing,
     )
 
     remote_origin = urlparse(config.remote_public_origin or "")
@@ -280,6 +422,7 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> Any:
+        context.start_status_refresh()
         publisher.start()
         try:
             yield
