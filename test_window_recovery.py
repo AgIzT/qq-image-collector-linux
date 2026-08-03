@@ -160,6 +160,27 @@ class WindowRecoveryTests(unittest.TestCase):
         )
         connection.commit()
 
+    def test_running_state_publication_is_throttled_without_delaying_pages(self) -> None:
+        runner = WindowRecoveryRunner(
+            self.config_path,
+            not_before=NOT_BEFORE,
+            not_after=NOT_AFTER,
+            expected_groups=1,
+            interval_seconds=0,
+            onebot=FakeOneBot(),
+        )
+        self.runners.append(runner)
+        aggregate = mock.Mock(return_value={"phase": "running", "updated_at": 1})
+        runner._aggregate = aggregate  # type: ignore[method-assign]
+
+        first = runner._publish_state("running")
+        second = runner._publish_state("running")
+        runner._publish_state("deferred")
+
+        self.assertEqual(first, second)
+        self.assertEqual(aggregate.call_count, 2)
+        self.assertEqual(runner.interval_seconds, 0)
+
     def insert_anchor(
         self,
         connection: sqlite3.Connection,

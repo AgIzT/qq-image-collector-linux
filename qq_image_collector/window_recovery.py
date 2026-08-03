@@ -175,6 +175,8 @@ class WindowRecoveryRunner:
         self.poll_seconds = max(1, int(poll_seconds))
         self.onebot = onebot or OneBotClient.from_settings(self.settings["onebot"])
         self.stop_event = threading.Event()
+        self._last_state_publish_at = 0.0
+        self._last_published_state: dict[str, Any] = {}
         self.report_path = (
             Path(self.settings["storage"]["root"])
             / "state"
@@ -773,6 +775,13 @@ class WindowRecoveryRunner:
         return result
 
     def _publish_state(self, phase: str, **extra: Any) -> dict[str, Any]:
+        now = time.monotonic()
+        if (
+            phase == "running"
+            and self._last_published_state
+            and now - self._last_state_publish_at < 2.0
+        ):
+            return dict(self._last_published_state)
         state = self._aggregate(phase, **extra)
         set_runtime_state(self.connection, "window_recovery", state)
         self.report_path.parent.mkdir(parents=True, exist_ok=True)
@@ -781,6 +790,8 @@ class WindowRecoveryRunner:
         )
         os.chmod(self.report_path, 0o600)
         print(json.dumps(state, ensure_ascii=False), flush=True)
+        self._last_state_publish_at = now
+        self._last_published_state = dict(state)
         return state
 
     def run(self) -> None:
