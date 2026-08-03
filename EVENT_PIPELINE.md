@@ -135,7 +135,8 @@ raw `msgSeq`；返回的稳定持久身份是 `real_seq`。恢复器使用 `reve
 4. 历史中的 `message_sent` 强制规范化为 `message`，避免漏掉登录账号自己发送的图；
 5. 时间随递增 `real_seq` 不倒退时，首个 `min(page_time)<not_before` 的跨界页处理
    完成后即可结束；短页、空页、锚点不进、方向异常或字段缺失均不能伪装完成；
-6. 每页之间默认等待 2 秒；没有每小时、每日、每群页数或队列深度停止条件；
+6. 每群每页之间默认等待 60 秒，以保护实时采集和控制台 I/O；没有每小时、每日、
+   每群页数或队列深度停止条件；
 7. NapCat short ID 映射失效时回到当前 raw 上界重扫；该 raw ID 也不可用时退回最新页
    引导，依赖 `real_seq` 去重；绝不把 raw `msgSeq` 冒充 API 锚点；
 8. 恢复调用另计 `window_history_calls`；完成后停止并移除 profile 容器，实时 WS

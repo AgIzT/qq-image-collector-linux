@@ -139,7 +139,7 @@ services:
       - --page-size
       - "20"
       - --interval-seconds
-      - "2"
+      - "60"
       - --hourly-limit
       - "0"
       - --daily-limit
@@ -149,7 +149,7 @@ services:
       - --queue-threshold
       - "-1"
       - --poll-seconds
-      - "2"
+      - "10"
     environment:
       QQ_IMAGE_COLLECTOR_CONFIG: /data/qq-image-collector/config/collector_config.json
       TZ: Asia/Shanghai

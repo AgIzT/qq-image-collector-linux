@@ -28,10 +28,15 @@ from qq_image_collector.database import (
 from .config import ConsoleConfig
 
 
+STATUS_CACHE_SECONDS = 15.0
+
+
 class Repository:
     def __init__(self, config: ConsoleConfig) -> None:
         self.config = config
         self._cache_lock = threading.Lock()
+        self._stats_compute_lock = threading.Lock()
+        self._groups_compute_lock = threading.Lock()
         self._stats_cache: tuple[float, dict[str, Any]] | None = None
         self._groups_cache: tuple[float, list[dict[str, Any]]] | None = None
         self.bootstrap()
@@ -89,12 +94,21 @@ class Repository:
                 set_setting(connection, "setup_completed", bool(settings.get("groups")))
 
     def _invalidate_groups(self) -> None:
-        with self._cache_lock:
-            self._groups_cache = None
+        with self._groups_compute_lock:
+            with self._cache_lock:
+                self._groups_cache = None
 
     def list_groups(self, force: bool = False) -> list[dict[str, Any]]:
+        with self._groups_compute_lock:
+            return self._list_groups_locked(force)
+
+    def _list_groups_locked(self, force: bool = False) -> list[dict[str, Any]]:
         with self._cache_lock:
-            if not force and self._groups_cache and time.time() - self._groups_cache[0] < 5:
+            if (
+                not force
+                and self._groups_cache
+                and time.time() - self._groups_cache[0] < STATUS_CACHE_SECONDS
+            ):
                 return [dict(row) for row in self._groups_cache[1]]
         with closing(self.connect()) as connection:
             rows = connection.execute(
@@ -246,8 +260,16 @@ class Repository:
         return self.get_app_settings()
 
     def stats(self, force: bool = False) -> dict[str, Any]:
+        with self._stats_compute_lock:
+            return self._stats_locked(force)
+
+    def _stats_locked(self, force: bool = False) -> dict[str, Any]:
         with self._cache_lock:
-            if not force and self._stats_cache and time.time() - self._stats_cache[0] < 2.0:
+            if (
+                not force
+                and self._stats_cache
+                and time.time() - self._stats_cache[0] < STATUS_CACHE_SECONDS
+            ):
                 return dict(self._stats_cache[1])
         with closing(self.connect()) as connection:
             unique_images = int(connection.execute("SELECT count(*) FROM assets").fetchone()[0])
