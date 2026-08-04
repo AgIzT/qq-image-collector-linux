@@ -6,11 +6,13 @@ import os
 import sqlite3
 import tempfile
 import time
+import zlib
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlsplit
 
 import httpx
+from PIL import Image, UnidentifiedImageError
 
 from metadata_reader import extension_for_format, inspect_image
 
@@ -24,6 +26,15 @@ from .database import (
 
 ALLOWED_CDN_HOSTS = frozenset({"gchat.qpic.cn", "multimedia.nt.qq.com.cn"})
 GIF_SIGNATURES = (b"GIF87a", b"GIF89a")
+METADATA_DECODE_ERRORS = (
+    UnidentifiedImageError,
+    Image.DecompressionBombError,
+    OSError,
+    ValueError,
+    SyntaxError,
+    EOFError,
+    zlib.error,
+)
 
 
 class DownloadError(RuntimeError):
@@ -257,8 +268,22 @@ class CdnDownloader:
                 increment_counter(self.connection, "filtered_gif")
                 return "filtered_gif"
 
-            result = await asyncio.to_thread(inspect_image, temp_path)
             digest = await asyncio.to_thread(sha256_file, temp_path)
+            try:
+                result = await asyncio.to_thread(inspect_image, temp_path)
+            except METADATA_DECODE_ERRORS as exc:
+                # A malformed or intentionally oversized metadata block belongs
+                # to this image. It must not tear down the shared Worker or keep
+                # a page-draining recovery job blocked forever.
+                finish_image(
+                    self.connection,
+                    row,
+                    status="rejected_no_metadata",
+                    sha256=digest,
+                    error=f"metadata_decode_error:{type(exc).__name__}",
+                )
+                increment_counter(self.connection, "rejected")
+                return "rejected"
             if not result.accepted:
                 finish_image(
                     self.connection,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
 import json
 import os
@@ -582,6 +583,71 @@ class EventPipelineTests(unittest.TestCase):
             ).fetchone()[0]
             self.assertEqual(status, "filtered_gif")
             self.assertFalse(any((self.root / "temp").glob("*.part")))
+
+        asyncio.run(scenario())
+
+    def test_metadata_decode_error_rejects_only_the_bad_image(self) -> None:
+        async def scenario() -> None:
+            payload = a1111_png()
+
+            async def handler(_request: httpx.Request) -> httpx.Response:
+                return httpx.Response(200, content=payload)
+
+            _cursor, items = parse_group_event(
+                image_event(url="https://gchat.qpic.cn/bad-metadata?rkey=secret")
+            )
+            enqueue_image(self.connection, items[0])
+            downloader = CdnDownloader(
+                self.connection,
+                self.root,
+                max_bytes=1024 * 1024,
+                daily_limit=10,
+            )
+            await downloader.client.aclose()
+            downloader.client = httpx.AsyncClient(
+                transport=httpx.MockTransport(handler)
+            )
+
+            with mock.patch(
+                "qq_image_collector.downloader.inspect_image",
+                side_effect=ValueError(
+                    "Decompressed data too large for PngImagePlugin.MAX_TEXT_CHUNK"
+                ),
+            ):
+                self.assertEqual(
+                    await downloader.process(claim_next_image(self.connection)),
+                    "rejected",
+                )
+
+            bad = self.connection.execute(
+                "SELECT status, sha256, error, resolver_json FROM images"
+            ).fetchone()
+            self.assertEqual(bad[0], "rejected_no_metadata")
+            self.assertEqual(bad[1], hashlib.sha256(payload).hexdigest())
+            self.assertEqual(bad[2], "metadata_decode_error:ValueError")
+            self.assertNotIn("secret", bad[3])
+            self.assertFalse(any((self.root / "temp").glob("*.part")))
+
+            next_event = image_event(url="https://gchat.qpic.cn/good-metadata")
+            next_event["raw"]["msgId"] = str(int(MESSAGE) + 1)
+            next_event["raw"]["msgSeq"] = "12346"
+            _cursor, next_items = parse_group_event(next_event)
+            enqueue_image(self.connection, next_items[0])
+            self.assertEqual(
+                await downloader.process(claim_next_image(self.connection)),
+                "accepted",
+            )
+            await downloader.close()
+
+            statuses = list(
+                self.connection.execute(
+                    "SELECT status FROM images ORDER BY sent_at, message_id"
+                )
+            )
+            self.assertEqual(
+                [row[0] for row in statuses],
+                ["rejected_no_metadata", "accepted"],
+            )
 
         asyncio.run(scenario())
 

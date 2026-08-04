@@ -20,7 +20,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from PIL import Image
+from PIL import Image, PngImagePlugin
+
+
+PNG_TEXT_CHUNK_LIMIT = 16 * 1024 * 1024
+PNG_TEXT_TOTAL_LIMIT = 64 * 1024 * 1024
+
+# Pillow's default compressed PNG text limit is 1 MiB, which is smaller than
+# real ComfyUI workflows. Keep decompression bounded, but permit practical
+# workflow payloads without mutating the limit around individual threads.
+PngImagePlugin.MAX_TEXT_CHUNK = PNG_TEXT_CHUNK_LIMIT
+PngImagePlugin.MAX_TEXT_MEMORY = PNG_TEXT_TOTAL_LIMIT
 
 
 GENERATION_KEYS = {
@@ -285,6 +295,24 @@ def _decode_png_text(value: bytes) -> str | None:
     return None
 
 
+def _decompress_png_text(value: bytes) -> bytes | None:
+    try:
+        decompressor = zlib.decompressobj()
+        decoded = decompressor.decompress(value, PNG_TEXT_CHUNK_LIMIT + 1)
+        if len(decoded) > PNG_TEXT_CHUNK_LIMIT or decompressor.unconsumed_tail:
+            return None
+        tail = decompressor.flush()
+        if (
+            not decompressor.eof
+            or decompressor.unused_data
+            or len(decoded) + len(tail) > PNG_TEXT_CHUNK_LIMIT
+        ):
+            return None
+        return decoded + tail
+    except zlib.error:
+        return None
+
+
 def _read_png_text_channels(path: Path) -> tuple[dict[str, str], dict[str, str]]:
     """Return official PNG text fields and recovery-only zTXt fields.
 
@@ -325,11 +353,8 @@ def _read_png_text_channels(path: Path) -> tuple[dict[str, str], dict[str, str]]
                 keyword = _decode_png_text(chunk_data[:separator])
                 # PNG zTXt currently defines compression method 0 (DEFLATE).
                 if keyword and chunk_data[separator + 1] == 0:
-                    try:
-                        decoded = zlib.decompress(chunk_data[separator + 2 :])
-                    except zlib.error:
-                        decoded = b""
-                    text = _decode_png_text(decoded)
+                    decoded = _decompress_png_text(chunk_data[separator + 2 :])
+                    text = _decode_png_text(decoded or b"")
                     if text:
                         ztxt_fields[keyword] = text
         elif chunk_type == b"iTXt":
@@ -349,10 +374,7 @@ def _read_png_text_channels(path: Path) -> tuple[dict[str, str], dict[str, str]]
                 if keyword and translated_end >= 0:
                     text_bytes = remainder[translated_end + 1 :]
                     if compressed and compression_method == 0:
-                        try:
-                            text_bytes = zlib.decompress(text_bytes)
-                        except zlib.error:
-                            text_bytes = b""
+                        text_bytes = _decompress_png_text(text_bytes) or b""
                     elif compressed:
                         text_bytes = b""
                     text = _decode_png_text(text_bytes)

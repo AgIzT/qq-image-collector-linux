@@ -2,6 +2,7 @@ import gzip
 import json
 import tempfile
 import unittest
+import zlib
 from pathlib import Path
 from unittest.mock import patch
 
@@ -10,7 +11,12 @@ from PIL.PngImagePlugin import PngInfo
 
 from linux.diagnostic_compare import metadata_summary
 from qq_image_collector.database import accepted_path_for, category_for_source
-from metadata_reader import _extract_stealth_png, inspect_image
+from metadata_reader import (
+    PNG_TEXT_CHUNK_LIMIT,
+    _decompress_png_text,
+    _extract_stealth_png,
+    inspect_image,
+)
 
 
 class MetadataReaderTests(unittest.TestCase):
@@ -283,6 +289,37 @@ class MetadataReaderTests(unittest.TestCase):
         self.assertTrue(result.accepted)
         self.assertEqual(result.source, "novelai-unreadable")
         self.assertIn("signed_hash", result.fields["Comment"])
+
+    def test_compressed_png_text_larger_than_pillow_default_is_supported(self) -> None:
+        path = self.root / "large-workflow.png"
+        metadata = PngInfo()
+        parameters = (
+            "cat\nNegative prompt: blur\n"
+            + ("workflow-node," * 90_000)
+            + "\nSteps: 20, Sampler: Euler, Seed: 1"
+        )
+        self.assertGreater(len(parameters.encode("utf-8")), 1024 * 1024)
+        self.assertLess(len(parameters.encode("utf-8")), PNG_TEXT_CHUNK_LIMIT)
+        metadata.add_text("parameters", parameters, zip=True)
+        Image.new("RGB", (8, 8), "white").save(path, pnginfo=metadata)
+
+        result = inspect_image(path)
+
+        self.assertTrue(result.accepted)
+        self.assertEqual(result.source, "a1111-compatible")
+        self.assertEqual(result.fields["parameters"], parameters)
+
+    def test_png_text_decompression_is_bounded(self) -> None:
+        within_limit = b"x" * PNG_TEXT_CHUNK_LIMIT
+        over_limit = within_limit + b"x"
+
+        self.assertEqual(
+            _decompress_png_text(zlib.compress(within_limit)),
+            within_limit,
+        )
+        self.assertIsNone(_decompress_png_text(zlib.compress(over_limit)))
+        self.assertIsNone(_decompress_png_text(b"not-a-zlib-stream"))
+        self.assertIsNone(_decompress_png_text(zlib.compress(b"truncated")[:-1]))
 
     def test_ztxt_duplicate_does_not_downgrade_native_comment(self) -> None:
         path = self.root / "text-and-ztxt-novelai.png"
