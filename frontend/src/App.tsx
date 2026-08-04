@@ -1,131 +1,56 @@
-import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
-import type { AvailableGroup, DashboardStatus, GroupRuntime, Job, Settings } from "./types";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import type { AvailableGroup, DashboardStatus, GroupRuntime, Settings } from "./types";
 
-type View = "overview" | "groups" | "jobs" | "settings" | "logs";
-type SystemAction = "start" | "stop" | "restart";
-type SessionInfo = {
-  ok: boolean;
-  mode: "local" | "remote" | "direct";
-  identity: { email: string } | null;
-  csrf_token: string | null;
-  permissions: string[];
-};
+type View = "overview" | "groups" | "settings" | "logs";
+type SessionInfo = { mode: "local" | "remote" | "direct"; identity: { email: string } | null };
 
-let activeCsrfToken: string | null = null;
-
-class ApiError extends Error {
-  status: number;
-  constructor(status: number, message: string) {
-    super(message);
-    this.status = status;
-  }
-}
+/** A group with no image for this long is shown as dormant rather than active. */
+const DORMANT_AFTER_SECONDS = 3 * 3600;
 
 async function api<T>(url: string, options: RequestInit = {}): Promise<T> {
-  const method = String(options.method ?? "GET").toUpperCase();
-  const mutation = ["POST", "PUT", "PATCH", "DELETE"].includes(method);
   const response = await fetch(url, {
-    credentials: "same-origin",
+    credentials: "include",
+    headers: { "Content-Type": "application/json", ...(options.headers ?? {}) },
     ...options,
-    headers: {
-      "Content-Type": "application/json",
-      ...(mutation && activeCsrfToken ? { "X-CSRF-Token": activeCsrfToken } : {}),
-      ...(options.headers ?? {}),
-    },
   });
-  const payload = (await response.json().catch(() => ({}))) as Record<string, unknown>;
-  if (!response.ok) throw new ApiError(response.status, String(payload.detail ?? `HTTP ${response.status}`));
-  return payload as T;
+  if (!response.ok) {
+    const detail = await response.json().catch(() => ({ detail: response.statusText }));
+    throw new Error(detail?.detail ?? `请求失败：${response.status}`);
+  }
+  return response.status === 204 ? (undefined as T) : ((await response.json()) as T);
 }
 
-function formatTime(value: number | null | undefined): string {
-  if (!value) return "—";
-  return new Intl.DateTimeFormat("zh-CN", {
-    month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit",
-  }).format(new Date(value * 1000));
+function ago(value: number | null | undefined): string {
+  if (!value) return "从未";
+  const seconds = Math.max(0, Math.floor(Date.now() / 1000) - value);
+  if (seconds < 60) return "刚刚";
+  if (seconds < 3600) return `${Math.floor(seconds / 60)} 分钟前`;
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)} 小时前`;
+  return `${Math.floor(seconds / 86400)} 天前`;
 }
 
-function formatDuration(value: number | null | undefined): string {
-  const seconds = Math.max(0, Number(value ?? 0));
-  if (seconds < 60) return `${seconds} 秒`;
-  if (seconds < 3600) return `${Math.floor(seconds / 60)} 分钟`;
-  return `${(seconds / 3600).toFixed(1)} 小时`;
+function bytes(value: number): string {
+  if (!value) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  const index = Math.min(units.length - 1, Math.floor(Math.log(value) / Math.log(1024)));
+  return `${(value / 1024 ** index).toFixed(index >= 3 ? 2 : 0)} ${units[index]}`;
 }
 
-function formatBytes(value: number): string {
-  if (value < 1024) return `${value} B`;
-  const units = ["KiB", "MiB", "GiB", "TiB"];
-  let size = value;
-  let index = -1;
-  do { size /= 1024; index += 1; } while (size >= 1024 && index < units.length - 1);
-  return `${size.toFixed(size >= 10 ? 1 : 2)} ${units[index]}`;
-}
+const n = (value: number) => value.toLocaleString("en-US");
 
-const labels: Record<string, string> = {
-  idle: "空闲", running: "运行中", connected: "已连接", disconnected: "已断开",
-  queued: "排队中", cancelled: "已取消", completed: "已完成", failed: "失败",
-  error: "异常", paused: "已暂停", recovered: "已恢复", incomplete: "未完全恢复",
-  no_gap: "无断档", downloading: "下载中", receiving: "接收中",
-  recovering: "恢复中", complete: "已恢复", partial: "部分恢复", deferred: "已延后",
-};
+const CATEGORIES = [
+  { key: "novelai", label: "NovelAI", tone: "nai" },
+  { key: "comfyui", label: "ComfyUI", tone: "comfy" },
+  { key: "other_models", label: "其他模型", tone: "other" },
+  { key: "novelai_unreadable", label: "NAI 不可读", tone: "unreadable" },
+] as const;
 
-function StatusPill({ value, good }: { value: string | null | undefined; good?: boolean }) {
-  const normalized = value || "idle";
-  const tone = good || ["connected", "completed", "complete", "recovered", "receiving", "no_gap"].includes(normalized)
-    ? "good"
-    : ["failed", "error", "incomplete", "disconnected"].includes(normalized)
-      ? "bad"
-      : ["running", "queued", "downloading"].includes(normalized) ? "active" : "neutral";
-  return <span className={`pill ${tone}`}>{labels[normalized] ?? normalized}</span>;
-}
-
-function ServiceCard({ title, state }: { title: string; state?: { healthy: boolean; detail: string } }) {
-  const healthy = Boolean(state?.healthy);
-  return (
-    <article className={`service-card ${healthy ? "online" : "offline"}`}>
-      <div className="service-heading"><span className="service-dot" /><span>{title}</span></div>
-      <strong>{healthy ? "正常" : "未就绪"}</strong>
-      <small title={state?.detail}>{state?.detail ?? "等待状态"}</small>
-    </article>
-  );
-}
-
-function Metric({ label, value, note }: { label: string; value: string | number; note?: string }) {
-  return <article className="metric"><span>{label}</span><strong>{value}</strong>{note && <small>{note}</small>}</article>;
-}
-
-function GroupCard({ group, onDisable, onEnable }: {
-  group: GroupRuntime;
-  onDisable: (id: string) => void;
-  onEnable: (id: string, name?: string) => void;
-}) {
-  return (
-    <article className={`group-card ${group.enabled ? "" : "disabled"}`}>
-      <div className="group-title">
-        <div><h3>{group.display_name || `群 ${group.group_id}`}</h3><code>{group.group_id}</code></div>
-        <StatusPill value={group.enabled ? "connected" : "paused"} good={Boolean(group.enabled)} />
-      </div>
-      <div className="runtime-grid">
-        <div><span>事件监听</span><StatusPill value={group.event_status} /><small>最后消息 {formatTime(group.last_event_at)}</small></div>
-        <div><span>断档恢复</span><StatusPill value={group.gap_status} /><small>最后图片 {formatTime(group.last_image_at)}</small>{group.gap_error && <small className="error-text">{group.gap_error}</small>}</div>
-      </div>
-      <div className="group-counts">
-        <span><b>{group.queued}</b> 排队</span><span><b>{group.accepted}</b> 有效</span>
-        <span><b>{group.rejected}</b> 淘汰</span><span><b>{group.duplicates}</b> 重复</span><span><b>{group.expired}</b> URL失效</span><span><b>{group.failed}</b> 失败</span>
-      </div>
-      <div className="button-row compact">
-        {group.enabled ? <>
-          <button className="danger-ghost" onClick={() => onDisable(group.group_id)}>停止监听</button>
-        </> : <button className="primary" onClick={() => onEnable(group.group_id, group.display_name ?? undefined)}>重新启用</button>}
-      </div>
-    </article>
-  );
-}
+/** Only these services are worth interrupting the user for. */
+const CRITICAL_SERVICES = ["event_stream", "worker", "downloader", "queue", "onebot", "qq"];
 
 export default function App() {
   const [view, setView] = useState<View>("overview");
   const [dashboard, setDashboard] = useState<DashboardStatus | null>(null);
-  const [session, setSession] = useState<SessionInfo | null>(null);
   const [authorized, setAuthorized] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
   const [toast, setToast] = useState<string | null>(null);
@@ -134,204 +59,461 @@ export default function App() {
   const [search, setSearch] = useState("");
   const [manualGroup, setManualGroup] = useState("");
   const [logs, setLogs] = useState<{ path: string; lines: string[] }[]>([]);
+  const [showDetail, setShowDetail] = useState(false);
 
   const notify = useCallback((message: string) => {
     setToast(message);
-    window.setTimeout(() => setToast(null), 3500);
+    window.setTimeout(() => setToast(null), 4000);
   }, []);
+
   const refresh = useCallback(async () => setDashboard(await api<DashboardStatus>("/api/v1/status")), []);
 
   useEffect(() => {
     void (async () => {
+      const token = new URLSearchParams(window.location.search).get("session_token");
       try {
-        const params = new URLSearchParams(window.location.search);
-        const token = params.get("session_token");
-        const established = await api<SessionInfo>(token ? `/api/v1/session?session_token=${encodeURIComponent(token)}` : "/api/v1/session");
-        if (token) window.history.replaceState({}, "", `${window.location.pathname}${window.location.hash}`);
-        activeCsrfToken = established.csrf_token;
-        setSession(established);
-        await refresh();
+        await api<SessionInfo>(
+          token ? `/api/v1/session?session_token=${encodeURIComponent(token)}` : "/api/v1/session",
+        );
+        if (token) window.history.replaceState({}, "", window.location.pathname);
         setAuthorized(true);
-      } catch (error) { setAuthError(error instanceof Error ? error.message : "无法建立控制台会话"); }
+        await refresh();
+      } catch (error) {
+        setAuthError((error as Error).message);
+      }
     })();
   }, [refresh]);
 
   useEffect(() => {
     if (!authorized) return;
     const source = new EventSource("/api/v1/events", { withCredentials: true });
-    source.addEventListener("status", (event) => setDashboard(JSON.parse((event as MessageEvent).data) as DashboardStatus));
-    let fallback: number | null = null;
-    source.onopen = () => {
-      if (fallback !== null) window.clearInterval(fallback);
-      fallback = null;
-    };
-    source.onerror = () => {
-      if (fallback === null) {
-        fallback = window.setInterval(() => void refresh().catch(() => undefined), 7000);
+    source.onmessage = (event) => {
+      try {
+        setDashboard(JSON.parse(event.data) as DashboardStatus);
+      } catch {
+        /* keep the last good snapshot */
       }
     };
+    const timer = window.setInterval(() => void refresh().catch(() => undefined), 30000);
     return () => {
       source.close();
-      if (fallback !== null) window.clearInterval(fallback);
+      window.clearInterval(timer);
     };
   }, [authorized, refresh]);
 
   useEffect(() => {
     if (!authorized || view !== "settings") return;
-    void api<Settings>("/api/v1/settings").then(setSettings).catch((error: Error) => notify(error.message));
+    void api<Settings>("/api/v1/settings").then(setSettings).catch((e: Error) => notify(e.message));
   }, [authorized, view, notify]);
 
   useEffect(() => {
-    if (!authorized || view !== "logs" || session?.mode === "remote") return;
-    void api<{ files: { path: string; lines: string[] }[] }>("/api/v1/logs?lines=250").then((value) => setLogs(value.files)).catch((error: Error) => notify(error.message));
-  }, [authorized, view, notify, session?.mode]);
+    if (!authorized || view !== "logs") return;
+    void api<{ files: { path: string; lines: string[] }[] }>("/api/v1/logs?lines=250")
+      .then((value) => setLogs(value.files))
+      .catch((e: Error) => notify(e.message));
+  }, [authorized, view, notify]);
 
-  const systemAction = async (action: SystemAction) => {
-    try {
-      await api(`/api/v1/system/${action}`, { method: "POST", body: JSON.stringify({ confirm_close_qq: true }) });
-      notify(action === "stop" ? "正在停止事件 Worker" : "操作已开始");
-      await refresh();
-    } catch (error) { notify(error instanceof Error ? error.message : "操作失败"); }
-  };
+  const run = useCallback(
+    async (label: string, task: () => Promise<unknown>) => {
+      try {
+        await task();
+        notify(label);
+        await refresh();
+      } catch (error) {
+        notify((error as Error).message);
+      }
+    },
+    [notify, refresh],
+  );
 
-  const addGroup = async (groupId: string, displayName?: string) => {
-    try {
-      await api("/api/v1/groups", { method: "POST", body: JSON.stringify({ group_id: groupId.trim(), display_name: displayName || null }) });
-      setManualGroup(""); notify("监听群已启用；首次从当前时刻开始"); await refresh();
-    } catch (error) { notify(error instanceof Error ? error.message : "添加失败"); }
-  };
+  const stats = dashboard?.statistics;
+  const today = stats?.today;
 
-  const disableGroup = async (groupId: string) => {
-    if (!window.confirm(`停止监听群 ${groupId}？已有图片和游标会保留。`)) return;
-    try { await api(`/api/v1/groups/${groupId}`, { method: "DELETE" }); notify("已停止监听"); await refresh(); }
-    catch (error) { notify(error instanceof Error ? error.message : "操作失败"); }
-  };
+  const problems = useMemo(() => {
+    if (!dashboard) return [] as { key: string; detail: string }[];
+    const found = CRITICAL_SERVICES.filter((key) => dashboard.services[key] && !dashboard.services[key].healthy).map(
+      (key) => ({ key, detail: dashboard.services[key].detail }),
+    );
+    if ((today?.get_image_blocked ?? 0) > 0) {
+      found.unshift({ key: "安全", detail: `拦截到 ${today?.get_image_blocked} 次 get_image 调用，采集已暂停` });
+    }
+    if (dashboard.action?.status === "failed") {
+      found.push({ key: "操作", detail: dashboard.action.error ?? "上次操作失败" });
+    }
+    return found;
+  }, [dashboard, today]);
 
-  const loadAvailable = async () => {
-    try { const rows = await api<AvailableGroup[]>("/api/v1/groups/available"); setAvailable(rows); notify(`已读取 ${rows.length} 个群`); }
-    catch (error) { notify(error instanceof Error ? error.message : "读取群列表失败"); }
-  };
+  const lastImageAt = useMemo(
+    () => (dashboard?.groups ?? []).reduce((max, g) => Math.max(max, g.last_image_at ?? 0), 0),
+    [dashboard],
+  );
 
-  const cancelJob = async (job: Job) => {
-    try { await api(`/api/v1/jobs/${job.id}/cancel`, { method: "POST", body: "{}" }); notify("将在当前页边界取消"); await refresh(); }
-    catch (error) { notify(error instanceof Error ? error.message : "取消失败"); }
-  };
+  const sortedGroups = useMemo(
+    () => [...(dashboard?.groups ?? [])].sort((a, b) => (b.last_image_at ?? 0) - (a.last_image_at ?? 0)),
+    [dashboard],
+  );
 
-  const recoverGap = async (groupId: string) => {
-    try {
-      await api(`/api/v1/groups/${groupId}/recover-gap`, { method: "POST", body: "{}" });
-      notify(`群 ${groupId} 的断档恢复已排队`);
-      await refresh();
-    } catch (error) { notify(error instanceof Error ? error.message : "恢复任务创建失败"); }
-  };
+  if (authError) {
+    return (
+      <div className="gate">
+        <h1>无法建立本地会话</h1>
+        <p>{authError}</p>
+        <p className="muted">请通过 <code>./manage.sh console-url</code> 获取带令牌的地址。</p>
+      </div>
+    );
+  }
 
-  const saveSettings = async (event: FormEvent) => {
-    event.preventDefault(); if (!settings) return;
-    try {
-      const payload = {
-        download_interval_seconds: settings.download_interval_seconds,
-        download_jitter_seconds: settings.download_jitter_seconds,
-        url_preference: settings.url_preference,
-        collector_paused: settings.collector_paused,
-      };
-      setSettings(await api<Settings>("/api/v1/settings", { method: "PATCH", body: JSON.stringify(payload) }));
-      notify("设置已保存，Worker 下一循环生效");
-    } catch (error) { notify(error instanceof Error ? error.message : "保存失败"); }
-  };
+  if (!dashboard || !stats || !today) {
+    return <div className="gate"><h1>正在读取采集状态…</h1></div>;
+  }
 
-  const filtered = useMemo(() => {
-    const query = search.trim().toLowerCase();
-    return query ? available.filter((row) => `${row.group_id} ${row.group_name}`.toLowerCase().includes(query)) : available;
-  }, [available, search]);
-
-  if (authError) return <main className="center-screen"><div className="auth-card"><div className="brand-mark">AI</div><h1>无法进入控制台</h1><p>{authError}</p></div></main>;
-  if (!dashboard) return <main className="center-screen"><div className="loader" /><p>正在连接事件采集服务…</p></main>;
-
-  const workerRunning = Boolean(dashboard.services.worker?.healthy);
-  const remoteMode = session?.mode === "remote";
-  const accountName = dashboard.account ? `${dashboard.account.nickname || "QQ"} · ${dashboard.account.user_id}` : "等待 QQ 扫码登录";
-  const today = dashboard.statistics.today;
-  const queue = dashboard.statistics.queue;
-  const downloader = dashboard.statistics.downloader;
-  const windowRecovery = dashboard.statistics.window_recovery ?? {};
-  const eventState = dashboard.statistics.events;
+  const totalCategorised = CATEGORIES.reduce((sum, c) => sum + (stats[c.key] as number), 0) || 1;
+  const paused = settings?.collector_paused ?? false;
 
   return (
-    <div className="app-shell">
-      <aside className="sidebar">
-        <div className="brand"><div className="brand-mark">AI</div><div><strong>原图采集</strong><small>EVENT PIPELINE</small></div></div>
-        <nav>{([
-          ["overview", "运行总览", "⌂"], ["groups", "监听群聊", "◎"], ["jobs", "断档任务", "↺"], ["settings", "采集设置", "⚙"],
-          ...(!remoteMode ? [["logs", "运行日志", "≡"]] : []),
-        ] as [View, string, string][]).map(([key, label, icon]) => <button key={key} className={view === key ? "active" : ""} onClick={() => setView(key)}><span>{icon}</span>{label}</button>)}</nav>
-        <div className="sidebar-footer"><span className={`live-dot ${workerRunning ? "on" : ""}`} /><div><strong>{workerRunning ? "事件采集中" : "Worker 已停止"}</strong><small>{accountName}</small></div></div>
-      </aside>
+    <div className="app">
+      <StatusBar
+        problems={problems}
+        lastImageAt={lastImageAt}
+        account={dashboard.account}
+        queueDepth={stats.queue.depth}
+      />
 
-      <main className="content">
-        <header className="topbar"><div><p className="eyebrow">QQ AI IMAGE COLLECTOR</p><h1>{{ overview: "运行总览", groups: "监听群聊", jobs: "断档恢复任务", settings: "采集设置", logs: "运行日志" }[view]}</h1></div><div className="top-actions"><button className="secondary" onClick={() => void systemAction("restart")}>重启 Worker</button>{workerRunning ? <button className="danger" onClick={() => void systemAction("stop")}>停止 Worker</button> : <button className="primary" onClick={() => void systemAction("start")}>启动 Worker</button>}</div></header>
+      <nav className="tabs">
+        {([["overview", "概览"], ["groups", "群聊"], ["settings", "设置"], ["logs", "日志"]] as [View, string][]).map(
+          ([key, label]) => (
+            <button key={key} className={view === key ? "tab active" : "tab"} onClick={() => setView(key)}>
+              {label}
+            </button>
+          ),
+        )}
+        <span className="spacer" />
+        <button className="ghost" onClick={() => void run("已刷新", refresh)}>刷新</button>
+      </nav>
 
-        {remoteMode && <section className="remote-banner"><div><strong>Cloudflare Access 远程会话</strong><small>{session?.identity?.email}</small></div><span>控制权限受 Token、CSRF 与身份验证保护</span></section>}
-        {dashboard.action.status !== "idle" && <section className={`action-banner ${dashboard.action.status}`}><div className={dashboard.action.status === "running" ? "spinner" : "action-icon"}>{dashboard.action.status === "completed" ? "✓" : dashboard.action.status === "failed" ? "!" : ""}</div><div><strong>{dashboard.action.message || "系统操作"}</strong><small>{dashboard.action.error || dashboard.action.stage || ""}</small></div></section>}
-
-        {view === "overview" && <>
-          <section className="account-strip"><div><span className="avatar">Q</span><div><small>当前登录 QQ</small><strong>{accountName}</strong></div></div><span>刷新于 {formatTime(dashboard.timestamp)}</span></section>
-          <section className="service-grid">
-            <ServiceCard title="NapCat" state={dashboard.services.napcat} /><ServiceCard title="OneBot HTTP" state={dashboard.services.onebot} />
-            <ServiceCard title="OneBot WS" state={dashboard.services.event_stream} /><ServiceCard title="持久队列" state={dashboard.services.queue} />
-            <ServiceCard title="CDN 下载器" state={dashboard.services.downloader} /><ServiceCard title="自动断档恢复" state={dashboard.services.recovery} />
+      {view === "overview" && (
+        <>
+          <section className="hero">
+            <div className="hero-main">
+              <div className="hero-number">{n(stats.unique_images)}</div>
+              <div className="hero-label">张含参数的图片已收藏</div>
+            </div>
+            <div className="hero-side">
+              <div className="hero-delta">
+                <strong>+{n(today.accepted)}</strong>
+                <span>今天新增</span>
+              </div>
+              <div className="hero-meta">
+                <div><strong>{bytes(stats.disk_bytes)}</strong><span>仓库大小</span></div>
+                <div><strong>{ago(lastImageAt)}</strong><span>最后一张</span></div>
+              </div>
+            </div>
           </section>
-          <section className="section-heading"><div><p className="eyebrow">TODAY</p><h2>事件与 CDN 链路</h2></div></section>
-          <section className="metric-grid">
-            <Metric label="今日事件" value={today.events} note={`${today.image_segments} 个图片段`} />
-            <Metric label="队列深度" value={queue.depth} note={`最老 ${formatDuration(queue.oldest_age_seconds)} · ${queue.expiry_urgent} 条临期`} />
-            <Metric label="CDN 请求 / 完整下载" value={`${today.cdn_requests} / ${today.cdn_downloads}`} note={formatBytes(today.cdn_bytes)} />
-            <Metric label="有效新增" value={today.accepted} note={`${today.duplicates} 个重复`} />
-            <Metric label="CDN 400 / 403" value={`${today.cdn_400} / ${today.cdn_403}`} note="URL 失效候选 / 拒绝" />
-            <Metric label="CDN 429" value={today.cdn_429} note="仅延后当前图片，其他任务继续" />
-            <Metric label="URL 已失效" value={today.expired} note="独立告警，不并入普通失败" />
-            <Metric label="历史调用" value={today.history_calls} note={`仅断档/URL恢复 · 窗口补漏 ${today.window_history_calls ?? 0}`} />
-            <Metric
-              label="限定窗口补漏"
-              value={`${Number(windowRecovery.groups_terminal ?? 0)} / ${Number(windowRecovery.groups_total ?? 0)}`}
-              note={`${String(windowRecovery.phase ?? "未启动")} · 新入队 ${Number(windowRecovery.images_enqueued ?? 0)}`}
+
+          <section className="panel">
+            <div className="bar">
+              {CATEGORIES.map((c) => {
+                const value = stats[c.key] as number;
+                return value > 0 ? (
+                  <span
+                    key={c.key}
+                    className={`seg ${c.tone}`}
+                    style={{ width: `${(value / totalCategorised) * 100}%` }}
+                    title={`${c.label} ${n(value)}`}
+                  />
+                ) : null;
+              })}
+            </div>
+            <div className="legend">
+              {CATEGORIES.map((c) => {
+                const value = stats[c.key] as number;
+                return (
+                  <div key={c.key} className="legend-item">
+                    <i className={`dot ${c.tone}`} />
+                    <span className="legend-label">{c.label}</span>
+                    <strong>{n(value)}</strong>
+                    <span className="muted">{((value / totalCategorised) * 100).toFixed(1)}%</span>
+                  </div>
+                );
+              })}
+            </div>
+          </section>
+
+          <section className="pulse">
+            <Pulse label="队列待下载" value={n(stats.queue.depth)} warn={stats.queue.depth > 500} />
+            <Pulse label="今日收到消息" value={n(today.events)} />
+            <Pulse label="今日图片" value={n(today.images_seen)} />
+            <Pulse label="今日淘汰" value={n(today.rejected + today.filtered_gif)} muted />
+          </section>
+
+          <section className="panel">
+            <div className="panel-head">
+              <h2>各群产出</h2>
+              <span className="muted">按最后收图时间排序</span>
+            </div>
+            <GroupTable groups={sortedGroups} />
+          </section>
+
+          <details className="detail" open={showDetail} onToggle={(e) => setShowDetail(e.currentTarget.open)}>
+            <summary>技术细节</summary>
+            <div className="grid">
+              <Detail label="CDN 请求" value={n(today.cdn_requests)} />
+              <Detail label="CDN 下载" value={n(today.cdn_downloads)} />
+              <Detail label="CDN 流量" value={bytes(today.cdn_bytes)} />
+              <Detail label="CDN 400" value={n(today.cdn_400)} warn={today.cdn_400 > 0} />
+              <Detail label="CDN 403 / 429" value={`${today.cdn_403} / ${today.cdn_429}`} warn={today.cdn_403 + today.cdn_429 > 0} />
+              <Detail label="历史调用（今日）" value={n(today.history_calls)} />
+              <Detail label="get_image 拦截" value={n(today.get_image_blocked)} warn={today.get_image_blocked > 0} />
+              <Detail label="重复图片" value={n(today.duplicates)} />
+              <Detail label="失败 / 过期" value={`${n(today.failed)} / ${n(today.expired)}`} />
+              <Detail label="累计记录" value={n(stats.accepted_records)} />
+            </div>
+            <p className="note">
+              稳态下「历史调用」应保持在低位，「get_image 拦截」必须为 0。前者受每小时与每日预算限制，
+              触顶时补漏会自动挂起而不是继续请求。
+            </p>
+          </details>
+        </>
+      )}
+
+      {view === "groups" && (
+        <>
+          <section className="panel">
+            <div className="panel-head"><h2>正在监听（{dashboard.groups.length}）</h2></div>
+            <GroupTable
+              groups={sortedGroups}
+              onDisable={(id) => void run("已停止监听", () => api(`/api/v1/groups/${id}`, { method: "DELETE" }))}
+              onRecover={(id) =>
+                void run("已排入补漏", () =>
+                  api(`/api/v1/groups/${id}/recover-gap`, { method: "POST", body: "{}" }),
+                )
+              }
             />
-            <Metric label="拦截 get_image" value={today.get_image_blocked} note="必须始终为 0" />
-            <Metric label="下载器状态" value={String(downloader.status ?? "idle")} />
           </section>
-          <section className="section-heading"><div><p className="eyebrow">ARCHIVE</p><h2>四分类仓库</h2></div></section>
-          <section className="metric-grid">
-            <Metric label="去重有效图片" value={dashboard.statistics.unique_images} note={`${dashboard.statistics.accepted_records} 条消息记录`} />
-            <Metric label="NovelAI" value={dashboard.statistics.novelai} /><Metric label="ComfyUI" value={dashboard.statistics.comfyui} />
-            <Metric label="NAI含参但不可直接读取的" value={dashboard.statistics.novelai_unreadable} /><Metric label="其他模型生成" value={dashboard.statistics.other_models} />
-            <Metric label="图库占用" value={formatBytes(dashboard.statistics.disk_bytes)} />
+
+          <section className="panel">
+            <div className="panel-head">
+              <h2>添加群聊</h2>
+              <button
+                className="ghost"
+                onClick={() =>
+                  void run("已读取群列表", async () => setAvailable(await api<AvailableGroup[]>("/api/v1/groups/available")))
+                }
+              >
+                读取账号群列表
+              </button>
+            </div>
+            <div className="row">
+              <input placeholder="手动输入群号" value={manualGroup} onChange={(e) => setManualGroup(e.target.value)} />
+              <button
+                className="primary"
+                disabled={!manualGroup.trim()}
+                onClick={() =>
+                  void run("已加入监听", async () => {
+                    await api("/api/v1/groups", {
+                      method: "POST",
+                      body: JSON.stringify({ group_id: manualGroup.trim(), display_name: null }),
+                    });
+                    setManualGroup("");
+                  })
+                }
+              >
+                添加
+              </button>
+            </div>
+            {available.length > 0 && (
+              <>
+                <input
+                  className="search"
+                  placeholder="搜索群名或群号"
+                  value={search}
+                  onChange={(e) => setSearch(e.target.value)}
+                />
+                <div className="available">
+                  {available
+                    .filter((g) => !search || g.group_name.includes(search) || g.group_id.includes(search))
+                    .slice(0, 60)
+                    .map((g) => {
+                      const joined = dashboard.groups.some((row) => row.group_id === g.group_id);
+                      return (
+                        <div key={g.group_id} className="available-row">
+                          <span className="name">{g.group_name}</span>
+                          <span className="muted">{g.group_id} · {g.member_count} 人</span>
+                          <button
+                            className="ghost"
+                            disabled={joined}
+                            onClick={() =>
+                              void run("已加入监听", () =>
+                                api("/api/v1/groups", {
+                                  method: "POST",
+                                  body: JSON.stringify({ group_id: g.group_id, display_name: g.group_name }),
+                                }),
+                              )
+                            }
+                          >
+                            {joined ? "监听中" : "添加"}
+                          </button>
+                        </div>
+                      );
+                    })}
+                </div>
+              </>
+            )}
           </section>
-          <section className="compact-table">{dashboard.groups.filter((row) => row.enabled).map((group) => <div className="compact-row" key={group.group_id}><div><strong>{group.display_name || group.group_id}</strong><small>{group.group_id}</small></div><div><small>最后事件</small><strong>{formatTime(group.last_event_at)}</strong></div><div><small>最后图片</small><strong>{formatTime(group.last_image_at)}</strong></div><div><small>排队 / 有效</small><strong>{group.queued} / {group.accepted}</strong></div></div>)}</section>
-        </>}
+        </>
+      )}
 
-        {view === "groups" && <>
-          <section className="panel add-panel"><div><p className="eyebrow">MONITOR TARGETS</p><h2>监听对象</h2><p>新群首次从当前时刻开始，不自动追溯历史。</p></div><form onSubmit={(event) => { event.preventDefault(); void addGroup(manualGroup); }}><input value={manualGroup} onChange={(event) => setManualGroup(event.target.value.replace(/\D/g, ""))} placeholder="输入 QQ 群号" /><button className="primary" disabled={!manualGroup}>加入监听</button></form><button className="secondary" onClick={() => void loadAvailable()}>读取当前 QQ 群列表</button></section>
-          {available.length > 0 && <section className="panel available-panel"><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索群名或群号" /><div className="available-list">{filtered.slice(0, 100).map((row) => <div key={row.group_id}><div><strong>{row.group_name || "未命名群"}</strong><small>{row.group_id} · {row.member_count} 人</small></div><button className="secondary" onClick={() => void addGroup(row.group_id, row.group_name)}>监听</button></div>)}</div></section>}
-          <section className="group-list">{dashboard.groups.map((group) => <GroupCard key={group.group_id} group={group} onDisable={(id) => void disableGroup(id)} onEnable={(id, name) => void addGroup(id, name)} />)}</section>
-        </>}
+      {view === "settings" && settings && (
+        <section className="panel">
+          <div className="panel-head"><h2>采集设置</h2></div>
+          <label className="toggle">
+            <input
+              type="checkbox"
+              checked={paused}
+              onChange={(e) =>
+                void run(e.target.checked ? "已暂停采集" : "已恢复采集", async () =>
+                  setSettings(
+                    await api<Settings>("/api/v1/settings", {
+                      method: "PATCH",
+                      body: JSON.stringify({ collector_paused: e.target.checked }),
+                    }),
+                  ),
+                )
+              }
+            />
+            <span>
+              <strong>暂停采集</strong>
+              <small>Worker 保持运行，但不再下载新图片</small>
+            </span>
+          </label>
+          <div className="grid">
+            <Detail label="仓库位置" value={settings.storage_root ?? "—"} />
+            <Detail label="URL 来源" value={settings.url_preference === "data" ? "消息段 data.url" : "原始 originImageUrl"} />
+            <Detail label="下载间隔" value={`${settings.download_interval_seconds}s ± ${settings.download_jitter_seconds}s`} />
+          </div>
+          <div className="row">
+            <button className="ghost" onClick={() => void run("已请求启动", () => api("/api/v1/system/start", { method: "POST", body: "{}" }))}>启动</button>
+            <button className="ghost" onClick={() => void run("已请求停止", () => api("/api/v1/system/stop", { method: "POST", body: "{}" }))}>停止</button>
+            <button className="ghost" onClick={() => void run("已请求重启", () => api("/api/v1/system/restart", { method: "POST", body: "{}" }))}>重启</button>
+          </div>
+        </section>
+      )}
 
-        {view === "jobs" && <>
-          <section className="panel"><div className="section-heading"><div><p className="eyebrow">GAP RECOVERY</p><h2>按持久游标补断档</h2><p>断线和重启会自动补齐；这里可手动重跑当前游标之后的缺口，不会向更早历史倒扫。</p></div></div><div className="button-row compact">{dashboard.groups.filter((group) => group.enabled).map((group) => <button className="secondary" key={group.group_id} onClick={() => void recoverGap(group.group_id)}>恢复 {group.display_name || group.group_id}</button>)}</div></section>
-          <section className="panel"><div className="job-table"><div className="job-row header"><span>任务</span><span>群号</span><span>状态</span><span>页数</span><span>更新时间</span><span /></div>{dashboard.jobs.map((job) => <div className="job-row" key={job.id}><span>#{job.id} · 断档恢复</span><code>{job.group_id}</code><StatusPill value={job.status} /><span>{job.progress_pages}</span><span>{formatTime(job.updated_at)}</span><span>{["queued", "running"].includes(job.status) && <button className="danger-ghost" onClick={() => void cancelJob(job)}>安全取消</button>}</span>{job.error && <small className="job-error">{job.error}</small>}</div>)}{!dashboard.jobs.length && <div className="empty">当前没有断档任务</div>}</div></section>
-        </>}
+      {view === "logs" && (
+        <section className="panel">
+          <div className="panel-head"><h2>日志</h2></div>
+          {logs.map((file) => (
+            <div key={file.path} className="log">
+              <h3>{file.path}</h3>
+              <pre>{file.lines.join("\n")}</pre>
+            </div>
+          ))}
+          {logs.length === 0 && <p className="muted">暂无日志。</p>}
+        </section>
+      )}
 
-        {view === "settings" && settings && <>
-          <form className="panel settings-form" onSubmit={(event) => void saveSettings(event)}><div className="section-heading"><div><p className="eyebrow">COLLECTION</p><h2>下载节奏</h2></div><button className="primary" type="submit">保存设置</button></div><div className="form-grid">
-            <label><span>图片间隔（秒）</span><input type="number" min={0} max={3600} value={settings.download_interval_seconds} onChange={(event) => setSettings({ ...settings, download_interval_seconds: Number(event.target.value) })} /></label>
-            <label><span>随机抖动（秒）</span><input type="number" min={0} max={60} value={settings.download_jitter_seconds} onChange={(event) => setSettings({ ...settings, download_jitter_seconds: Number(event.target.value) })} /></label>
-            <label><span>CDN 首选通道</span><select value={settings.url_preference} onChange={(event) => setSettings({ ...settings, url_preference: event.target.value as "data" | "raw" })}><option value="data">标准 data.url</option><option value="raw">raw originImageUrl</option></select></label>
-          </div><div className="toggle-grid"><label><input type="checkbox" checked={settings.collector_paused} onChange={(event) => setSettings({ ...settings, collector_paused: event.target.checked })} /><span><strong>暂停下载</strong><small>事件仍持久化，队列保留</small></span></label></div></form>
-          <section className="panel storage-panel"><div><p className="eyebrow">UNLIMITED</p><h2>无限采集与自动恢复</h2><p>当前仓库：<code>{settings.storage_root}</code></p></div><small className="muted">没有每日数量、历史次数或 403/429 全局熔断。每个图片事件都会持久化并处理；网络失败持续延期重试，WS 断线后按群游标自动补齐。生产 Worker 仍不调用 get_image。</small></section>
-        </>}
-
-        {view === "logs" && <section className="panel logs-panel"><div className="section-heading"><div><p className="eyebrow">DIAGNOSTICS</p><h2>最近运行日志</h2></div><button className="secondary" onClick={() => void api<{ files: { path: string; lines: string[] }[] }>("/api/v1/logs?lines=250").then((value) => setLogs(value.files))}>刷新</button></div>{logs.map((file) => <div className="log-file" key={file.path}><strong>{file.path}</strong><pre>{file.lines.join("\n") || "（空）"}</pre></div>)}{!logs.length && <div className="empty">尚无日志</div>}</section>}
-      </main>
       {toast && <div className="toast">{toast}</div>}
-      <span hidden>{String(eventState.connected ?? false)}</span>
+    </div>
+  );
+}
+
+function StatusBar({
+  problems,
+  lastImageAt,
+  account,
+  queueDepth,
+}: {
+  problems: { key: string; detail: string }[];
+  lastImageAt: number;
+  account: { user_id: string; nickname: string } | null;
+  queueDepth: number;
+}) {
+  const healthy = problems.length === 0;
+  return (
+    <header className={healthy ? "status ok" : "status bad"}>
+      <span className="light" />
+      <div className="status-text">
+        {healthy ? (
+          <>
+            <strong>采集正常运行</strong>
+            <span className="muted">
+              最后收图 {ago(lastImageAt)}
+              {queueDepth > 0 ? ` · 队列 ${queueDepth}` : ""}
+            </span>
+          </>
+        ) : (
+          <>
+            <strong>{problems.length} 项异常需要处理</strong>
+            <span className="muted">{problems.map((p) => `${p.key}：${p.detail}`).join("；")}</span>
+          </>
+        )}
+      </div>
+      {account && <span className="account">{account.nickname} · {account.user_id}</span>}
+    </header>
+  );
+}
+
+function GroupTable({
+  groups,
+  onDisable,
+  onRecover,
+}: {
+  groups: GroupRuntime[];
+  onDisable?: (id: string) => void;
+  onRecover?: (id: string) => void;
+}) {
+  const now = Math.floor(Date.now() / 1000);
+  return (
+    <div className="table">
+      <div className="tr th">
+        <span>群聊</span>
+        <span className="num">已收藏</span>
+        <span className="num">淘汰</span>
+        <span className="num">队列</span>
+        <span>最后收图</span>
+        {(onDisable || onRecover) && <span />}
+      </div>
+      {groups.map((g) => {
+        const dormant = !g.last_image_at || now - g.last_image_at > DORMANT_AFTER_SECONDS;
+        return (
+          <div key={g.group_id} className={dormant ? "tr dormant" : "tr"}>
+            <span className="name">
+              <i className={dormant ? "dot idle" : "dot live"} />
+              {g.display_name || g.group_id}
+              <small className="muted">{g.group_id}</small>
+            </span>
+            <span className="num strong">{n(g.accepted)}</span>
+            <span className="num muted">{n(g.rejected)}</span>
+            <span className="num">{g.queued > 0 ? n(g.queued) : "—"}</span>
+            <span className={dormant ? "muted" : ""}>{ago(g.last_image_at)}</span>
+            {(onDisable || onRecover) && (
+              <span className="actions">
+                {onRecover && <button className="ghost sm" onClick={() => onRecover(g.group_id)}>补漏</button>}
+                {onDisable && <button className="ghost sm danger" onClick={() => onDisable(g.group_id)}>停止</button>}
+              </span>
+            )}
+          </div>
+        );
+      })}
+      {groups.length === 0 && <p className="muted pad">尚未监听任何群聊。</p>}
+    </div>
+  );
+}
+
+function Pulse({ label, value, warn, muted }: { label: string; value: string; warn?: boolean; muted?: boolean }) {
+  return (
+    <div className={`pulse-item${warn ? " warn" : ""}${muted ? " dim" : ""}`}>
+      <strong>{value}</strong>
+      <span>{label}</span>
+    </div>
+  );
+}
+
+function Detail({ label, value, warn }: { label: string; value: string; warn?: boolean }) {
+  return (
+    <div className={warn ? "detail-item warn" : "detail-item"}>
+      <span>{label}</span>
+      <strong>{value}</strong>
     </div>
   );
 }
