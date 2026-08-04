@@ -499,6 +499,20 @@ class CollectorWorker:
         failures = int(data.get("url_refresh_failures") or 0) + 1
         data["url_refresh_failures"] = failures
         now = int(time.time())
+        # Every refresh retry costs one get_group_msg_history call against the
+        # account session, and the backoff caps at one hour.  Without a ceiling
+        # a permanently unrecoverable image keeps issuing history calls forever,
+        # which is exactly the request pattern this pipeline exists to avoid.
+        max_failures = int(self.runtime("url_refresh_max_failures") or 0)
+        if max_failures > 0 and failures >= max_failures:
+            finish_image(
+                self.connection,
+                row,
+                status="failed_terminal",
+                error=f"{error}; gave up after {failures} URL refresh failures",
+            )
+            increment_counter(self.connection, "failed")
+            return
         retry_delay = max(
             max(1, int(delay_seconds)),
             min(3600, 60 * (2 ** min(6, max(0, failures - 1)))),

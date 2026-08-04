@@ -13,6 +13,7 @@ DEFAULT_RUNTIME: dict[str, Any] = {
     "max_download_bytes": 128 * 1024 * 1024,
     "url_preference": "data",
     "url_expiry_urgent_seconds": 3600,
+    "url_refresh_max_failures": 5,
     "ws_ping_interval_seconds": 30,
     "event_state_heartbeat_seconds": 10,
     "ws_disconnect_gap_seconds": 3,
