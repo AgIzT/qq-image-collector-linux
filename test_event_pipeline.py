@@ -592,6 +592,58 @@ class EventPipelineTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_known_qq_parcel_expression_never_requests_dead_redirect(self) -> None:
+        async def scenario() -> None:
+            event = image_event(
+                url=(
+                    "https://gxh.vip.qq.com/club/item/parcel/item/00/"
+                    "synthetic/raw300.gif"
+                )
+            )
+            event["message"][0]["data"].update(
+                {"file": "raw300.gif", "summary": "[synthetic expression]"}
+            )
+            event["raw"]["elements"][0]["picElement"]["fileName"] = "raw300.gif"
+            _cursor, items = parse_group_event(event)
+            self.assertTrue(items[0]["resolver_data"]["emoji_signal"])
+            enqueue_image(self.connection, items[0])
+
+            requests = 0
+
+            async def must_not_request(_request: httpx.Request) -> httpx.Response:
+                nonlocal requests
+                requests += 1
+                return httpx.Response(302, headers={"location": "https://p.qpic.cn/dead"})
+
+            downloader = CdnDownloader(
+                self.connection,
+                self.root,
+                max_bytes=1024 * 1024,
+                daily_limit=10,
+            )
+            await downloader.client.aclose()
+            downloader.client = httpx.AsyncClient(
+                transport=httpx.MockTransport(must_not_request)
+            )
+
+            self.assertEqual(
+                await downloader.process(claim_next_image(self.connection)),
+                "filtered_gif",
+            )
+            await downloader.close()
+            self.assertEqual(requests, 0)
+            status, error = self.connection.execute(
+                "SELECT status, error FROM images"
+            ).fetchone()
+            self.assertEqual(status, "filtered_gif")
+            self.assertEqual(error, "excluded QQ parcel GIF expression")
+            counters = self.connection.execute(
+                "SELECT sum(cdn_requests), sum(filtered_gif) FROM hourly_counters"
+            ).fetchone()
+            self.assertEqual(tuple(counters), (0, 1))
+
+        asyncio.run(scenario())
+
     def test_metadata_decode_error_rejects_only_the_bad_image(self) -> None:
         async def scenario() -> None:
             payload = a1111_png()

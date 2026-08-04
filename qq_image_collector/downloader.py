@@ -28,6 +28,7 @@ ALLOWED_CDN_HOSTS = frozenset(
     {"gchat.qpic.cn", "multimedia.nt.qq.com.cn", "gxh.vip.qq.com"}
 )
 GIF_SIGNATURES = (b"GIF87a", b"GIF89a")
+QQ_PARCEL_EXPRESSION_HOSTS = frozenset({"gxh.vip.qq.com", "p.qpic.cn"})
 METADATA_DECODE_ERRORS = (
     UnidentifiedImageError,
     Image.DecompressionBombError,
@@ -127,6 +128,29 @@ def candidate_urls(
 def selected_url(row: sqlite3.Row, preference: str = "data") -> str:
     candidates = candidate_urls(row, preference)
     return candidates[0] if candidates else ""
+
+
+def is_known_qq_parcel_expression(row: sqlite3.Row) -> bool:
+    data = resolver_data(row)
+    if not bool(data.get("emoji_signal")):
+        return False
+    for key in ("url", "origin_url"):
+        url = str(data.get(key) or "").strip()
+        if not url:
+            continue
+        try:
+            parsed = urlsplit(url)
+        except ValueError:
+            continue
+        path = parsed.path.casefold()
+        if (
+            parsed.scheme == "https"
+            and (parsed.hostname or "").lower() in QQ_PARCEL_EXPRESSION_HOSTS
+            and path.startswith("/club/item/parcel/item/")
+            and path.endswith("/raw300.gif")
+        ):
+            return True
+    return False
 
 
 def validate_cdn_url(url: str) -> str:
@@ -231,6 +255,18 @@ class CdnDownloader:
 
     async def process(self, row: sqlite3.Row) -> str:
         self.last_attempted_statuses = ()
+        if is_known_qq_parcel_expression(row):
+            # Some deleted parcel expressions redirect to a dead asset, so
+            # byte-level GIF confirmation is no longer possible. Require the
+            # event signal, fixed Tencent host and fixed path together.
+            finish_image(
+                self.connection,
+                row,
+                status="filtered_gif",
+                error="excluded QQ parcel GIF expression",
+            )
+            increment_counter(self.connection, "filtered_gif")
+            return "filtered_gif"
         urls = candidate_urls(row, self.url_preference)
         if not urls:
             finish_image(
