@@ -18,11 +18,13 @@ from .config import load_settings
 from .database import (
     claim_next_image,
     connect_database,
+    counter_sum,
     defer_image,
     ensure_final_directories,
     finish_image,
     get_runtime_state,
     increment_counter,
+    local_day_start,
     recover_inflight,
     set_runtime_state,
 )
@@ -46,6 +48,16 @@ from .onebot import OneBotClient, OneBotError, websocket_settings
 
 class JobCancelled(RuntimeError):
     pass
+
+
+class HistoryBudgetExceeded(RuntimeError):
+    """The account-session history budget for this window is spent.
+
+    get_group_msg_history is the only Tencent interface this pipeline still
+    touches per image, so it is the one that has to stay bounded.  Without a
+    ceiling a single misbehaving code path can sustain thousands of calls a
+    day, which is the request pattern that got earlier accounts banned.
+    """
 
 
 def _setting(connection: sqlite3.Connection, key: str, default: Any) -> Any:
@@ -160,8 +172,26 @@ class CollectorWorker:
                     raise
                 await asyncio.sleep(min(2.0, 0.1 * (2**attempt)))
 
+    def _check_history_budget(self) -> None:
+        hourly = int(self.runtime("history_hourly_limit") or 0)
+        daily = int(self.runtime("history_daily_limit") or 0)
+        if hourly > 0:
+            now = int(time.time())
+            used = counter_sum(self.connection, "history_calls", now - now % 3600)
+            if used >= hourly:
+                raise HistoryBudgetExceeded(
+                    f"hourly history budget spent: {used}/{hourly}"
+                )
+        if daily > 0:
+            used = counter_sum(self.connection, "history_calls", local_day_start())
+            if used >= daily:
+                raise HistoryBudgetExceeded(
+                    f"daily history budget spent: {used}/{daily}"
+                )
+
     async def _history_call(self, params: dict[str, Any]) -> Any:
         async with self._history_lock:
+            self._check_history_budget()
             increment_counter(self.connection, "history_calls")
             return await self.onebot.call_async("get_group_msg_history", params)
 
@@ -172,6 +202,10 @@ class CollectorWorker:
             for group_id in sorted(enabled_group_ids(self.connection)):
                 try:
                     await self.recover_gap(group_id, automatic=True)
+                except HistoryBudgetExceeded as exc:
+                    # Not an error: the ceiling did its job.  Remaining groups
+                    # are skipped this round and picked up after it refills.
+                    self._set_gap(group_id, "deferred", str(exc), finished=True)
                 except Exception as exc:
                     self._set_gap(group_id, "error", f"{type(exc).__name__}: {exc}", finished=True)
 
@@ -328,6 +362,9 @@ class CollectorWorker:
         if not raw_anchor:
             return "unavailable"
         async with self._history_lock:
+            # A per-image URL refresh spends the same account-session budget as
+            # gap recovery, so it has to answer to the same ceiling.
+            self._check_history_budget()
             data["url_refresh_attempted"] = True
             self.connection.execute(
                 """
@@ -535,6 +572,15 @@ class CollectorWorker:
         )
         self.connection.commit()
 
+    def _defer_budget_wait(self, row: sqlite3.Row, *, error: str) -> None:
+        """Park an image until the history budget refills.
+
+        Budget exhaustion is a temporary condition, so it must not advance
+        url_refresh_failures — otherwise a quiet hour would terminate images
+        that are still perfectly recoverable.
+        """
+        defer_image(self.connection, row, delay_seconds=3600, error=error[:2048])
+
     def _requires_bounded_page_replay(
         self,
         row: sqlite3.Row,
@@ -587,6 +633,9 @@ class CollectorWorker:
                     return
                 try:
                     outcome = await self.refresh_url(row)
+                except HistoryBudgetExceeded as exc:
+                    self._defer_budget_wait(row, error=f"missing URL: {exc}")
+                    return
                 except Exception as refresh_error:
                     self._defer_refresh_retry(
                         row,
@@ -621,6 +670,12 @@ class CollectorWorker:
                     return
                 try:
                     outcome = await self.refresh_url(row)
+                except HistoryBudgetExceeded as budget_error:
+                    self._defer_budget_wait(
+                        row,
+                        error=f"CDN {exc.status_code}: {budget_error}",
+                    )
+                    return
                 except Exception as refresh_error:
                     self._defer_refresh_retry(
                         row,

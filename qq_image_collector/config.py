@@ -14,6 +14,12 @@ DEFAULT_RUNTIME: dict[str, Any] = {
     "url_preference": "data",
     "url_expiry_urgent_seconds": 3600,
     "url_refresh_max_failures": 5,
+    # get_group_msg_history is the only per-image Tencent interface left, so it
+    # carries a hard ceiling.  Steady-state live collection needs zero calls;
+    # these budgets exist to cover reconnect gap recovery and to stop any single
+    # code path from sustaining thousands of calls a day unnoticed.
+    "history_hourly_limit": 60,
+    "history_daily_limit": 300,
     "ws_ping_interval_seconds": 30,
     "event_state_heartbeat_seconds": 10,
     "ws_disconnect_gap_seconds": 3,
