@@ -24,7 +24,9 @@ from .database import (
 )
 
 
-ALLOWED_CDN_HOSTS = frozenset({"gchat.qpic.cn", "multimedia.nt.qq.com.cn"})
+ALLOWED_CDN_HOSTS = frozenset(
+    {"gchat.qpic.cn", "multimedia.nt.qq.com.cn", "gxh.vip.qq.com"}
+)
 GIF_SIGNATURES = (b"GIF87a", b"GIF89a")
 METADATA_DECODE_ERRORS = (
     UnidentifiedImageError,

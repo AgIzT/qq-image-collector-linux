@@ -22,7 +22,8 @@ NapCat OneBot WS（debug raw）
   `original` 缺失，尺寸、扩展名与表情信号共同决定优先级。
 - 下载并发恒为 1，默认间隔 15 秒；队列最老任务超过 30 分钟时降到 5 秒。
   没有每日数量、小时次数或队列总量上限；请求尝试与完整下载分别统计。
-- 只允许 `gchat.qpic.cn` 与 `multimedia.nt.qq.com.cn` HTTPS 地址，单文件最大
+- 只允许 `gchat.qpic.cn`、`multimedia.nt.qq.com.cn` 与 QQ 表情资源主机
+  `gxh.vip.qq.com` 的 HTTPS 地址，单文件最大
   128 MiB。首选 URL 无效时先尝试事件自带的第二条合法 CDN URL；400/403/404/410
   会用对应消息游标刷新 URL，429 只延后当前图片，网络错误和 5xx 持续退避重试，
   不会因为次数达到阈值而永久放弃。

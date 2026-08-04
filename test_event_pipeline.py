@@ -428,6 +428,12 @@ class EventPipelineTests(unittest.TestCase):
             validate_cdn_url("https://multimedia.nt.qq.com.cn/path?rkey=x"),
             "https://multimedia.nt.qq.com.cn/path?rkey=x",
         )
+        self.assertEqual(
+            validate_cdn_url(
+                "https://gxh.vip.qq.com/club/item/parcel/item/00/hash/raw300.gif"
+            ),
+            "https://gxh.vip.qq.com/club/item/parcel/item/00/hash/raw300.gif",
+        )
         for value in (
             "http://gchat.qpic.cn/path",
             "https://example.invalid/path",
