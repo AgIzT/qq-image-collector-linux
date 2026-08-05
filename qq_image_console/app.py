@@ -39,6 +39,8 @@ SESSION_COOKIE = "qqic_session"
 REMOTE_PERMISSIONS = ["status", "system", "groups", "gap_recovery", "safe_settings", "audit"]
 STATE_CHANGING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 STATUS_SNAPSHOT_SECONDS = 15.0
+# A refresh that has not finished by now is treated as wedged, not as slow.
+STATUS_REFRESH_TIMEOUT_SECONDS = 120.0
 LOGGER = logging.getLogger(__name__)
 
 
@@ -81,6 +83,7 @@ class AppContext:
     _status_cache_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
     _status_cache: tuple[float, dict[str, Any]] | None = field(default=None, init=False, repr=False)
     _status_refreshing: bool = field(default=False, init=False, repr=False)
+    _status_refresh_started_at: float = field(default=0.0, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.status_cache_enabled:
@@ -176,8 +179,19 @@ class AppContext:
             return
         with self._status_cache_lock:
             if self._status_refreshing:
-                return
+                # A refresh thread that blocks forever (a slow scan or a lock
+                # held by the worker) would otherwise pin this flag and freeze
+                # the console on one snapshot indefinitely.  After the deadline
+                # we abandon the stuck thread and let a new one try.
+                started = self._status_refresh_started_at
+                if time.monotonic() - started < STATUS_REFRESH_TIMEOUT_SECONDS:
+                    return
+                LOGGER.warning(
+                    "status refresh stuck for %.0fs; starting a replacement",
+                    time.monotonic() - started,
+                )
             self._status_refreshing = True
+            self._status_refresh_started_at = time.monotonic()
         threading.Thread(
             target=self._refresh_status,
             name="console-status-refresh",
@@ -208,8 +222,12 @@ class AppContext:
         with self._status_cache_lock:
             assert self._status_cache is not None
             cached_at, cached = self._status_cache
-            should_refresh = time.monotonic() - cached_at >= STATUS_SNAPSHOT_SECONDS
+            age = time.monotonic() - cached_at
+            should_refresh = age >= STATUS_SNAPSHOT_SECONDS
             payload = copy.deepcopy(cached)
+        # The console cannot tell a quiet pipeline from a frozen snapshot
+        # unless the payload says how old it is.
+        payload["snapshot_age_seconds"] = int(age)
         if should_refresh:
             self.start_status_refresh()
         return payload

@@ -69,6 +69,8 @@ export type Job = {
 
 export type DashboardStatus = {
   timestamp: number;
+  /** Age of the served snapshot. Large values mean the console is frozen. */
+  snapshot_age_seconds?: number;
   services: Record<string, ServiceState>;
   account: { user_id: string; nickname: string } | null;
   action: {
