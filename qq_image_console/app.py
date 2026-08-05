@@ -38,9 +38,15 @@ from .storage import StorageMigrationManager
 SESSION_COOKIE = "qqic_session"
 REMOTE_PERMISSIONS = ["status", "system", "groups", "gap_recovery", "safe_settings", "audit"]
 STATE_CHANGING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
-STATUS_SNAPSHOT_SECONDS = 15.0
+# Computing a full status costs seconds of cold reads against a database far
+# larger than the page cache this container gets.  A refresh interval shorter
+# than that cost makes refreshes near-continuous, and their own I/O evicts the
+# cache that would have made them fast - the snapshot then falls further behind
+# until it stops updating at all.  The interval must stay well above the
+# measured compute time.
+STATUS_SNAPSHOT_SECONDS = 90.0
 # A refresh that has not finished by now is treated as wedged, not as slow.
-STATUS_REFRESH_TIMEOUT_SECONDS = 120.0
+STATUS_REFRESH_TIMEOUT_SECONDS = 300.0
 LOGGER = logging.getLogger(__name__)
 
 
