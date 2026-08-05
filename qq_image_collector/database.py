@@ -81,6 +81,9 @@ def _ensure_columns(
     return added
 
 
+BUSY_TIMEOUT_SECONDS = 60
+
+
 def connect_database(
     path: str | Path,
     *,
@@ -88,8 +91,13 @@ def connect_database(
 ) -> sqlite3.Connection:
     database = Path(path)
     database.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(database, timeout=5)
-    connection.execute("PRAGMA busy_timeout=5000")
+    # Cold reads of this database take seconds once it outgrows the container's
+    # page cache, and a full console status compute takes tens of seconds.  A
+    # five second lock wait meant any write that overlapped a status refresh
+    # failed outright, which killed the worker.  Wait longer than the slowest
+    # reader instead.
+    connection = sqlite3.connect(database, timeout=BUSY_TIMEOUT_SECONDS)
+    connection.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_SECONDS * 1000}")
     connection.execute("PRAGMA foreign_keys=ON")
     connection.execute("PRAGMA temp_store=MEMORY")
     if not initialize:
@@ -811,7 +819,18 @@ def claim_next_image(
     del expiry_urgent_seconds
     connection.row_factory = sqlite3.Row
     now = int(time.time())
-    connection.execute("BEGIN IMMEDIATE")
+    # Losing a race for the write lock is a normal, transient condition; it must
+    # not propagate out and take the download loop down with it.
+    for attempt in range(5):
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            break
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).casefold() and "busy" not in str(exc).casefold():
+                raise
+            if attempt == 4:
+                return None
+            time.sleep(min(4.0, 0.25 * (2**attempt)))
     try:
         row = connection.execute(
             """
