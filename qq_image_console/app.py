@@ -44,9 +44,7 @@ STATE_CHANGING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 # cache that would have made them fast - the snapshot then falls further behind
 # until it stops updating at all.  The interval must stay well above the
 # measured compute time.
-STATUS_SNAPSHOT_SECONDS = 90.0
-# A refresh that has not finished by now is treated as wedged, not as slow.
-STATUS_REFRESH_TIMEOUT_SECONDS = 300.0
+STATUS_SNAPSHOT_SECONDS = 30.0
 LOGGER = logging.getLogger(__name__)
 
 
@@ -88,8 +86,7 @@ class AppContext:
     status_cache_enabled: bool = True
     _status_cache_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
     _status_cache: tuple[float, dict[str, Any]] | None = field(default=None, init=False, repr=False)
-    _status_refreshing: bool = field(default=False, init=False, repr=False)
-    _status_refresh_started_at: float = field(default=0.0, init=False, repr=False)
+    _status_refresher: threading.Thread | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.status_cache_enabled:
@@ -181,28 +178,33 @@ class AppContext:
         }
 
     def start_status_refresh(self) -> None:
+        """Start the single refresher. Safe to call repeatedly; only one runs.
+
+        Refreshing used to be triggered per request, guarded by a flag.  Any
+        compute that blocked forever - most easily by holding the repository's
+        stats lock - pinned that flag, and every later attempt piled up behind
+        the same lock, so the console froze on one snapshot permanently.  One
+        long-lived loop cannot wedge that way: a slow pass is merely slow, and
+        the next pass always follows it.
+        """
+
         if not self.status_cache_enabled:
             return
         with self._status_cache_lock:
-            if self._status_refreshing:
-                # A refresh thread that blocks forever (a slow scan or a lock
-                # held by the worker) would otherwise pin this flag and freeze
-                # the console on one snapshot indefinitely.  After the deadline
-                # we abandon the stuck thread and let a new one try.
-                started = self._status_refresh_started_at
-                if time.monotonic() - started < STATUS_REFRESH_TIMEOUT_SECONDS:
-                    return
-                LOGGER.warning(
-                    "status refresh stuck for %.0fs; starting a replacement",
-                    time.monotonic() - started,
-                )
-            self._status_refreshing = True
-            self._status_refresh_started_at = time.monotonic()
-        threading.Thread(
-            target=self._refresh_status,
-            name="console-status-refresh",
-            daemon=True,
-        ).start()
+            if self._status_refresher is not None and self._status_refresher.is_alive():
+                return
+            thread = threading.Thread(
+                target=self._status_refresh_loop,
+                name="console-status-refresh",
+                daemon=True,
+            )
+            self._status_refresher = thread
+        thread.start()
+
+    def _status_refresh_loop(self) -> None:
+        while True:
+            self._refresh_status()
+            time.sleep(STATUS_SNAPSHOT_SECONDS)
 
     def _refresh_status(self) -> None:
         try:
@@ -212,9 +214,6 @@ class AppContext:
         else:
             with self._status_cache_lock:
                 self._status_cache = (time.monotonic(), payload)
-        finally:
-            with self._status_cache_lock:
-                self._status_refreshing = False
 
     def status(self, *, force: bool = False) -> dict[str, Any]:
         if not self.status_cache_enabled:
@@ -229,13 +228,12 @@ class AppContext:
             assert self._status_cache is not None
             cached_at, cached = self._status_cache
             age = time.monotonic() - cached_at
-            should_refresh = age >= STATUS_SNAPSHOT_SECONDS
             payload = copy.deepcopy(cached)
         # The console cannot tell a quiet pipeline from a frozen snapshot
         # unless the payload says how old it is.
         payload["snapshot_age_seconds"] = int(age)
-        if should_refresh:
-            self.start_status_refresh()
+        # Serving a request never computes; it only makes sure the loop is up.
+        self.start_status_refresh()
         return payload
 
     def _compute_status(self) -> dict[str, Any]:
