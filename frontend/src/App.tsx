@@ -143,6 +143,9 @@ export default function App() {
     // A frozen snapshot looks exactly like a healthy but quiet pipeline, so it
     // has to be called out explicitly rather than inferred from the numbers.
     const age = dashboard.snapshot_age_seconds ?? 0;
+    if (dashboard.snapshot_starting) {
+      return [{ key: "正在启动", detail: "控制台正在读取首次状态，稍候自动刷新" }];
+    }
     if (age > 120) {
       found.unshift({
         key: "数据陈旧",

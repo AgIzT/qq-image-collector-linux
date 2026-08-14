@@ -227,11 +227,13 @@ class AppContext:
         with self._status_cache_lock:
             assert self._status_cache is not None
             cached_at, cached = self._status_cache
-            age = time.monotonic() - cached_at
             payload = copy.deepcopy(cached)
-        # The console cannot tell a quiet pipeline from a frozen snapshot
-        # unless the payload says how old it is.
-        payload["snapshot_age_seconds"] = int(age)
+        # The placeholder is seeded with cached_at=0, so measuring against it
+        # would report the machine's uptime as the snapshot age and paint the
+        # whole console as stale and unhealthy for the first pass after a
+        # restart.  Until a real compute lands, the view is starting, not stale.
+        payload["snapshot_starting"] = cached_at <= 0.0
+        payload["snapshot_age_seconds"] = 0 if cached_at <= 0.0 else int(time.monotonic() - cached_at)
         # Serving a request never computes; it only makes sure the loop is up.
         self.start_status_refresh()
         return payload
