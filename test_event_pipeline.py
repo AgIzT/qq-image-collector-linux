@@ -561,7 +561,10 @@ class EventPipelineTests(unittest.TestCase):
             stored = self.connection.execute("SELECT status, metadata_source, resolver_json FROM images").fetchone()
             self.assertEqual(stored[0:2], ("accepted", "a1111-compatible"))
             self.assertNotIn("secret", stored[2])
-            self.assertEqual(len(list((self.root / "final" / "其他模型生成").glob("*.png"))), 1)
+            stored_files = list((self.root / "final" / "其他模型生成").glob("*/*.png"))
+            self.assertEqual(len(stored_files), 1)
+            # 目录名必须与文件名的日期前缀一致
+            self.assertEqual(stored_files[0].parent.name, stored_files[0].name[:10])
             counters = self.connection.execute(
                 "SELECT sum(cdn_requests), sum(cdn_downloads) FROM hourly_counters"
             ).fetchone()

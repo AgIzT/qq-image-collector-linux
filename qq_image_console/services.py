@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import socket
 import subprocess
 import sys
@@ -15,8 +16,15 @@ from collector import OneBotClient, OneBotError
 
 from .config import ConsoleConfig
 
+LOGGER = logging.getLogger(__name__)
 
-WORKER_START_TIMEOUT_SECONDS = 30
+
+# The worker opens a multi-hundred-megabyte database and scans the existing
+# repository before it claims its PID file.  On a slow disk that regularly
+# takes minutes; a short deadline kills a worker that is starting normally.
+WORKER_START_TIMEOUT_SECONDS = 600
+# A failed autostart used to leave collection down until someone noticed.
+START_RETRY_DELAYS_SECONDS = (30, 60, 120, 300)
 HEALTH_CACHE_SECONDS = 5.0
 
 
@@ -205,7 +213,9 @@ class ProcessSupervisor:
                     raise RuntimeError(f"采集 Worker 启动失败，退出码 {process.returncode}")
                 time.sleep(0.2)
             process.terminate()
-            raise RuntimeError("采集 Worker 未在 30 秒内建立单实例 PID")
+            raise RuntimeError(
+                f"采集 Worker 未在 {WORKER_START_TIMEOUT_SECONDS} 秒内建立单实例 PID"
+            )
 
     def stop_worker(self, timeout: float = 15) -> dict[str, Any]:
         with self._worker_lock:
@@ -242,30 +252,47 @@ class ProcessSupervisor:
         return {"confirmation_required": False, "action": self.action()}
 
     def _start_sequence(self) -> None:
-        try:
-            deadline = time.time() + 180
-            while time.time() < deadline:
-                if self.health.ready_for_collection(self.health.snapshot(force=True)):
-                    break
-                time.sleep(2)
-            else:
-                raise TimeoutError("180 秒内未等到 NapCat 登录和 OneBot 事件接口")
-            self._set_action(stage="start_worker", message="接口已就绪，正在启动事件 Worker")
-            self.start_worker()
-            self._set_action(
-                status="completed",
-                stage="done",
-                message="事件驱动采集已启动",
-                error=None,
-                finished_at=int(time.time()),
-            )
-        except Exception as exc:
-            self._set_action(
-                status="failed",
-                message="启动失败",
-                error=_error_text(exc),
-                finished_at=int(time.time()),
-            )
+        # Retry rather than give up: a start that fails because NapCat is still
+        # coming up, or because the repository scan ran long, otherwise leaves
+        # collection stopped indefinitely with nothing watching.
+        attempts = len(START_RETRY_DELAYS_SECONDS) + 1
+        for attempt in range(1, attempts + 1):
+            try:
+                deadline = time.time() + 180
+                while time.time() < deadline:
+                    if self.health.ready_for_collection(self.health.snapshot(force=True)):
+                        break
+                    time.sleep(2)
+                else:
+                    raise TimeoutError("180 秒内未等到 NapCat 登录和 OneBot 事件接口")
+                self._set_action(stage="start_worker", message="接口已就绪，正在启动事件 Worker")
+                self.start_worker()
+                self._set_action(
+                    status="completed",
+                    stage="done",
+                    message="事件驱动采集已启动",
+                    error=None,
+                    finished_at=int(time.time()),
+                )
+                return
+            except Exception as exc:
+                if attempt > len(START_RETRY_DELAYS_SECONDS):
+                    self._set_action(
+                        status="failed",
+                        message=f"启动失败，已重试 {attempt - 1} 次",
+                        error=_error_text(exc),
+                        finished_at=int(time.time()),
+                    )
+                    return
+                delay = START_RETRY_DELAYS_SECONDS[attempt - 1]
+                LOGGER.warning("worker start attempt %d failed: %s", attempt, exc)
+                self._set_action(
+                    status="running",
+                    stage="retry_wait",
+                    message=f"第 {attempt} 次启动失败，{delay} 秒后重试",
+                    error=_error_text(exc),
+                )
+                time.sleep(delay)
 
     def request_stop(self) -> dict[str, Any]:
         with self._lock:

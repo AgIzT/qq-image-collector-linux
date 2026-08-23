@@ -32,6 +32,15 @@ export type DailyCounters = {
   filtered_gif: number;
 };
 
+export type ModelFamilyCount = { family: string; count: number };
+
+export type ModelStats = {
+  available: boolean;
+  indexed?: number;
+  total: ModelFamilyCount[];
+  days: { today: ModelFamilyCount[]; yesterday: ModelFamilyCount[] };
+};
+
 export type GroupRuntime = {
   group_id: string;
   display_name: string | null;
@@ -46,6 +55,7 @@ export type GroupRuntime = {
   gap_finished_at: number | null;
   gap_error: string | null;
   accepted: number;
+  accepted_today: number;
   duplicates: number;
   rejected: number;
   failed: number;
@@ -97,6 +107,7 @@ export type DashboardStatus = {
     novelai_unreadable: number;
     other_models: number;
     disk_bytes: number;
+    models: ModelStats;
     queue: QueueState;
     today: DailyCounters;
     events: Record<string, unknown>;

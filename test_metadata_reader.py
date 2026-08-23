@@ -506,7 +506,7 @@ class MetadataReaderTests(unittest.TestCase):
             "10000001",
             "123456789",
         )
-        self.assertEqual(path.parent, self.root / "final" / "ComfyUI")
+        self.assertEqual(path.parent, self.root / "final" / "ComfyUI" / "2024-01-01")
         self.assertEqual(
             path.name,
             "2024-01-01_08-00-00_g10000001_u123456789_ababababab.png",

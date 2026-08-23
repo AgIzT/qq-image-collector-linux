@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import type { AvailableGroup, DashboardStatus, GroupRuntime, Settings } from "./types";
+import type { AvailableGroup, DashboardStatus, GroupRuntime, ModelStats, Settings } from "./types";
 
 type View = "overview" | "groups" | "settings" | "logs";
 type SessionInfo = { mode: "local" | "remote" | "direct"; identity: { email: string } | null };
@@ -251,6 +251,8 @@ export default function App() {
             </div>
           </section>
 
+          <ModelPanel models={stats.models} />
+
           <section className="pulse">
             <Pulse label="队列待下载" value={n(stats.queue.depth)} warn={stats.queue.depth > 500} />
             <Pulse label="今日收到消息" value={n(today.events)} />
@@ -479,8 +481,8 @@ function GroupTable({
     <div className="table">
       <div className="tr th">
         <span>群聊</span>
-        <span className="num">已收藏</span>
-        <span className="num">淘汰</span>
+        <span className="num">今日</span>
+        <span className="num">累计收藏</span>
         <span className="num">队列</span>
         <span>最后收图</span>
         {(onDisable || onRecover) && <span />}
@@ -494,8 +496,8 @@ function GroupTable({
               {g.display_name || g.group_id}
               <small className="muted">{g.group_id}</small>
             </span>
+            <span className="num today">{g.accepted_today > 0 ? `+${n(g.accepted_today)}` : "—"}</span>
             <span className="num strong">{n(g.accepted)}</span>
-            <span className="num muted">{n(g.rejected)}</span>
             <span className="num">{g.queued > 0 ? n(g.queued) : "—"}</span>
             <span className={dormant ? "muted" : ""}>{ago(g.last_image_at)}</span>
             {(onDisable || onRecover) && (
@@ -509,6 +511,61 @@ function GroupTable({
       })}
       {groups.length === 0 && <p className="muted pad">尚未监听任何群聊。</p>}
     </div>
+  );
+}
+
+const FAMILY_TONE: Record<string, string> = {
+  "NAI-V5": "nai5", "NAI-V4": "nai", ComfyUI: "comfy",
+  其他模型生成: "other", NovelAI: "unreadable",
+};
+
+function ModelPanel({ models }: { models: ModelStats }) {
+  if (!models?.available) {
+    return (
+      <section className="panel">
+        <div className="panel-head"><h2>模型分布</h2></div>
+        <p className="muted">模型索引尚未建立。</p>
+      </section>
+    );
+  }
+  const total = models.total.reduce((sum, r) => sum + r.count, 0) || 1;
+  const dayMap = (rows: { family: string; count: number }[]) =>
+    Object.fromEntries(rows.map((r) => [r.family, r.count]));
+  const today = dayMap(models.days.today);
+  const yest = dayMap(models.days.yesterday);
+  return (
+    <section className="panel">
+      <div className="panel-head">
+        <h2>模型分布</h2>
+        <span className="muted">已索引 {n(models.indexed ?? total)} 张 · 每日 04:20 增量更新</span>
+      </div>
+      <div className="bar">
+        {models.total.map((r) => (
+          <span key={r.family} className={`seg ${FAMILY_TONE[r.family] ?? "unreadable"}`}
+                style={{ width: `${(r.count / total) * 100}%` }} title={`${r.family} ${n(r.count)}`} />
+        ))}
+      </div>
+      <div className="table model-table">
+        <div className="tr th">
+          <span>模型</span>
+          <span className="num">累计</span>
+          <span className="num">占比</span>
+          <span className="num">昨日</span>
+          <span className="num">今日</span>
+        </div>
+        {models.total.map((r) => (
+          <div key={r.family} className="tr">
+            <span className="name">
+              <i className={`dot ${FAMILY_TONE[r.family] ?? "unreadable"}`} />{r.family}
+            </span>
+            <span className="num strong">{n(r.count)}</span>
+            <span className="num muted">{((r.count / total) * 100).toFixed(1)}%</span>
+            <span className="num muted">{yest[r.family] ? n(yest[r.family]) : "—"}</span>
+            <span className="num today">{today[r.family] ? `+${n(today[r.family])}` : "—"}</span>
+          </div>
+        ))}
+      </div>
+    </section>
   );
 }
 

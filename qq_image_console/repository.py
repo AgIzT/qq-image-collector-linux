@@ -118,6 +118,7 @@ class Repository:
                        r.last_event_at, r.last_image_at, r.gap_status,
                        r.gap_started_at, r.gap_finished_at, r.gap_error,
                        coalesce(s.accepted, 0) AS accepted,
+                       coalesce(s.accepted_today, 0) AS accepted_today,
                        coalesce(s.rejected, 0) AS rejected,
                        coalesce(s.failed, 0) AS failed,
                        coalesce(s.expired, 0) AS expired,
@@ -128,6 +129,8 @@ class Repository:
                 LEFT JOIN (
                     SELECT group_id,
                            sum(CASE WHEN status='accepted' THEN 1 ELSE 0 END) AS accepted,
+                           -- 同一次扫描里多带一个累加器，不增加任何成本
+                           sum(CASE WHEN status='accepted' AND sent_at>=:today THEN 1 ELSE 0 END) AS accepted_today,
                            count(DISTINCT CASE WHEN status='accepted' THEN sha256 END) AS unique_accepted,
                            sum(CASE WHEN status IN ('rejected_no_metadata','filtered_gif') THEN 1 ELSE 0 END) AS rejected,
                            sum(CASE WHEN status IN ('failed_terminal','legacy_failed') THEN 1 ELSE 0 END) AS failed,
@@ -136,7 +139,8 @@ class Repository:
                     FROM images GROUP BY group_id
                 ) s ON s.group_id=g.group_id
                 ORDER BY g.enabled DESC, g.created_at, g.group_id
-                """
+                """,
+                {"today": local_day_start()},
             ).fetchall()
             result = [dict(row) for row in rows]
         with self._cache_lock:
@@ -259,6 +263,41 @@ class Repository:
                 set_setting(connection, key, value)
         return self.get_app_settings()
 
+    def _model_stats(self, connection: sqlite3.Connection) -> dict[str, Any]:
+        """Model-family breakdown from the side index.
+
+        asset_model is small and indexed on sent_at, unlike images, so this
+        stays in the millisecond range and is safe on the status path.  The
+        index is rebuilt incrementally by a daily cron, so "today" here trails
+        until that run.
+        """
+
+        exists = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='asset_model'"
+        ).fetchone()
+        if not exists:
+            return {"available": False, "total": [], "days": {}}
+        today = local_day_start()
+        yesterday = today - 86400
+        total = [
+            {"family": str(row[0] or "unknown"), "count": int(row[1])}
+            for row in connection.execute(
+                "SELECT model_family, count(*) FROM asset_model GROUP BY 1 ORDER BY 2 DESC"
+            )
+        ]
+        days: dict[str, list[dict[str, Any]]] = {"today": [], "yesterday": []}
+        for label, lo, hi in (("today", today, today + 86400), ("yesterday", yesterday, today)):
+            days[label] = [
+                {"family": str(row[0] or "unknown"), "count": int(row[1])}
+                for row in connection.execute(
+                    "SELECT model_family, count(*) FROM asset_model "
+                    "WHERE sent_at>=? AND sent_at<? GROUP BY 1 ORDER BY 2 DESC",
+                    (lo, hi),
+                )
+            ]
+        indexed = int(connection.execute("SELECT count(*) FROM asset_model").fetchone()[0])
+        return {"available": True, "indexed": indexed, "total": total, "days": days}
+
     def stats(self, force: bool = False) -> dict[str, Any]:
         with self._stats_compute_lock:
             return self._stats_locked(force)
@@ -317,6 +356,7 @@ class Repository:
                 "disk_bytes": int(
                     connection.execute("SELECT coalesce(sum(file_size), 0) FROM assets").fetchone()[0]
                 ),
+                "models": self._model_stats(connection),
                 "queue": queue,
                 "today": counters,
                 "events": get_runtime_state(connection, "event_stream", {}),

@@ -239,3 +239,8 @@ input:focus { outline: none; border-color: var(--accent); }
   .available-row { grid-template-columns: minmax(0, 1fr) auto; }
   .available-row .muted { display: none; }
 }
+
+/* ---------- model panel ---------- */
+.seg.nai5, .dot.nai5 { background: #f778ba; }
+.model-table .tr { grid-template-columns: minmax(0, 2fr) 90px 70px 80px 80px; }
+.num.today { text-align: right; font-variant-numeric: tabular-nums; color: var(--ok); font-weight: 600; }

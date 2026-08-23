@@ -483,18 +483,29 @@ def connect_database(
     connection.execute("DROP VIEW IF EXISTS occurrences")
     connection.execute("CREATE VIEW occurrences AS SELECT * FROM images")
 
-    # The event-driven collector never retries any non-terminal work item from
-    # the legacy OneBot/QCE resolver.  This also catches queued/downloading rows
-    # left behind by an abrupt cutover, not just the six known `failed` rows.
-    connection.execute(
-        """
-        UPDATE images SET status='legacy_failed', next_retry_at=0, updated_at=?
-        WHERE status NOT IN ('accepted','rejected_no_metadata','filtered_gif',
-                             'failed_terminal','expired','legacy_failed')
-          AND (coalesce(resolver, '') <> 'event-cdn' OR status='failed')
-        """,
-        (int(time.time()),),
-    )
+    # Retiring the legacy OneBot/QCE work items was a one-time cutover, but the
+    # predicate negates status so no index can serve it: every start rescanned
+    # the whole images table, which grew to twenty minutes of cold reads past a
+    # hundred thousand rows and repeatedly killed worker startup.  Run it once
+    # and remember.  Delete the marker row to force it again.
+    already_migrated = connection.execute(
+        "SELECT 1 FROM app_settings WHERE key='legacy_cutover_done'"
+    ).fetchone()
+    if not already_migrated:
+        connection.execute(
+            """
+            UPDATE images SET status='legacy_failed', next_retry_at=0, updated_at=?
+            WHERE status NOT IN ('accepted','rejected_no_metadata','filtered_gif',
+                                 'failed_terminal','expired','legacy_failed')
+              AND (coalesce(resolver, '') <> 'event-cdn' OR status='failed')
+            """,
+            (int(time.time()),),
+        )
+        connection.execute(
+            "INSERT OR REPLACE INTO app_settings(key, value_json, updated_at) "
+            "VALUES ('legacy_cutover_done', 'true', ?)",
+            (int(time.time()),),
+        )
     now = int(time.time())
     connection.execute(
         """
@@ -1003,17 +1014,20 @@ def accepted_path_for(
     digest_length: int = 10,
 ) -> Path:
     try:
-        timestamp = dt.datetime.fromtimestamp(int(sent_at), FILENAME_TIMEZONE).strftime(
-            "%Y-%m-%d_%H-%M-%S"
-        )
+        sent = dt.datetime.fromtimestamp(int(sent_at), FILENAME_TIMEZONE)
+        timestamp = sent.strftime("%Y-%m-%d_%H-%M-%S")
+        day = sent.strftime("%Y-%m-%d")
     except (OSError, OverflowError, TypeError, ValueError):
         timestamp = "unknown-time"
+        day = "unknown-date"
     group = str(group_id or "")
     sender = str(sender_uin or "")
     group = group if group.isdigit() else "unknown"
     sender = sender if sender.isdigit() else "unknown"
     name = f"{timestamp}_g{group}_u{sender}_{digest[:max(10, digest_length)]}{extension}"
-    return storage_root / "final" / category_for_source(source) / name
+    # One directory per send date: the folder name always matches the
+    # filename prefix, and no single directory grows past a day of images.
+    return storage_root / "final" / category_for_source(source) / day / name
 
 
 def collision_safe_path(
