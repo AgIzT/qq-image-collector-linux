@@ -45,6 +45,10 @@ STATE_CHANGING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 # until it stops updating at all.  The interval must stay well above the
 # measured compute time.
 STATUS_SNAPSHOT_SECONDS = 30.0
+# Long enough that a worker which keeps dying on startup is retried at a human
+# pace rather than in a loop, and short enough that an ordinary crash costs
+# minutes instead of the hours it used to.
+WORKER_REVIVE_COOLDOWN_SECONDS = 300.0
 LOGGER = logging.getLogger(__name__)
 
 
@@ -87,6 +91,7 @@ class AppContext:
     _status_cache_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
     _status_cache: tuple[float, dict[str, Any]] | None = field(default=None, init=False, repr=False)
     _status_refresher: threading.Thread | None = field(default=None, init=False, repr=False)
+    _last_worker_revival_at: float = field(default=0.0, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.status_cache_enabled:
@@ -214,6 +219,32 @@ class AppContext:
         else:
             with self._status_cache_lock:
                 self._status_cache = (time.monotonic(), payload)
+            self._revive_worker_if_dead(payload)
+
+    def _revive_worker_if_dead(self, payload: dict[str, Any]) -> None:
+        """Restart a worker that stopped with nothing else watching.
+
+        --autostart fires once at container start and gives up permanently at
+        the end of its retry ladder, and the container restart policy only
+        covers this process - the worker is a child of it, so a worker that
+        exits leaves the container healthy and collection stopped.  Until this
+        existed, that state persisted until a person happened to look.
+        """
+
+        worker = (payload.get("services") or {}).get("worker") or {}
+        if worker.get("healthy"):
+            return
+        if self.supervisor.action().get("status") == "running":
+            return
+        now = time.monotonic()
+        if now - self._last_worker_revival_at < WORKER_REVIVE_COOLDOWN_SECONDS:
+            return
+        self._last_worker_revival_at = now
+        LOGGER.warning("worker reported unhealthy; requesting an automatic start")
+        try:
+            self.supervisor.request_start(False)
+        except Exception:
+            LOGGER.exception("automatic worker start could not be requested")
 
     def status(self, *, force: bool = False) -> dict[str, Any]:
         if not self.status_cache_enabled:

@@ -3,9 +3,18 @@
 This runner is deliberately separate from the always-on worker. History
 pagination starts at a current-session raw NT ``msgId`` at or after the fixed
 upper bound, moves towards older messages, and never changes the live WS cursor.
-It has no hourly, daily, queue-depth or per-group page quota; the immutable time
-window and source-progress checks are the boundaries. If a quiet group has no
-current-session anchor, one latest-history page bootstraps the same traversal.
+If a quiet group has no current-session anchor, one latest-history page
+bootstraps the same traversal.
+
+Every page costs one ``get_group_msg_history`` call against the account session,
+which is the only request pattern this pipeline treats as a ban risk. The time
+window and source-progress checks bound *where* the traversal goes, not how many
+calls it makes: one production run paged 1,591 times and recovered nothing. So
+the call budget is enforced here as well, against the same counter the worker
+answers to - both bill to one account, and counting only this runner's own pages
+let a recovery spend the worker's entire allowance out from under it.
+``--allow-unlimited`` still exists for a genuinely long outage, but removing the
+ceiling has to be a deliberate act.
 """
 
 from __future__ import annotations
@@ -15,6 +24,7 @@ import hashlib
 import json
 import os
 import signal
+import sys
 import sqlite3
 import threading
 import time
@@ -25,8 +35,10 @@ from .config import load_settings
 from .database import (
     TERMINAL_IMAGE_STATUSES,
     connect_database,
+    counter_sum,
     enqueue_image,
     increment_counter,
+    local_day_start,
     queue_snapshot,
     set_runtime_state,
 )
@@ -41,6 +53,7 @@ TERMINAL_STATUSES = (
     "completed",
     "partial_source_exhausted",
     "partial_max_calls",
+    "partial_no_yield",
     "failed_anchor",
     "failed_direction",
     "failed_policy",
@@ -151,6 +164,7 @@ class WindowRecoveryRunner:
         poll_seconds: int = 2,
         drain_pages: bool = False,
         pending_timeout_seconds: int = 1200,
+        no_yield_pages: int = 50,
         onebot: OneBotClient | None = None,
     ) -> None:
         if not_before <= 0 or not_after <= not_before:
@@ -163,6 +177,8 @@ class WindowRecoveryRunner:
             raise WindowPolicyError("invalid recovery limits")
         if pending_timeout_seconds <= 0:
             raise WindowPolicyError("invalid pending-page timeout")
+        if no_yield_pages < 0:
+            raise WindowPolicyError("invalid no-yield page ceiling")
 
         self.config_path = Path(config_path)
         self.settings = load_settings(self.config_path)
@@ -180,6 +196,7 @@ class WindowRecoveryRunner:
         self.poll_seconds = max(1, int(poll_seconds))
         self.drain_pages = bool(drain_pages)
         self.pending_timeout_seconds = int(pending_timeout_seconds)
+        self.no_yield_pages = int(no_yield_pages)
         self.onebot = onebot or OneBotClient.from_settings(self.settings["onebot"])
         self.stop_event = threading.Event()
         self._last_state_publish_at = 0.0
@@ -385,6 +402,19 @@ class WindowRecoveryRunner:
         daily = [value for value in calls if value >= now - 86400]
         if self.daily_limit > 0 and len(daily) >= self.daily_limit:
             waits.append(max(1, daily[-self.daily_limit] + 86401 - now))
+        # Recovery pages and the worker's own history calls bill to the same
+        # account session, so one ceiling covers both.  Counting only the rows
+        # this runner wrote let a long recovery drain the worker's allowance,
+        # after which live collection parked images for an hour at a time while
+        # the recovery carried on paging.
+        if self.hourly_limit > 0:
+            hour_start = now - now % 3600
+            if counter_sum(self.connection, "history_calls", hour_start) >= self.hourly_limit:
+                waits.append(max(1, hour_start + 3600 - now))
+        if self.daily_limit > 0:
+            day_start = local_day_start(now)
+            if counter_sum(self.connection, "history_calls", day_start) >= self.daily_limit:
+                waits.append(max(1, day_start + 86400 - now))
         return max(waits)
 
     def _record_call(self, group_id: str) -> tuple[int, int]:
@@ -843,8 +873,50 @@ class WindowRecoveryRunner:
             ),
         )
         self.connection.commit()
+        self._stop_if_no_yield(int(job["id"]))
         self._publish_state("running")
         return True
+
+    def _stop_if_no_yield(self, job_id: int) -> None:
+        """Abandon a traversal that is paging without ever reaching the window.
+
+        The 2026-07-30 run spent 1,591 pages and enqueued nothing: the anchor
+        never descended into the window, so every call was pure cost against
+        the account session.  Requiring messages_in_window to still be zero
+        keeps this from firing on a healthy run, which legitimately pages
+        through newer messages before it arrives.
+        """
+
+        if self.no_yield_pages <= 0:
+            return
+        row = self.connection.execute(
+            """
+            SELECT pages, messages_in_window, images_enqueued
+            FROM window_recovery_jobs WHERE id=?
+            """,
+            (int(job_id),),
+        ).fetchone()
+        if not row:
+            return
+        if int(row["pages"]) < self.no_yield_pages:
+            return
+        if int(row["messages_in_window"]) or int(row["images_enqueued"]):
+            return
+        self.connection.execute(
+            """
+            UPDATE window_recovery_jobs
+            SET status='partial_no_yield', next_retry_at=0, finished_at=?,
+                updated_at=?, last_error=?
+            WHERE id=?
+            """,
+            (
+                int(time.time()),
+                int(time.time()),
+                f"stopped after {int(row['pages'])} pages that never reached the window",
+                int(job_id),
+            ),
+        )
+        self.connection.commit()
 
     def _aggregate(self, phase: str, **extra: Any) -> dict[str, Any]:
         rows = self.connection.execute(
@@ -944,18 +1016,52 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--expected-groups", type=int, default=6)
     parser.add_argument("--page-size", type=int, default=20)
     parser.add_argument("--interval-seconds", type=int, default=2)
-    parser.add_argument("--hourly-limit", type=int, default=0)
-    parser.add_argument("--daily-limit", type=int, default=0)
-    parser.add_argument("--max-calls-per-group", type=int, default=0)
+    # These mirror the worker's own ceiling and bill to the same counter.  Zero
+    # still means "no limit", but reaching it now needs --allow-unlimited.
+    parser.add_argument("--hourly-limit", type=int, default=60)
+    parser.add_argument("--daily-limit", type=int, default=300)
+    parser.add_argument("--max-calls-per-group", type=int, default=200)
     parser.add_argument("--queue-threshold", type=int, default=-1)
     parser.add_argument("--poll-seconds", type=int, default=2)
     parser.add_argument("--drain-pages", action="store_true")
     parser.add_argument("--pending-timeout-seconds", type=int, default=1200)
+    parser.add_argument(
+        "--no-yield-pages",
+        type=int,
+        default=50,
+        help="give up on a group after this many pages that never reach the window (0 disables)",
+    )
+    parser.add_argument(
+        "--allow-unlimited",
+        action="store_true",
+        help="permit 0 (no limit) for the call budgets; without it a 0 is refused",
+    )
     return parser
+
+
+UNBOUNDED_ARGUMENTS = (
+    ("hourly_limit", "--hourly-limit"),
+    ("daily_limit", "--daily-limit"),
+    ("max_calls_per_group", "--max-calls-per-group"),
+)
 
 
 def main() -> int:
     args = build_parser().parse_args()
+    if not args.allow_unlimited:
+        unbounded = [
+            flag for name, flag in UNBOUNDED_ARGUMENTS if int(getattr(args, name)) == 0
+        ]
+        if unbounded:
+            # An uncapped run is the one shape of this tool that has actually
+            # cost an account, so it may not be reached by leaving a flag at
+            # zero in a compose file that nobody re-reads.
+            print(
+                f"refusing to run with no ceiling on {', '.join(unbounded)}; "
+                "pass a positive value or --allow-unlimited",
+                file=sys.stderr,
+            )
+            return 2
     runner = WindowRecoveryRunner(
         args.config,
         not_before=args.not_before,
@@ -970,6 +1076,7 @@ def main() -> int:
         poll_seconds=args.poll_seconds,
         drain_pages=args.drain_pages,
         pending_timeout_seconds=args.pending_timeout_seconds,
+        no_yield_pages=args.no_yield_pages,
     )
     signal.signal(signal.SIGTERM, runner.request_stop)
     signal.signal(signal.SIGINT, runner.request_stop)

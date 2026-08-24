@@ -55,6 +55,13 @@ services:
       - "127.0.0.1:${COLLECTOR_CONSOLE_PORT:-17890}:17890"
     volumes:
       - ${QQAI_RUNTIME_ROOT:-./runtime}/repository:/data/qq-image-collector
+      # The SQLite state lives on its own volume so it can sit on fast storage
+      # while the image repository stays on the large slow one.  Measured on
+      # production: 4.5 GB/s vs 26 MB/s.  The database is small and entirely
+      # random-access, the images are large and written once - putting the
+      # database on the slow volume was behind the multi-second status refresh,
+      # the multi-minute index builds and the worker's lock contention.
+      - ${QQAI_STATE_ROOT:-/var/lib/qqai-state}:/data/qq-image-collector/state
       - ${QQAI_RUNTIME_ROOT:-./runtime}/manager:/data/manager
       - ${QQAI_RUNTIME_ROOT:-./runtime}/napcat-config:/app/napcat/config:ro
       - ${QQAI_RUNTIME_ROOT:-./runtime}/qq-session:/app/.config/QQ:ro
@@ -117,7 +124,10 @@ services:
     profiles: ["window-recovery"]
     image: qq-ai-image-collector-console:1.1.6-event
     container_name: qqai-window-recovery
-    restart: unless-stopped
+    # One-shot by design: it recovers a closed window and exits.  A restart
+    # policy here would re-run it, and every re-run spends account-session
+    # history calls.
+    restart: "no"
     init: true
     depends_on:
       napcat:
@@ -138,14 +148,10 @@ services:
       - "6"
       - --page-size
       - "20"
-      - --interval-seconds
-      - "0"
-      - --hourly-limit
-      - "0"
-      - --daily-limit
-      - "0"
-      - --max-calls-per-group
-      - "0"
+      # Pacing and the call budget are left at their defaults on purpose.
+      # Overriding them to 0 here is what let one run page 1,591 times against
+      # the account session, and the runner now refuses a 0 without
+      # --allow-unlimited anyway.
       - --queue-threshold
       - "-1"
       - --poll-seconds
@@ -158,6 +164,9 @@ services:
       TZ: Asia/Shanghai
     volumes:
       - ${QQAI_RUNTIME_ROOT:-./runtime}/repository:/data/qq-image-collector
+      # Must match collector-console: both open the same database, and without
+      # this the runner would silently create an empty one on the slow volume.
+      - ${QQAI_STATE_ROOT:-/var/lib/qqai-state}:/data/qq-image-collector/state
       - ${QQAI_RUNTIME_ROOT:-./runtime}/napcat-config:/app/napcat/config:ro
     networks: [collector-private]
     stop_grace_period: 30s

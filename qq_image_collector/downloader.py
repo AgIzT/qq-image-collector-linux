@@ -356,7 +356,6 @@ class CdnDownloader:
                 sha256=digest,
                 local_path=str(destination),
                 metadata_source=result.source,
-                metadata_json=metadata_json,
             )
             increment_counter(self.connection, "accepted")
             if duplicate:

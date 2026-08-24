@@ -1,14 +1,22 @@
 from __future__ import annotations
 
+import io
 import json
 import sqlite3
+import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
 
+from qq_image_collector.database import increment_counter
 from qq_image_collector.onebot import OneBotError
-from qq_image_collector.window_recovery import WindowPolicyError, WindowRecoveryRunner
+from qq_image_collector.window_recovery import (
+    WindowPolicyError,
+    WindowRecoveryRunner,
+    main as window_recovery_main,
+)
 
 
 GROUP = "100000001"
@@ -159,6 +167,83 @@ class WindowRecoveryTests(unittest.TestCase):
             [(key, json.dumps(value), now) for key, value in settings.items()],
         )
         connection.commit()
+
+    def test_cli_refuses_an_uncapped_budget_without_an_explicit_override(self) -> None:
+        base = [
+            "window_recovery",
+            "--config",
+            str(self.config_path),
+            "--not-before",
+            str(NOT_BEFORE),
+            "--not-after",
+            str(NOT_AFTER),
+            "--hourly-limit",
+            "0",
+        ]
+        with mock.patch.object(sys, "argv", base):
+            with mock.patch("sys.stderr", io.StringIO()) as captured:
+                self.assertEqual(window_recovery_main(), 2)
+        self.assertIn("--hourly-limit", captured.getvalue())
+
+    def test_worker_history_spend_holds_recovery_at_the_shared_ceiling(self) -> None:
+        runner = self.make_runner(FakeOneBot(), daily_limit=5, interval_seconds=0)
+        now = int(time.time())
+        self.assertEqual(runner._budget_wait_seconds(now), 0)
+        # Spent by the worker, not by this runner: one account, one ceiling.
+        for _ in range(5):
+            increment_counter(runner.connection, "history_calls")
+        self.assertGreater(runner._budget_wait_seconds(int(time.time())), 0)
+
+    def test_traversal_that_never_reaches_the_window_is_abandoned(self) -> None:
+        runner = self.make_runner(FakeOneBot(), no_yield_pages=50)
+        runner.initialize()
+        job_id = int(
+            runner.connection.execute(
+                "SELECT id FROM window_recovery_jobs LIMIT 1"
+            ).fetchone()[0]
+        )
+        runner.connection.execute(
+            "UPDATE window_recovery_jobs SET pages=49, messages_in_window=0, "
+            "images_enqueued=0 WHERE id=?",
+            (job_id,),
+        )
+        runner.connection.commit()
+        runner._stop_if_no_yield(job_id)
+        self.assertNotEqual(self._job_status(runner, job_id), "partial_no_yield")
+
+        runner.connection.execute(
+            "UPDATE window_recovery_jobs SET pages=50 WHERE id=?", (job_id,)
+        )
+        runner.connection.commit()
+        runner._stop_if_no_yield(job_id)
+        self.assertEqual(self._job_status(runner, job_id), "partial_no_yield")
+
+    def test_a_traversal_inside_the_window_is_never_abandoned(self) -> None:
+        runner = self.make_runner(FakeOneBot(), no_yield_pages=10)
+        runner.initialize()
+        job_id = int(
+            runner.connection.execute(
+                "SELECT id FROM window_recovery_jobs LIMIT 1"
+            ).fetchone()[0]
+        )
+        # Pages well past the ceiling, but the anchor did descend into the
+        # window, so this is a slow recovery rather than a runaway one.
+        runner.connection.execute(
+            "UPDATE window_recovery_jobs SET pages=500, messages_in_window=3, "
+            "images_enqueued=0 WHERE id=?",
+            (job_id,),
+        )
+        runner.connection.commit()
+        runner._stop_if_no_yield(job_id)
+        self.assertNotEqual(self._job_status(runner, job_id), "partial_no_yield")
+
+    @staticmethod
+    def _job_status(runner: WindowRecoveryRunner, job_id: int) -> str:
+        return str(
+            runner.connection.execute(
+                "SELECT status FROM window_recovery_jobs WHERE id=?", (job_id,)
+            ).fetchone()[0]
+        )
 
     def test_running_state_publication_is_throttled_without_delaying_pages(self) -> None:
         runner = WindowRecoveryRunner(

@@ -99,7 +99,11 @@ def connect_database(
     connection = sqlite3.connect(database, timeout=BUSY_TIMEOUT_SECONDS)
     connection.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_SECONDS * 1000}")
     connection.execute("PRAGMA foreign_keys=ON")
-    connection.execute("PRAGMA temp_store=MEMORY")
+    # Temp b-trees stay on disk.  The console's per-group rollup builds one for
+    # its count(DISTINCT sha256), and this container shares a 2 GB host with QQ
+    # itself; holding that structure in memory is how the box reaches the point
+    # where the kernel picks a process to kill.
+    connection.execute("PRAGMA temp_store=FILE")
     if not initialize:
         return connection
     connection.execute("PRAGMA journal_mode=WAL")
@@ -119,7 +123,6 @@ def connect_database(
             sha256 TEXT,
             local_path TEXT,
             metadata_source TEXT,
-            metadata_json TEXT,
             error TEXT,
             updated_at INTEGER NOT NULL,
             attempts INTEGER NOT NULL DEFAULT 0,
@@ -156,7 +159,6 @@ def connect_database(
             "sha256": "TEXT",
             "local_path": "TEXT",
             "metadata_source": "TEXT",
-            "metadata_json": "TEXT",
             "error": "TEXT",
             "attempts": "INTEGER NOT NULL DEFAULT 0",
             "next_retry_at": "INTEGER NOT NULL DEFAULT 0",
@@ -193,38 +195,6 @@ def connect_database(
             WHERE status IN ('queued','deferred','downloading')
             """
         )
-    # The original six-hour hint was contradicted by production probes: rkey
-    # URLs worked near 30 minutes and returned 400 near 60 minutes. Tighten
-    # exact legacy rows first, then migrate rows whose discovery timestamp was
-    # one or more seconds earlier than URL capture. The JSON marker makes the
-    # second migration idempotent and keeps parsing out of the claim hot path.
-    connection.execute(
-        """
-        UPDATE images SET url_expires_at=discovered_at+1800
-        WHERE status IN ('queued','deferred','downloading')
-          AND discovered_at>0
-          AND url_expires_at=discovered_at+21600
-        """
-    )
-    connection.execute(
-        """
-        UPDATE images SET
-            url_expires_at=
-                CAST(json_extract(resolver_json, '$.url_expires_at') AS INTEGER)-19800,
-            resolver_json=json_set(
-                resolver_json,
-                '$.url_expires_at',
-                CAST(json_extract(resolver_json, '$.url_expires_at') AS INTEGER)-19800,
-                '$.url_expiry_basis',
-                'observed-any-rkey-30m-scheduling-window'
-            )
-        WHERE status IN ('queued','deferred','downloading')
-          AND json_valid(resolver_json)
-          AND json_extract(resolver_json, '$.url_expiry_basis')=
-              'conservative-any-rkey-6h-hint'
-          AND CAST(json_extract(resolver_json, '$.url_expires_at') AS INTEGER)>19800
-        """
-    )
     connection.execute(
         """
         CREATE TABLE IF NOT EXISTS assets (
@@ -463,6 +433,20 @@ def connect_database(
         """
     )
     connection.execute("CREATE INDEX IF NOT EXISTS idx_images_sha256 ON images(sha256)")
+    # The console recomputes a per-group rollup on a fixed interval forever.
+    # Without these two the rollups scan both tables end to end and read every
+    # row off disk, which is most of the status refresh cost and most of the
+    # lock contention the worker sees.  Both are covering: the aggregates never
+    # touch the tables themselves.
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_images_group_rollup
+        ON images(group_id, status, sent_at, sha256)
+        """
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_assets_rollup ON assets(category, file_size)"
+    )
     connection.execute("CREATE INDEX IF NOT EXISTS idx_images_group_sent ON images(group_id, sent_at)")
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_images_group_seq ON images(group_id, message_seq, image_index)"
@@ -504,6 +488,49 @@ def connect_database(
         connection.execute(
             "INSERT OR REPLACE INTO app_settings(key, value_json, updated_at) "
             "VALUES ('legacy_cutover_done', 'true', ?)",
+            (int(time.time()),),
+        )
+
+    # The original six-hour rkey hint was contradicted by production probes:
+    # URLs worked near 30 minutes and returned 400 near 60 minutes.  Both
+    # rewrites below finished long ago and only ever matched rows that no
+    # longer exist, but they still re-scanned the live queue on every start.
+    # Same treatment as the cutover above: run once, then remember.  Delete the
+    # marker row to force them again.
+    already_retimed = connection.execute(
+        "SELECT 1 FROM app_settings WHERE key='url_expiry_migration_done'"
+    ).fetchone()
+    if not already_retimed:
+        connection.execute(
+            """
+            UPDATE images SET url_expires_at=discovered_at+1800
+            WHERE status IN ('queued','deferred','downloading')
+              AND discovered_at>0
+              AND url_expires_at=discovered_at+21600
+            """
+        )
+        connection.execute(
+            """
+            UPDATE images SET
+                url_expires_at=
+                    CAST(json_extract(resolver_json, '$.url_expires_at') AS INTEGER)-19800,
+                resolver_json=json_set(
+                    resolver_json,
+                    '$.url_expires_at',
+                    CAST(json_extract(resolver_json, '$.url_expires_at') AS INTEGER)-19800,
+                    '$.url_expiry_basis',
+                    'observed-any-rkey-30m-scheduling-window'
+                )
+            WHERE status IN ('queued','deferred','downloading')
+              AND json_valid(resolver_json)
+              AND json_extract(resolver_json, '$.url_expiry_basis')=
+                  'conservative-any-rkey-6h-hint'
+              AND CAST(json_extract(resolver_json, '$.url_expires_at') AS INTEGER)>19800
+            """
+        )
+        connection.execute(
+            "INSERT OR REPLACE INTO app_settings(key, value_json, updated_at) "
+            "VALUES ('url_expiry_migration_done', 'true', ?)",
             (int(time.time()),),
         )
     now = int(time.time())
@@ -684,7 +711,7 @@ def enqueue_image(
                 """
                 UPDATE images SET message_seq=?, sent_at=?, file_token=?, declared_size=?,
                     status='queued', sha256=NULL, local_path=NULL, metadata_source=NULL,
-                    metadata_json=NULL, error=NULL, updated_at=?, attempts=0,
+                    error=NULL, updated_at=?, attempts=0,
                     next_retry_at=0, resolver='event-cdn', resolver_json=?,
                     queue_priority=?, url_expires_at=?,
                     group_uin=coalesce(?, group_uin), group_name=coalesce(?, group_name),
@@ -931,10 +958,13 @@ def finish_image(
     sha256: str | None = None,
     local_path: str | None = None,
     metadata_source: str | None = None,
-    metadata_json: str | None = None,
     error: str | None = None,
     http_status: int | None = None,
 ) -> None:
+    # The parsed generation payload is deliberately not stored here.  assets
+    # holds exactly one copy per sha256 and is the only side anything reads;
+    # a second copy on every message occurrence made this column the largest
+    # thing in the largest table and forced every full scan to page it in.
     if status not in TERMINAL_IMAGE_STATUSES:
         raise ValueError(f"not a terminal image status: {status}")
     now = int(time.time())
@@ -946,7 +976,7 @@ def finish_image(
     connection.execute(
         """
         UPDATE images SET status=?, sha256=?, local_path=?, metadata_source=?,
-            metadata_json=?, error=?, next_retry_at=0, resolver_json=?,
+            error=?, next_retry_at=0, resolver_json=?,
             collected_at=?, updated_at=?
         WHERE group_id=? AND message_id=? AND image_index=?
         """,
@@ -955,7 +985,6 @@ def finish_image(
             sha256,
             local_path,
             metadata_source,
-            metadata_json,
             error[:2048] if error else None,
             resolver_json,
             now,
@@ -1071,11 +1100,19 @@ def store_asset(
         "SELECT local_path FROM assets WHERE sha256=?",
         (digest,),
     ).fetchone()
+    stale_row = False
     if existing:
         path = Path(str(existing[0]))
         if path.is_file():
             temp_path.unlink(missing_ok=True)
             return path, True
+        # The row outlived its file: an offline re-layout moved it, or it was
+        # deleted to reclaim space.  Falling through writes the image again,
+        # but INSERT OR IGNORE cannot revive the row because sha256 already
+        # holds the primary key.  Without the explicit update below the row
+        # would keep pointing at a path that no longer exists while the new
+        # file sits on disk with nothing referencing it.
+        stale_row = True
 
     destination = collision_safe_path(storage_root, digest, extension, source, item)
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -1115,6 +1152,14 @@ def store_asset(
             now,
         ),
     )
+    if stale_row:
+        connection.execute(
+            """
+            UPDATE assets SET local_path=?, file_size=?, updated_at=?
+            WHERE sha256=?
+            """,
+            (str(destination), destination.stat().st_size, now, digest),
+        )
     connection.commit()
     return destination, duplicate
 
