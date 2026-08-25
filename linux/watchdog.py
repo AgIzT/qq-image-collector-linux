@@ -418,17 +418,24 @@ def main() -> int:
     signature = "|".join(f"{f.key}:{f.level}" for f in problems)
     changed = signature != str(state.get("last_signature") or "")
     cooled = now - int(state.get("last_notified_at") or 0) >= int(config["notify_cooldown_seconds"])
-    should_notify = bool(problems) and (changed or cooled or args.force_notify)
-    recovered = not problems and str(state.get("last_signature") or "")
+    should_notify = bool(problems) and (changed or cooled)
+    recovered = not problems and bool(state.get("last_signature"))
 
-    if not args.dry_run and (should_notify or recovered):
+    # --force-notify has to push even when nothing is wrong.  Its whole purpose
+    # is proving the channel works before it is needed, and a healthy system is
+    # exactly when someone sets one up - gating it behind "are there problems"
+    # made the one command for testing a push silently do nothing.
+    if not args.dry_run and (should_notify or recovered or args.force_notify):
         if problems:
             level = CRITICAL if worst == RANK[CRITICAL] else WARN
             title = f"QQ采集 {'严重' if level == CRITICAL else '警告'}：{problems[0].message[:40]}"
             lines = [f"{'✖' if f.level == CRITICAL else '▲'} {f.message}" for f in problems]
-        else:
+        elif recovered:
             title = "QQ采集 已恢复"
             lines = ["之前的告警项目前全部正常。"]
+        else:
+            title = "QQ采集 巡检正常"
+            lines = ["测试推送：所有检查项正常。收到这条就说明告警通道是通的。"]
         if recovery:
             lines.append(f"↻ {recovery}")
         lines.append("")
