@@ -28,7 +28,10 @@ from qq_image_collector.database import (
 from .config import ConsoleConfig
 
 
-STATUS_CACHE_SECONDS = 15.0
+# Must stay below app.STATUS_SNAPSHOT_SECONDS.  If it does not, the refresh
+# loop hands itself back the cache it just stored and the snapshot silently
+# stops advancing.
+STATUS_CACHE_SECONDS = 5.0
 
 
 class Repository:

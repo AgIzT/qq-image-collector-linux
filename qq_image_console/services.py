@@ -20,13 +20,20 @@ from .config import ConsoleConfig
 LOGGER = logging.getLogger(__name__)
 
 
-# The worker opens a multi-hundred-megabyte database and scans the existing
-# repository before it claims its PID file.  On a slow disk that regularly
-# takes minutes; a short deadline kills a worker that is starting normally.
-WORKER_START_TIMEOUT_SECONDS = 600
+# The worker opens the database before it claims its PID file.  That took
+# minutes when the database was large and on slow storage; it now measures four
+# seconds.  The old ten-minute deadline was not free: a start that could never
+# succeed held the worker lock for its whole length, which is exactly what a
+# PID-format mismatch produced.  Keep an order of magnitude of headroom, not two.
+WORKER_START_TIMEOUT_SECONDS = 120
 # A failed autostart used to leave collection down until someone noticed.
 START_RETRY_DELAYS_SECONDS = (30, 60, 120, 300)
-HEALTH_CACHE_SECONDS = 5.0
+# This gates get_login_info, which is an account-session call, and the status
+# loop asks for a health snapshot every pass.  A cache shorter than that
+# interval means one Tencent-facing call per pass, so shortening the loop would
+# have tripled account-session traffic - the one metric this pipeline exists to
+# keep small.  Pin the polling rate here instead of letting it follow the UI.
+HEALTH_CACHE_SECONDS = 60.0
 
 
 def _error_text(exc: BaseException) -> str:

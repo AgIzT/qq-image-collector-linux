@@ -91,11 +91,13 @@ def connect_database(
 ) -> sqlite3.Connection:
     database = Path(path)
     database.parent.mkdir(parents=True, exist_ok=True)
-    # Cold reads of this database take seconds once it outgrows the container's
-    # page cache, and a full console status compute takes tens of seconds.  A
-    # five second lock wait meant any write that overlapped a status refresh
-    # failed outright, which killed the worker.  Wait longer than the slowest
-    # reader instead.
+    # Deliberately generous, and deliberately not reduced along with the other
+    # slow-storage allowances.  It was raised from five seconds because a write
+    # overlapping a status refresh failed outright and killed the worker; those
+    # refreshes are fast now, but a long busy timeout costs nothing when there
+    # is no contention - it only decides how long a writer waits when there is.
+    # Lowering it would buy nothing and would turn a survivable stall back into
+    # a failure.
     connection = sqlite3.connect(database, timeout=BUSY_TIMEOUT_SECONDS)
     connection.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_SECONDS * 1000}")
     connection.execute("PRAGMA foreign_keys=ON")
@@ -108,7 +110,10 @@ def connect_database(
         return connection
     connection.execute("PRAGMA journal_mode=WAL")
     connection.execute("PRAGMA synchronous=NORMAL")
-    connection.execute("PRAGMA wal_autocheckpoint=10000")
+    # 10000 pages is a 40 MB threshold, chosen when checkpointing was expensive.
+    # It is cheap now, and a high threshold combined with a long-lived reader is
+    # how the WAL reached 604 MB on a volume that was already 92% full.
+    connection.execute("PRAGMA wal_autocheckpoint=2000")
     connection.execute(
         """
         CREATE TABLE IF NOT EXISTS images (
