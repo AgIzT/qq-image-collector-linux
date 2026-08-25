@@ -3,7 +3,8 @@
 
 安全约束：
   - 仅 CREATE TABLE / INSERT 到 asset_model；对 assets 只读
-  - 每批小事务提交，批间休眠，避免长时间持锁拖垮采集 worker
+  - 每批小事务提交，批间短暂让出，避免长时间持锁拖垮采集 worker
+  - 批大小与间隔可用 QQAI_INDEX_CHUNK / QQAI_INDEX_SLEEP 覆盖
   - 以 sha256 为主键，重复运行只补新增（可随时中断续跑）
 """
 import json, os, re, sqlite3, sys, time
@@ -13,8 +14,14 @@ DB = os.environ.get(
     # The state volume moved to fast storage; images stayed on the big one.
     "/var/lib/qqai-state/collector_state.sqlite3",
 )
-CHUNK = 200
-SLEEP = 0.3
+# The batch size and the pause between batches were chosen when the database
+# sat on a volume that read at 26 MB/s, where a long-running index build
+# starved the collector.  On the current volume a full rebuild does about nine
+# seconds of actual work, so a 0.3s pause per batch was adding twenty-one
+# seconds of pure waiting to it.  Keep a small pause - it still hands the
+# writer a gap between transactions - and let both be tuned without an edit.
+CHUNK = int(os.environ.get("QQAI_INDEX_CHUNK", "500"))
+SLEEP = float(os.environ.get("QQAI_INDEX_SLEEP", "0.05"))
 
 NAI = re.compile(r"(?:NovelAI\s+Diffusion\s+|DiffusionModelMetaName\.NAI)v?([0-9]+)", re.I)
 
