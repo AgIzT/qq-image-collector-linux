@@ -38,13 +38,16 @@ from .storage import StorageMigrationManager
 SESSION_COOKIE = "qqic_session"
 REMOTE_PERMISSIONS = ["status", "system", "groups", "gap_recovery", "safe_settings", "audit"]
 STATE_CHANGING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
-# Computing a full status costs seconds of cold reads against a database far
-# larger than the page cache this container gets.  A refresh interval shorter
-# than that cost makes refreshes near-continuous, and their own I/O evicts the
-# cache that would have made them fast - the snapshot then falls further behind
-# until it stops updating at all.  The interval must stay well above the
-# measured compute time.
-STATUS_SNAPSHOT_SECONDS = 30.0
+# A full status compute used to cost tens of seconds of cold reads, so the
+# interval had to stay well above it or refreshes went near-continuous and
+# their own I/O evicted the cache that would have made them fast.  With the
+# database on fast storage and the rollups covered by indexes it measures
+# ~0.15s, so the interval can be set by what the console is worth to look at.
+# It also paces the worker revival check below, so a shorter one shortens how
+# long a dead worker stays dead.  Repository.STATUS_CACHE_SECONDS must stay
+# below this, or the loop reads its own cache back and the snapshot stops
+# advancing.
+STATUS_SNAPSHOT_SECONDS = 10.0
 # Long enough that a worker which keeps dying on startup is retried at a human
 # pace rather than in a loop, and short enough that an ordinary crash costs
 # minutes instead of the hours it used to.

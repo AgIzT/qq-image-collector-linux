@@ -28,7 +28,10 @@ from qq_image_collector.database import (
 from .config import ConsoleConfig
 
 
-STATUS_CACHE_SECONDS = 15.0
+# Must stay below app.STATUS_SNAPSHOT_SECONDS.  If it does not, the refresh
+# loop hands itself back the cache it just stored and the snapshot silently
+# stops advancing.
+STATUS_CACHE_SECONDS = 5.0
 
 
 class Repository:
@@ -272,8 +275,9 @@ class Repository:
 
         asset_model is small and indexed on sent_at, unlike images, so this
         stays in the millisecond range and is safe on the status path.  The
-        index is rebuilt incrementally by a daily cron, so "today" here trails
-        until that run.
+        index is rebuilt incrementally every quarter of an hour, so "today"
+        here is close to live; it was a daily rebuild only while the database
+        sat on storage slow enough to make one expensive.
         """
 
         exists = connection.execute(
