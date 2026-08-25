@@ -25,6 +25,7 @@ from qq_image_collector.database import (
     get_runtime_state,
     increment_counter,
     queue_snapshot,
+    store_asset,
 )
 from qq_image_collector.downloader import CdnDownloader, validate_cdn_url
 from qq_image_collector.events import EventListener, parse_group_event, record_group_cursor
@@ -152,6 +153,56 @@ class EventPipelineTests(unittest.TestCase):
         )
         self.assertTrue(items[1]["resolver_data"]["emoji_signal"])
         self.assertIsNone(items[1]["original_flag"])
+
+    def _store_once(self, payload: bytes) -> Path:
+        temporary = self.root / "temp"
+        temporary.mkdir(parents=True, exist_ok=True)
+        staged = temporary / f"stage-{time.time_ns()}.part"
+        staged.write_bytes(payload)
+        destination, _duplicate = store_asset(
+            self.connection,
+            staged,
+            digest=hashlib.sha256(payload).hexdigest(),
+            extension=".png",
+            source="a1111-compatible",
+            metadata_json="{}",
+            width=8,
+            height=8,
+            image_format="PNG",
+            item={
+                "group_id": GROUP,
+                "sender_uin": SENDER,
+                "message_id": MESSAGE,
+                "image_index": 0,
+                "sent_at": 1_704_067_200,
+            },
+            storage_root=self.root,
+        )
+        return destination
+
+    def test_asset_row_outliving_its_file_is_repointed_not_orphaned(self) -> None:
+        payload = a1111_png()
+        digest = hashlib.sha256(payload).hexdigest()
+        destination = self._store_once(payload)
+        self.assertTrue(destination.is_file())
+
+        # An offline re-layout moved the file and left the row behind, which is
+        # exactly what a date-directory migration or a space reclaim produces.
+        drifted = str(self.root / "final" / "其他模型生成" / "gone" / destination.name)
+        self.connection.execute(
+            "UPDATE assets SET local_path=? WHERE sha256=?", (drifted, digest)
+        )
+        self.connection.commit()
+
+        repaired = self._store_once(payload)
+        stored = str(
+            self.connection.execute(
+                "SELECT local_path FROM assets WHERE sha256=?", (digest,)
+            ).fetchone()[0]
+        )
+        self.assertEqual(stored, str(repaired))
+        self.assertTrue(Path(stored).is_file())
+        self.assertNotEqual(stored, drifted)
 
     def test_process_local_short_ids_never_replace_durable_raw_cursor(self) -> None:
         durable, _items = parse_group_event(

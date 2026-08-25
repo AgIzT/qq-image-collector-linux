@@ -1,0 +1,37 @@
+#!/usr/bin/env python3
+"""把推送地址写进 watchdog 配置。用法见 --help。"""
+import json, sys
+
+CONF = "/etc/qqai-watchdog.json"
+USAGE = """用法：
+  qqai-set-notify bark <你的KEY>
+  qqai-set-notify serverchan <你的SendKey>
+  qqai-set-notify telegram <bot token> <chat id>
+  qqai-set-notify test            # 发一条测试推送
+"""
+
+def save(notify):
+    d = json.load(open(CONF, encoding="utf-8"))
+    d["notify"] = notify
+    json.dump(d, open(CONF, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+    print("已写入。发条测试：qqai-set-notify test")
+
+args = sys.argv[1:]
+if not args or args[0] in ("-h", "--help"):
+    print(USAGE); raise SystemExit(0)
+kind = args[0]
+if kind == "bark" and len(args) == 2:
+    save({"url": f"https://api.day.app/{args[1]}/{{title}}/{{body}}",
+          "method": "GET", "timeout_seconds": 15})
+elif kind == "serverchan" and len(args) == 2:
+    save({"url": f"https://sctapi.ftqq.com/{args[1]}.send", "method": "POST",
+          "form": {"title": "{title}", "desp": "{body}"}, "timeout_seconds": 15})
+elif kind == "telegram" and len(args) == 3:
+    save({"url": f"https://api.telegram.org/bot{args[1]}/sendMessage", "method": "POST",
+          "json": {"chat_id": args[2], "text": "{title}\n{body}"}, "timeout_seconds": 15})
+elif kind == "test":
+    import subprocess
+    raise SystemExit(subprocess.call(
+        ["python3", "/opt/qqai-watchdog.py", "--force-notify"]))
+else:
+    print(USAGE); raise SystemExit(2)

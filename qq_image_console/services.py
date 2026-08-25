@@ -12,7 +12,8 @@ from urllib.parse import urlsplit
 
 import psutil
 
-from collector import OneBotClient, OneBotError
+from qq_image_collector.onebot import OneBotClient, OneBotError
+from qq_image_collector.pidfile import holder_is_live
 
 from .config import ConsoleConfig
 
@@ -156,9 +157,18 @@ class ProcessSupervisor:
         return Path(runtime.get("pid_file", self.config.storage_root() / "state" / "collector.pid"))
 
     def worker_pid(self) -> int | None:
+        # Must stay in step with PidFile, which records the process start time
+        # next to the PID so a reused container PID is recognisable.  Parsing
+        # the file as a bare integer raised ValueError against that format and
+        # reported a perfectly healthy worker as absent - which then had the
+        # console try to start a second one every few minutes.
         try:
-            pid = int(self.worker_pid_file().read_text(encoding="ascii").strip())
-        except (OSError, ValueError):
+            text = self.worker_pid_file().read_text(encoding="ascii")
+        except OSError:
+            return None
+        pid = holder_is_live(text)
+        if pid is None:
+            self.worker_pid_file().unlink(missing_ok=True)
             return None
         try:
             process = psutil.Process(pid)

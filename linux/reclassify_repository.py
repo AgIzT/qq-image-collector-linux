@@ -220,14 +220,13 @@ def apply_plan(
                 updated_images += connection.execute(
                     """
                     UPDATE images
-                    SET status='accepted', local_path=?, metadata_source=?, metadata_json=?,
+                    SET status='accepted', local_path=?, metadata_source=?,
                         error=NULL, updated_at=?
                     WHERE sha256=?
                     """,
                     (
                         str(target),
                         entry.metadata_source,
-                        entry.metadata_json,
                         now,
                         entry.sha256,
                     ),
@@ -281,7 +280,7 @@ def apply_plan(
                     """
                     UPDATE images
                     SET status='rejected_no_metadata', local_path=?, metadata_source=NULL,
-                        metadata_json=NULL, error=?, updated_at=?
+                        error=?, updated_at=?
                     WHERE sha256=?
                     """,
                     (str(target), entry.error, now, entry.sha256),
