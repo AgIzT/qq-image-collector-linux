@@ -537,7 +537,7 @@ function ModelPanel({ models }: { models: ModelStats }) {
     <section className="panel">
       <div className="panel-head">
         <h2>模型分布</h2>
-        <span className="muted">已索引 {n(models.indexed ?? total)} 张 · 每日 04:20 增量更新</span>
+        <span className="muted">已索引 {n(models.indexed ?? total)} 张 · 每 15 分钟增量更新</span>
       </div>
       <div className="bar">
         {models.total.map((r) => (
