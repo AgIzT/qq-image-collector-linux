@@ -10,7 +10,8 @@ import urllib.parse
 import webbrowser
 from pathlib import Path
 
-from collector import PidFile, main as collector_main, pid_is_alive
+from collector import main as collector_main
+from qq_image_collector.pidfile import PidFile, holder_is_live
 
 from .app import create_app
 from .config import load_console_config
@@ -58,18 +59,19 @@ def _live_other_manager(path: Path) -> int | None:
     if not path.is_file():
         return None
     try:
-        existing = int(path.read_text(encoding="ascii").strip())
-    except (OSError, ValueError):
+        text = path.read_text(encoding="ascii")
+    except OSError:
         return None
-    # Container PIDs are routinely reused after a restart. A PID file that
-    # already contains our not-yet-locked process ID can only be stale.
-    if existing == os.getpid():
+    # Container PIDs restart from 1, so "this PID exists" says nothing about
+    # who owns it. holder_is_live compares the recorded process start time and
+    # reports a reused PID as what it is: a stale file.
+    holder = holder_is_live(text)
+    if holder is None:
         try:
             path.unlink(missing_ok=True)
         except OSError:
             pass
-        return None
-    return existing if pid_is_alive(existing) else None
+    return holder
 
 
 def _run_worker(config_path: Path | None) -> int:

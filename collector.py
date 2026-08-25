@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import os
 from pathlib import Path
 from typing import Any
 
@@ -17,45 +16,9 @@ from qq_image_collector import (
     connect_database,
 )
 from qq_image_collector.config import load_settings
+from qq_image_collector.pidfile import PidFile, pid_is_alive
 from qq_image_collector.database import queue_snapshot
 from qq_image_collector.worker import run_worker
-
-
-def pid_is_alive(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except OSError:
-        return False
-    return True
-
-
-class PidFile:
-    def __init__(self, path: str | Path) -> None:
-        self.path = Path(path)
-
-    def __enter__(self) -> "PidFile":
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        if self.path.is_file():
-            try:
-                existing = int(self.path.read_text(encoding="ascii").strip())
-            except (OSError, ValueError):
-                existing = 0
-            if existing and existing != os.getpid() and pid_is_alive(existing):
-                raise RuntimeError(f"collector is already running with PID {existing}")
-            self.path.unlink(missing_ok=True)
-        descriptor = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        with os.fdopen(descriptor, "w", encoding="ascii") as handle:
-            handle.write(str(os.getpid()))
-        return self
-
-    def __exit__(self, *_args: Any) -> None:
-        try:
-            if self.path.read_text(encoding="ascii").strip() == str(os.getpid()):
-                self.path.unlink(missing_ok=True)
-        except OSError:
-            pass
 
 
 def build_parser() -> argparse.ArgumentParser:

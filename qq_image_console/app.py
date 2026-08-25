@@ -131,6 +131,7 @@ class AppContext:
                     "queue",
                     "downloader",
                     "recovery",
+                    "policy",
                 )
             },
             "account": None,
@@ -171,6 +172,7 @@ class AppContext:
                 "downloader": {"status": "loading"},
                 "worker": {},
                 "window_recovery": {},
+                "critical_alarm": {},
             },
             "groups": [],
             "jobs": [],
@@ -321,6 +323,15 @@ class AppContext:
                 f"处理中 {queue_depth} 张，最老 {queue_oldest_age} 秒"
                 if queue_depth
                 else "队列已清空"
+            ),
+        }
+        alarm = statistics.get("critical_alarm") or {}
+        services["policy"] = {
+            "healthy": not bool(alarm.get("active")),
+            "detail": (
+                str(alarm.get("reason") or "已触发禁用动作拦截")
+                if alarm.get("active")
+                else "禁用动作拦截未触发"
             ),
         }
         services["recovery"] = {
@@ -650,7 +661,11 @@ def create_app(
 
     def require_local(request: Request) -> AuthContext:
         auth = require_auth(request)
-        if auth.mode == "remote":
+        # "direct" is the public gateway, not the machine.  Rejecting only
+        # "remote" left log reading, setup completion and the storage migration
+        # - which copies the entire repository and needs twice the disk -
+        # reachable from the internet by anyone holding the session token.
+        if auth.mode != "local":
             raise HTTPException(status_code=403, detail="此操作只能在本机控制台完成")
         return auth
 

@@ -12,7 +12,7 @@ from urllib.parse import urlsplit
 
 import psutil
 
-from collector import OneBotClient, OneBotError
+from qq_image_collector.onebot import OneBotClient, OneBotError
 
 from .config import ConsoleConfig
 

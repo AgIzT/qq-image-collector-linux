@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 import tempfile
 import unittest
@@ -8,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from qq_image_collector.pidfile import pid_start_time
 from qq_image_console.main import _live_other_manager, main
 
 
@@ -19,6 +21,35 @@ class ConsoleMainTests(unittest.TestCase):
                 pid_file.write_text("7", encoding="ascii")
                 self.assertIsNone(_live_other_manager(pid_file))
         self.assertFalse(pid_file.exists())
+
+    def test_reused_pid_from_a_previous_container_is_not_a_live_manager(self) -> None:
+        # A container numbers processes from 1 again, so a leftover file names a
+        # PID that exists and belongs to something else.  The recorded start
+        # time is what tells the two apart.
+        with tempfile.TemporaryDirectory() as temporary:
+            pid_file = Path(temporary) / "manager.pid"
+            live_pid = os.getpid()
+            actual = pid_start_time(live_pid)
+            pid_file.write_text(f"{live_pid + 1} 999999999", encoding="ascii")
+            with patch("qq_image_collector.pidfile.pid_is_alive", return_value=True):
+                with patch(
+                    "qq_image_collector.pidfile.pid_start_time",
+                    return_value=(actual if actual is not None else 12345),
+                ):
+                    self.assertIsNone(_live_other_manager(pid_file))
+            self.assertFalse(pid_file.exists())
+
+    def test_a_genuinely_live_manager_is_still_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            pid_file = Path(temporary) / "manager.pid"
+            other = os.getpid() + 1
+            pid_file.write_text(f"{other} 4242", encoding="ascii")
+            with patch("qq_image_collector.pidfile.pid_is_alive", return_value=True):
+                with patch(
+                    "qq_image_collector.pidfile.pid_start_time", return_value=4242
+                ):
+                    self.assertEqual(_live_other_manager(pid_file), other)
+            self.assertTrue(pid_file.exists())
 
     def test_loopback_server_does_not_rewrite_client_from_proxy_headers(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

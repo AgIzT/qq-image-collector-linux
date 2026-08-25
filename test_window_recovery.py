@@ -185,6 +185,36 @@ class WindowRecoveryTests(unittest.TestCase):
                 self.assertEqual(window_recovery_main(), 2)
         self.assertIn("--hourly-limit", captured.getvalue())
 
+    def test_a_different_window_is_refused_without_an_explicit_override(self) -> None:
+        # The markers are also read by the live worker, so recovering another
+        # period must not require editing them.
+        runner = self.make_runner(
+            FakeOneBot(), not_before=NOT_BEFORE - 7200, not_after=NOT_AFTER - 3600
+        )
+        with self.assertRaises(WindowPolicyError) as raised:
+            runner._safety_check()
+        self.assertIn("--window-override", str(raised.exception))
+
+    def test_window_override_recovers_another_window_without_touching_markers(self) -> None:
+        runner = self.make_runner(
+            FakeOneBot(),
+            not_before=NOT_BEFORE - 7200,
+            not_after=NOT_AFTER - 3600,
+            window_override=True,
+        )
+        self.assertEqual(runner._safety_check(), [GROUP])
+        # The worker's markers are untouched by the override path.
+        markers = dict(
+            runner.connection.execute(
+                "SELECT key, value_json FROM app_settings WHERE key IN "
+                "('production_history_floor','production_live_only_started_at')"
+            ).fetchall()
+        )
+        self.assertEqual(int(json.loads(markers["production_history_floor"])), NOT_BEFORE)
+        self.assertEqual(
+            int(json.loads(markers["production_live_only_started_at"])), NOT_AFTER
+        )
+
     def test_worker_history_spend_holds_recovery_at_the_shared_ceiling(self) -> None:
         runner = self.make_runner(FakeOneBot(), daily_limit=5, interval_seconds=0)
         now = int(time.time())

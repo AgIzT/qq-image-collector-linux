@@ -165,6 +165,7 @@ class WindowRecoveryRunner:
         drain_pages: bool = False,
         pending_timeout_seconds: int = 1200,
         no_yield_pages: int = 50,
+        window_override: bool = False,
         onebot: OneBotClient | None = None,
     ) -> None:
         if not_before <= 0 or not_after <= not_before:
@@ -197,6 +198,7 @@ class WindowRecoveryRunner:
         self.drain_pages = bool(drain_pages)
         self.pending_timeout_seconds = int(pending_timeout_seconds)
         self.no_yield_pages = int(no_yield_pages)
+        self.window_override = bool(window_override)
         self.onebot = onebot or OneBotClient.from_settings(self.settings["onebot"])
         self.stop_event = threading.Event()
         self._last_state_publish_at = 0.0
@@ -243,13 +245,36 @@ class WindowRecoveryRunner:
         ]
         if frozen_groups and frozen_groups != groups:
             raise WindowPolicyError("enabled group set differs from the frozen window jobs")
-        if int(_setting(self.connection, "production_history_floor", 0)) != self.not_before:
-            raise WindowPolicyError("recovery lower bound differs from production marker")
-        if (
-            int(_setting(self.connection, "production_live_only_started_at", 0))
-            != self.not_after
-        ):
-            raise WindowPolicyError("recovery upper bound differs from production marker")
+        # production_history_floor and production_live_only_started_at are also
+        # read by the live worker (_requires_bounded_page_replay decides whether
+        # to park an image for a day on them).  Requiring them to equal this
+        # run's window meant recovering any other period involved editing two
+        # settings the worker acts on, running, and editing them back - which
+        # changes how production treats its existing backlog for the duration.
+        # --window-override skips only this equality check; the group-count and
+        # frozen-job checks below and above still apply.
+        if self.window_override:
+            print(
+                "window-override: skipping the production marker comparison; "
+                f"recovering [{self.not_before}, {self.not_after}] on operator instruction",
+                file=sys.stderr,
+            )
+        else:
+            if int(_setting(self.connection, "production_history_floor", 0)) != self.not_before:
+                raise WindowPolicyError(
+                    "recovery lower bound differs from production marker "
+                    "(pass --window-override to recover a different window "
+                    "without editing the markers the worker reads)"
+                )
+            if (
+                int(_setting(self.connection, "production_live_only_started_at", 0))
+                != self.not_after
+            ):
+                raise WindowPolicyError(
+                    "recovery upper bound differs from production marker "
+                    "(pass --window-override to recover a different window "
+                    "without editing the markers the worker reads)"
+                )
         active_gap_jobs = int(
             self.connection.execute(
                 """
@@ -1032,6 +1057,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="give up on a group after this many pages that never reach the window (0 disables)",
     )
     parser.add_argument(
+        "--window-override",
+        action="store_true",
+        help="recover a window other than the production markers, without editing them",
+    )
+    parser.add_argument(
         "--allow-unlimited",
         action="store_true",
         help="permit 0 (no limit) for the call budgets; without it a 0 is refused",
@@ -1077,6 +1107,7 @@ def main() -> int:
         drain_pages=args.drain_pages,
         pending_timeout_seconds=args.pending_timeout_seconds,
         no_yield_pages=args.no_yield_pages,
+        window_override=args.window_override,
     )
     signal.signal(signal.SIGTERM, runner.request_stop)
     signal.signal(signal.SIGINT, runner.request_stop)

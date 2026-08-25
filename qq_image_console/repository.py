@@ -80,10 +80,14 @@ class Repository:
                     set_setting(connection, key, value)
             connection.execute(
                 """
+                -- Settings from designs that no longer exist.  history_hourly_limit
+                -- and history_daily_limit deliberately are NOT in this list: they
+                -- came back as the live account-session ceiling, and deleting them
+                -- on every console start silently discarded any operator override,
+                -- leaving the limit adjustable only by editing Python defaults.
                 DELETE FROM app_settings
                 WHERE key IN (
-                    'daily_download_limit', 'history_hourly_limit',
-                    'history_daily_limit', 'history_max_pages_per_gap',
+                    'daily_download_limit', 'history_max_pages_per_gap',
                     'allow_403_history_refresh', 'cdn_403_window_seconds',
                     'cdn_403_trip_count', 'cdn_circuit_seconds'
                 )
@@ -363,6 +367,11 @@ class Repository:
                 "downloader": get_runtime_state(connection, "downloader", {}),
                 "worker": get_runtime_state(connection, "worker", {}),
                 "window_recovery": get_runtime_state(connection, "window_recovery", {}),
+                # The blocked-action alarm used to be written and never read by
+                # anything, so a policy violation raised a flag nobody looked
+                # at.  linux/watchdog.py is the out-of-band consumer; this puts
+                # it in front of anyone with the console open too.
+                "critical_alarm": get_runtime_state(connection, "critical_alarm", {}),
             }
         with self._cache_lock:
             self._stats_cache = (time.time(), payload)

@@ -61,7 +61,7 @@ message occurrences remain in SQLite.
 ## Source Compatibility
 
 The parser keeps legacy `novelai-stealth` and `novelai-ztxt` values mapped to
-`NAI含参但不可直接读取的`. Parser version `4` records the corrected official
+`NAI含参但不可直接读取的`. Parser version `5` records the corrected official
 fallback simulation in the asset table.
 
 Normal event Worker startup never reclassifies or rehashes existing assets. This
