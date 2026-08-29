@@ -52,7 +52,13 @@ DEFAULTS: dict[str, Any] = {
     "no_event_critical_seconds": 10800,
     "disk_warn_percent": 85,
     "disk_critical_percent": 93,
+    # Repeat interval while a problem persists, chosen by severity.  One
+    # interval for both meant a slow, known condition - a disk filling over
+    # days - pushed as often as a dead QQ, and an alert that repeats hourly
+    # about something the operator has already decided to handle on Thursday
+    # is how people learn to swipe the channel away.
     "notify_cooldown_seconds": 3600,
+    "warn_cooldown_seconds": 43200,
     "recovery_cooldown_seconds": 3600,
     # Restarting NapCat re-launches QQ.  Off by default: turning it on is a
     # decision about whether an unattended restart is preferable to waiting for
@@ -417,7 +423,14 @@ def main() -> int:
     now = int(time.time())
     signature = "|".join(f"{f.key}:{f.level}" for f in problems)
     changed = signature != str(state.get("last_signature") or "")
-    cooled = now - int(state.get("last_notified_at") or 0) >= int(config["notify_cooldown_seconds"])
+    cooldown = int(
+        config["notify_cooldown_seconds"]
+        if worst == RANK[CRITICAL]
+        else config.get("warn_cooldown_seconds", config["notify_cooldown_seconds"])
+    )
+    # `changed` still bypasses this, so a warn escalating to critical pushes at
+    # once rather than waiting out the gentler interval it was throttled by.
+    cooled = now - int(state.get("last_notified_at") or 0) >= cooldown
     should_notify = bool(problems) and (changed or cooled)
     recovered = not problems and bool(state.get("last_signature"))
 
