@@ -955,6 +955,9 @@ def main() -> int:
     parser.add_argument("--purge", action="store_true",
                         help="delete local files for verified days older than --keep-days")
     parser.add_argument("--index", action="store_true", help="rewrite data/index.json")
+    parser.add_argument("--reindex", action="store_true",
+                        help="rewrite the day indexes from the database without re-uploading "
+                             "images (use after changing how records are shaped)")
     parser.add_argument("--status", action="store_true", help="print progress and exit")
     parser.add_argument("--day", action="append", help="restrict to this day (repeatable)")
     parser.add_argument("--keep-days", type=int, default=None,
@@ -982,8 +985,8 @@ def main() -> int:
         print_status(state, conn)
         return 0
 
-    if not (args.upload or args.purge or args.index):
-        parser.error("nothing to do: pass --upload, --purge, --index or --status")
+    if not (args.upload or args.purge or args.index or args.reindex):
+        parser.error("nothing to do: pass --upload, --purge, --reindex, --index or --status")
 
     lock = acquire_lock()  # noqa: F841 - held for the lifetime of the process
     client = R2Client(cfg)
@@ -999,13 +1002,17 @@ def main() -> int:
             if stats["uploaded"] or needs_index(state, day, stats["total"]):
                 write_day_indexes(client, state, conn, day, args)
 
+    if args.reindex:
+        for day in days:
+            write_day_indexes(client, state, conn, day, args)
+
     if args.purge:
         freed = 0
         for day in days:
             freed += purge_day(client, state, conn, day, args)
         log(f"purge: {'would free' if args.dry_run else 'freed'} {freed / 1073741824:.1f} GB")
 
-    if args.index or args.upload:
+    if args.index or args.upload or args.reindex:
         write_root_index(client, state, conn)
 
     return 0
