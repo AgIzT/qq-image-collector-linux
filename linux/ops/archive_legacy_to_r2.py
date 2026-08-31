@@ -116,6 +116,7 @@ def scan(state, root: Path, workers: int) -> int:
         return 0
 
     lock = threading.Lock()
+    checkpoint = archive.Checkpoint(every=200)
     processed = skipped = 0
 
     def read(path: Path):
@@ -185,7 +186,7 @@ def scan(state, root: Path, workers: int) -> int:
                      int(time.time())),
                 )
                 processed += 1
-                if processed % 200 == 0:
+                if checkpoint.due(processed):
                     state.commit()
                     log(f"  scanned {processed}/{len(todo)}")
     state.commit()
@@ -206,6 +207,7 @@ def upload(state, client, workers: int) -> int:
         return 0
 
     lock = threading.Lock()
+    checkpoint = archive.Checkpoint()
     sent = 0
     total_bytes = 0
 
@@ -240,7 +242,7 @@ def upload(state, client, workers: int) -> int:
                                   (sha, int(time.time())))
                 sent += 1
                 total_bytes += size
-                if sent % 100 == 0:
+                if checkpoint.due(sent):
                     state.commit()
                     log(f"  {sent}/{len(rows)} ({total_bytes / 1048576:.0f} MB)")
     state.commit()

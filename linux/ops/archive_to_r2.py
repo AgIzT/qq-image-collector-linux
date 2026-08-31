@@ -534,6 +534,28 @@ def meta_key(sha: str) -> str:
 # --------------------------------------------------------------------------
 
 
+class Checkpoint:
+    """Decide when to commit progress and say so.
+
+    Counting objects alone is the wrong unit when the two ends of this run are
+    so far apart: the server pushes 100 objects in a minute, while the machine
+    holding the pre-server collection needs twelve. Every-100 there means a
+    quarter hour of silence and a quarter hour of re-uploads after any
+    interruption. Whichever comes first.
+    """
+
+    def __init__(self, every=100, seconds=60.0):
+        self.every = every
+        self.seconds = seconds
+        self.last = time.time()
+
+    def due(self, count: int) -> bool:
+        if count % self.every == 0 or time.time() - self.last >= self.seconds:
+            self.last = time.time()
+            return True
+        return False
+
+
 class Budget:
     """Lets a cron run stop cleanly part-way and pick up where it left off."""
 
@@ -599,6 +621,7 @@ def upload_day(client, state, conn, day, args, budget) -> dict:
         return ("ok", row, len(body))
 
     stopped = False
+    checkpoint = Checkpoint()
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as pool:
         futures = {pool.submit(send, row): row for row in todo}
         for future in concurrent.futures.as_completed(futures):
@@ -627,7 +650,7 @@ def upload_day(client, state, conn, day, args, budget) -> dict:
                 )
                 stats["uploaded"] += 1
                 stats["bytes"] += size
-                if stats["uploaded"] % 50 == 0:
+                if checkpoint.due(stats["uploaded"]):
                     state.commit()
                     log(f"  {stats['uploaded']}/{len(todo)} ({stats['bytes'] / 1048576:.0f} MB)")
     state.commit()
