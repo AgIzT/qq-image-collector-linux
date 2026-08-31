@@ -238,6 +238,8 @@ def open_state(path: Path = STATE_PATH) -> sqlite3.Connection:
             indexed_at  INTEGER,
             purged_at   INTEGER,
             purged_bytes INTEGER,
+            categories  TEXT,
+            families    TEXT,
             PRIMARY KEY (day, origin)
         );
 
@@ -247,6 +249,10 @@ def open_state(path: Path = STATE_PATH) -> sqlite3.Connection:
         );
         """
     )
+    have = {row[1] for row in conn.execute("PRAGMA table_info(days)")}
+    for column in ("categories", "families"):
+        if column not in have:
+            conn.execute(f"ALTER TABLE days ADD COLUMN {column} TEXT")
     conn.commit()
     return conn
 
@@ -713,10 +719,12 @@ def write_day_indexes(client, state, conn, day, args) -> dict | None:
     )
     state.execute(
         "INSERT OR REPLACE INTO days (day, origin, asset_count, bytes, indexed_at, "
-        "purged_at, purged_bytes) VALUES (?, 'server', ?, ?, ?, "
+        "categories, families, purged_at, purged_bytes) VALUES (?, 'server', ?, ?, ?, ?, ?, "
         "(SELECT purged_at FROM days WHERE day=? AND origin='server'), "
         "(SELECT purged_bytes FROM days WHERE day=? AND origin='server'))",
-        (day, len(entries), total_bytes, int(time.time()), day, day),
+        (day, len(entries), total_bytes, int(time.time()),
+         json.dumps(categories, ensure_ascii=False), json.dumps(families, ensure_ascii=False),
+         day, day),
     )
     state.commit()
     log(f"{day}: index {len(entries)} entries, {raw_size / 1024:.0f} KB -> {gz_size / 1024:.0f} KB gz")
@@ -835,22 +843,27 @@ def purge_day(client, state, conn, day, args) -> int:
 
 
 def write_root_index(client, state, conn) -> None:
+    """Roll the day indexes up. Counts describe the archive, not the library.
+
+    Taking the totals from ``assets`` instead would read as though everything
+    were already archived from the first day of a backfill that takes hours.
+    """
     days = []
     categories, families = {}, {}
     total_count = total_bytes = 0
     for row in state.execute(
-        "SELECT day, origin, asset_count, bytes FROM days ORDER BY day"
+        "SELECT day, origin, asset_count, bytes, categories, families FROM days ORDER BY day"
     ):
-        day, origin, count, size = row
+        day, origin, count, size, day_categories, day_families = row
         days.append({"day": day, "origin": origin, "entryCount": count, "bytes": size,
                      "path": f"data/days/{day}.json" if origin == "server"
                              else f"data/legacy/days/{day}.json"})
         total_count += count or 0
         total_bytes += size or 0
-    for name, count in conn.execute("SELECT category, count(*) FROM assets GROUP BY 1"):
-        categories[name] = count
-    for name, count in conn.execute("SELECT model_family, count(*) FROM asset_model GROUP BY 1"):
-        families[name] = count
+        for target, blob in ((categories, day_categories), (families, day_families)):
+            for name, value in (json.loads(blob) if blob else {}).items():
+                target[name] = target.get(name, 0) + value
+    remaining = conn.execute("SELECT count(*) FROM assets").fetchone()[0] - total_count
 
     index = {
         "id": "qqai-archive",
@@ -862,12 +875,14 @@ def write_root_index(client, state, conn) -> None:
         "entryCount": total_count,
         "bytes": total_bytes,
         "dayCount": len(days),
+        "pendingCount": max(0, remaining),
         "categories": categories,
         "modelFamilies": families,
         "days": days,
     }
     client.put_json("data/index.json", index, cache_control="public, max-age=60")
-    log(f"index: {len(days)} days, {total_count} entries, {total_bytes / 1073741824:.1f} GB")
+    log(f"index: {len(days)} days, {total_count} entries, {total_bytes / 1073741824:.1f} GB"
+        + (f", {remaining} not archived yet" if remaining > 0 else ""))
 
 
 # --------------------------------------------------------------------------
