@@ -768,7 +768,6 @@ def purge_day(client, state, conn, day, args) -> int:
     # Confirm in this run, not from bookkeeping: the whole point of the check is
     # to be independent of the table that says the upload happened.
     log(f"{day}: verifying {len(rows)} objects in R2 before deleting")
-    verified = {}
     failures = []
     lock = threading.Lock()
 
@@ -790,8 +789,6 @@ def purge_day(client, state, conn, day, args) -> int:
                     failures.append(f"{key} -> HTTP {status}")
                 elif length != row["file_size"]:
                     failures.append(f"{key} -> {length} bytes, expected {row['file_size']}")
-                else:
-                    verified[row["sha256"]] = True
 
     if failures:
         log(f"{day}: REFUSING to purge, {len(failures)} objects unverified")
