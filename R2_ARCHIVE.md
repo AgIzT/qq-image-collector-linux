@@ -193,7 +193,10 @@ SQL 查不到它们，元数据只能从文件里重新读。
 它 import `archive_to_r2.py` 拿上传、键布局和记录格式，只有"字段从哪来"是自己的：
 
 ```bash
-python linux/ops/archive_legacy_to_r2.py \n    --root "D:/program/群聊图片获取/final" \n    --config r2_archive_config.json --bucket qqai-image-archive \n    --state legacy_archive.sqlite3
+python linux/ops/archive_legacy_to_r2.py \
+    --root "D:/program/群聊图片获取/final" \
+    --config r2_archive_config.json --bucket qqai-image-archive \
+    --state legacy_archive.sqlite3
 ```
 
 传完会写一份 `legacy_days.json`，拿到服务器上合进索引：
