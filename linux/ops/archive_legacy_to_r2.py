@@ -106,6 +106,67 @@ def parse_name(name: str) -> dict:
     }
 
 
+def build_record(*, sha, day, category, source, fields, model, family,
+                 ext, width, height, size, sent_at) -> dict:
+    """Shape one listing record, exactly as archive_to_r2 shapes the server's."""
+    shaped = archive.SHAPERS.get(source, lambda _f: {})(fields)
+    record = {
+        "id": sha,
+        "title": archive.title_for(shaped.get("tags"), shaped.get("model") or model, day),
+        "path": [category, day],
+        "ext": ext,
+        "width": width,
+        "height": height,
+        "size": size,
+        "sentAt": sent_at,
+        "category": category,
+        "metadataSource": source,
+        "modelFamily": family,
+        "origin": "legacy",
+    }
+    if model:
+        record["model"] = model
+    for key in ("tags", "negative", "params", "model", "hasWorkflow", "promptSource"):
+        value = shaped.get(key)
+        if value:
+            record.setdefault(key, value)
+    return record
+
+
+def reshape(state) -> int:
+    """Rebuild the records from the metadata already stored, without touching the files.
+
+    The prompt shapers get refined - which node holds a ComfyUI prompt is a
+    convention that keeps turning out to have another variant. Re-reading 11 GB
+    off disk and re-uploading it to answer that would be absurd when the parsed
+    metadata is sitting in this database, so re-derive from there. The server
+    side has the same escape hatch in ``archive_to_r2.py --reindex``.
+    """
+    rows = state.execute("SELECT path, sha256, record, metadata FROM scanned").fetchall()
+    changed = 0
+    for path, sha, record_json, metadata_json in rows:
+        old = json.loads(record_json)
+        stored = json.loads(metadata_json) if metadata_json else {}
+        fields = stored.get("metadata") or {}
+        category = old["category"]
+        model, family = model_index.extract(
+            json.dumps(fields, ensure_ascii=False), category
+        )
+        new = build_record(
+            sha=sha, day=old["path"][1], category=category,
+            source=old["metadataSource"], fields=fields, model=model, family=family,
+            ext=old["ext"], width=old["width"], height=old["height"],
+            size=old["size"], sent_at=old.get("sentAt"),
+        )
+        if new != old:
+            state.execute("UPDATE scanned SET record = ? WHERE path = ?",
+                          (json.dumps(new, ensure_ascii=False), path))
+            changed += 1
+    state.commit()
+    log(f"reshape: {changed} of {len(rows)} records changed")
+    return changed
+
+
 def scan(state, root: Path, workers: int) -> int:
     """Hash and re-parse every file. The slow half; resumable and idempotent."""
     files = sorted(p for p in root.rglob("*") if p.is_file())
@@ -149,27 +210,12 @@ def scan(state, root: Path, workers: int) -> int:
             blob = json.dumps(fields, ensure_ascii=False)
             model, family = model_index.extract(blob, category)
 
-            shaped = archive.SHAPERS.get(result.source, lambda _f: {})(fields)
-            record = {
-                "id": sha,
-                "title": archive.title_for(shaped.get("tags"), shaped.get("model") or model, day),
-                "path": [category, day],
-                "ext": extension_for_format(result.image_format),
-                "width": result.width,
-                "height": result.height,
-                "size": path.stat().st_size,
-                "sentAt": named.get("sentAt"),
-                "category": category,
-                "metadataSource": result.source,
-                "modelFamily": family,
-                "origin": "legacy",
-            }
-            if model:
-                record["model"] = model
-            for key in ("tags", "negative", "params", "model", "hasWorkflow", "promptSource"):
-                value = shaped.get(key)
-                if value:
-                    record.setdefault(key, value)
+            record = build_record(
+                sha=sha, day=day, category=category, source=result.source, fields=fields,
+                model=model, family=family, ext=extension_for_format(result.image_format),
+                width=result.width, height=result.height, size=path.stat().st_size,
+                sent_at=named.get("sentAt"),
+            )
 
             private = {
                 "sha256": sha, "file": path.name,
@@ -293,8 +339,9 @@ def write_indexes(state, client) -> list[dict]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--root", type=Path, required=True,
-                        help="the final/ directory of the pre-server collection")
+    parser.add_argument("--root", type=Path,
+                        help="the final/ directory of the pre-server collection "
+                             "(not needed with --reindex)")
     parser.add_argument("--config", type=Path, required=True, help="R2 credentials, JSON")
     parser.add_argument("--bucket", help="override the bucket in --config; pass this when "
                                          "reusing a credentials file written for another bucket")
@@ -303,16 +350,27 @@ def main() -> int:
                         help="day summary to merge into the server's archive state")
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--scan-only", action="store_true")
+    parser.add_argument("--reindex", action="store_true",
+                        help="re-derive the records from the metadata already scanned and "
+                             "rewrite the day indexes; does not read files or re-upload images")
     args = parser.parse_args()
 
-    if not args.root.is_dir():
-        raise SystemExit(f"not a directory: {args.root}")
+    if not args.reindex and not (args.root and args.root.is_dir()):
+        raise SystemExit(f"--root must be a directory (got {args.root})")
     cfg = json.loads(args.config.read_text(encoding="utf-8"))
     if args.bucket:
         cfg["bucket"] = args.bucket
     cfg.setdefault("bucket", archive.DEFAULT_BUCKET)
     log(f"bucket: {cfg['bucket']}")
     state = open_state(args.state)
+
+    if args.reindex:
+        reshape(state)
+        client = archive.R2Client(cfg)
+        summary = write_indexes(state, client)
+        args.out.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+        log(f"wrote {args.out}: {len(summary)} days")
+        return 0
 
     scan(state, args.root, args.workers)
     if args.scan_only:
