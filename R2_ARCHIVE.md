@@ -45,6 +45,14 @@ originals/<sha256[0:2]>/<sha256><ext>
 `private/` 不该被任何公开路由映射出去。把它和公开数据放在不同前缀，是为了让
 "别把群号发出去"成为结构上的事实，而不是一条需要记住的规矩。
 
+> **这个桶不要开公开访问。** 不要给 `qqai-image-archive` 开 r2.dev 公开 URL，
+> 也不要直接绑自定义域——两者都会让整个桶可读，而 `private/days/2026-08-21.json`
+> 这种键是猜得出来的，等于把群号和 QQ 号挂到公网上。
+>
+> 展示端要读图，正确做法是走 Worker 绑定这个桶，并且**按前缀白名单**放行：
+> 只放 `originals/`、`meta/`、`data/`。站内 `ATLAS_DATA_BUCKET` 就是这个模式。
+> 如果哪天真的需要整桶公开，先把 `private/` 挪到另一个桶再说。
+
 JSON 都带 `Content-Encoding: gzip`（图片不压——PNG/WebP 已压过，收益 0-2%）。
 浏览器 `fetch` 透明解压；`curl` 要加 `--compressed`。
 
@@ -175,12 +183,41 @@ qqai-set-r2 test         # 连一次，确认读写都通
 
 ---
 
-## 5. 还没做的
+## 5. 服务器之前的那批（`origin: "legacy"`）
+
+Windows 时代收的 5,090 张（11.2 GB，2026-06-08 ~ 07-24）不在数据库里——
+`assets` / `images` 两张表都没有对应行，所以 IMAGE_LIBRARY_SPEC.md 里那些
+SQL 查不到它们，元数据只能从文件里重新读。
+
+`linux/ops/archive_legacy_to_r2.py` 在**存着这些文件的那台 Windows 机器上**跑，
+它 import `archive_to_r2.py` 拿上传、键布局和记录格式，只有"字段从哪来"是自己的：
+
+```bash
+python linux/ops/archive_legacy_to_r2.py \n    --root "D:/program/群聊图片获取/final" \n    --config r2_archive_config.json --bucket qqai-image-archive \n    --state legacy_archive.sqlite3
+```
+
+传完会写一份 `legacy_days.json`，拿到服务器上合进索引：
+
+```bash
+scp legacy_days.json <server>:/tmp/
+ssh <server> 'python3 .../archive_to_r2.py --merge-days /tmp/legacy_days.json'
+```
+
+两批共用 `originals/` 空间——内容寻址让两边都有的图落在同一个键上，只存一份，
+所以那 474 张"服务器已有同 sha256"的不用特殊处理。索引分开，因为
+**数据库状态不同**：`origin: "server"` 的能用 SQL 查出来源，`origin: "legacy"`
+的查不到。消费端要能区分这一点。
+
+`_rejected/`（243 张，确认无价值）和 `_prompt_only/`（91 张，见下）不传。
+
+## 6. 还没做的
 
 - **缩略图。** 原图平均 2.3 MB，19,000 张的列表页不能直接加载原图。键位留了
   `thumbs/<sha[0:2]>/<sha>.webp`，但服务器是 2 核 2 GB 且没装 Pillow，在上面
   批量生成会和采集抢 CPU、触发心跳告警。R2 出口免费，更合适的做法是从 R2
   拉下来在别的机器上生成，或者交给 Cloudflare Images 按需缩放。
 - **展示端。** 数据格式是照着站内法典的词条格式设计的，前端还没有。
+- **本地那批的删除。** 脚本不删任何本地文件。磁盘压力在服务器上，不在这台
+  Windows 机器上，所以什么时候删是另一个决定。
 - **`_prompt_only` 那 91 张。** 有实质提示词但缺 Steps / Sampler / CFG，按当前
   契约不算"可复现的生成参数"，所以既没进 `final/` 也没上传。等决定。
