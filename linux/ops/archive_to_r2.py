@@ -31,7 +31,6 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import datetime as dt
-import fcntl
 import gzip
 import hashlib
 import hmac
@@ -842,6 +841,32 @@ def purge_day(client, state, conn, day, args) -> int:
 # --------------------------------------------------------------------------
 
 
+def merge_days(state, path: Path) -> int:
+    """Record days that were uploaded from somewhere else.
+
+    The pre-server Windows collection has no rows in ``assets``, so this host
+    cannot derive those days itself; ``archive_legacy_to_r2.py`` uploads them
+    and hands over a summary. Merging it here is what makes them appear in
+    ``data/index.json`` alongside the server's own days.
+    """
+    rows = json.loads(path.read_text(encoding="utf-8"))
+    for row in rows:
+        state.execute(
+            "INSERT OR REPLACE INTO days (day, origin, asset_count, bytes, indexed_at, "
+            "categories, families, purged_at, purged_bytes) VALUES (?,?,?,?,?,?,?,"
+            "(SELECT purged_at FROM days WHERE day=? AND origin=?),"
+            "(SELECT purged_bytes FROM days WHERE day=? AND origin=?))",
+            (row["day"], row.get("origin", "legacy"), row["asset_count"], row["bytes"],
+             int(time.time()),
+             json.dumps(row.get("categories", {}), ensure_ascii=False),
+             json.dumps(row.get("families", {}), ensure_ascii=False),
+             row["day"], row.get("origin", "legacy"), row["day"], row.get("origin", "legacy")),
+        )
+    state.commit()
+    log(f"merged {len(rows)} days from {path}")
+    return len(rows)
+
+
 def write_root_index(client, state, conn) -> None:
     """Roll the day indexes up. Counts describe the archive, not the library.
 
@@ -863,7 +888,10 @@ def write_root_index(client, state, conn) -> None:
         for target, blob in ((categories, day_categories), (families, day_families)):
             for name, value in (json.loads(blob) if blob else {}).items():
                 target[name] = target.get(name, 0) + value
-    remaining = conn.execute("SELECT count(*) FROM assets").fetchone()[0] - total_count
+    archived_here = state.execute(
+        "SELECT coalesce(sum(asset_count), 0) FROM days WHERE origin = 'server'"
+    ).fetchone()[0]
+    remaining = conn.execute("SELECT count(*) FROM assets").fetchone()[0] - archived_here
 
     index = {
         "id": "qqai-archive",
@@ -902,6 +930,8 @@ def load_config(path: Path) -> dict:
 
 def acquire_lock() -> object:
     """cron can fire again while the previous run is still uploading."""
+    import fcntl  # POSIX only; the legacy uploader imports this module on Windows.
+
     LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
     handle = LOCK_PATH.open("w")
     try:
@@ -955,6 +985,9 @@ def main() -> int:
     parser.add_argument("--purge", action="store_true",
                         help="delete local files for verified days older than --keep-days")
     parser.add_argument("--index", action="store_true", help="rewrite data/index.json")
+    parser.add_argument("--merge-days", type=Path,
+                        help="merge a day summary produced by archive_legacy_to_r2.py, so days "
+                             "uploaded from another machine appear in data/index.json")
     parser.add_argument("--reindex", action="store_true",
                         help="rewrite the day indexes from the database without re-uploading "
                              "images (use after changing how records are shaped)")
@@ -985,11 +1018,14 @@ def main() -> int:
         print_status(state, conn)
         return 0
 
-    if not (args.upload or args.purge or args.index or args.reindex):
-        parser.error("nothing to do: pass --upload, --purge, --reindex, --index or --status")
+    if not (args.upload or args.purge or args.index or args.reindex or args.merge_days):
+        parser.error("nothing to do: pass --upload, --purge, --reindex, --index, "
+                     "--merge-days or --status")
 
     lock = acquire_lock()  # noqa: F841 - held for the lifetime of the process
     client = R2Client(cfg)
+    if args.merge_days:
+        merge_days(state, args.merge_days)
     budget = Budget(args.max_seconds, args.max_bytes)
     days = args.day or all_days(conn)
 
@@ -1012,7 +1048,7 @@ def main() -> int:
             freed += purge_day(client, state, conn, day, args)
         log(f"purge: {'would free' if args.dry_run else 'freed'} {freed / 1073741824:.1f} GB")
 
-    if args.index or args.upload or args.reindex:
+    if args.index or args.upload or args.reindex or args.merge_days:
         write_root_index(client, state, conn)
 
     return 0
