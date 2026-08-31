@@ -343,39 +343,149 @@ def _a1111_fields(fields: dict) -> dict:
     return out
 
 
-def _from_node_graph(graph) -> dict | None:
-    """Pull the prompt out of a node graph by reading the CLIP text encoders.
+TEXT_KEYS = ("text", "string", "value", "prompt", "positive", "string_1", "text_positive")
+NEG_KEY = re.compile(r"negative|\buc\b", re.I)
+WIDGET_NOISE = re.compile(r"^(true|false|enable|disable|none|\d+(\.\d+)?)$", re.I)
+STRING_INPUT = re.compile(r"^(string|text)_?\d*$", re.I)
 
-    Which node holds the prompt is a convention, not a rule, so this is a guess
-    and says so. The full graph is in the ``meta/`` object either way.
+# Where a graph does not label which encoder is which, the text says so itself:
+# these terms belong to negative prompts and turn up in positives essentially
+# never. Two distinct ones is not a coincidence.
+NEGATIVE_MARKERS = re.compile(
+    r"worst quality|low quality|normal quality|lowres|bad anatomy|bad hands|"
+    r"missing fingers|extra digits?|fewer digits|jpeg artifacts|watermark|username|"
+    r"signature|artist name|poorly drawn|bad proportions|extra limbs|mutated|"
+    r"deformed|disfigured|artistic error|scan artifacts|very displeasing|"
+    r"score_[1-4]|blank page|negative space|multiple views",
+    re.I,
+)
+
+
+def _looks_negative(text: str) -> bool:
+    return len({m.group(0).lower() for m in NEGATIVE_MARKERS.finditer(text)}) >= 2
+
+
+def _widget_text(value, nodes, depth=0) -> str | None:
+    """A literal widget value, or a ``[node_id, slot]`` link that has to be followed.
+
+    ComfyUI inputs are either the value or a wire to whatever produces it, so a
+    prompt typed into a ``CR Text`` node and wired into the encoder reads as a
+    two-element list here, not a string. Following the wire is most of the
+    difference between a prompt and a blank.
+    """
+    if isinstance(value, str):
+        text = value.strip()
+        return text if text and not WIDGET_NOISE.match(text) else None
+    if depth < 4 and isinstance(value, list) and value and isinstance(value[0], (str, int)):
+        node = nodes.get(str(value[0]))
+        if isinstance(node, dict):
+            inputs = node.get("inputs") or {}
+            for key in TEXT_KEYS:
+                found = _widget_text(inputs.get(key), nodes, depth + 1)
+                if found:
+                    return found
+            # JoinStringMulti and friends: several numbered string inputs.
+            parts = [_widget_text(v, nodes, depth + 1)
+                     for k, v in inputs.items() if STRING_INPUT.match(str(k))]
+            parts = [p for p in parts if p]
+            if parts:
+                return ", ".join(parts)
+    return None
+
+
+def _sort_prompt(text: str, labelled_negative: bool, positive: list, negative: list) -> None:
+    if labelled_negative or _looks_negative(text):
+        negative.append(text)
+    else:
+        positive.append(text)
+
+
+def _from_node_graph(graph, workflow=None) -> dict | None:
+    """Recover the prompt from a node graph. Every step of this is a guess.
+
+    Which node holds the prompt is a convention rather than a rule, and the
+    conventions differ per UI pack, so this tries three of them in order of how
+    much it can trust the answer: the standard encoders, then any node carrying
+    a long string under a prompt-ish key, then the saved UI workflow for images
+    that have no API graph at all. Whatever it returns is labelled a guess, and
+    the untouched graph is in the ``meta/`` object regardless.
     """
     if isinstance(graph, str):
         graph = _loads(graph)
-    if not isinstance(graph, dict) or not graph:
-        return None
     positive, negative = [], []
-    for node in graph.values():
-        if not isinstance(node, dict):
-            continue
-        if "CLIPTextEncode" not in str(node.get("class_type", "")):
-            continue
-        text = node.get("inputs", {}).get("text")
-        if not isinstance(text, str) or not text.strip():
-            continue
-        title = str(node.get("_meta", {}).get("title", "")).lower()
-        (negative if "negative" in title else positive).append(text.strip())
+
+    if isinstance(graph, dict) and graph:
+        for node in graph.values():
+            if not isinstance(node, dict):
+                continue
+            if "CLIPTextEncode" not in str(node.get("class_type", "")):
+                continue
+            text = _widget_text((node.get("inputs") or {}).get("text"), graph)
+            if text:
+                title = str((node.get("_meta") or {}).get("title", ""))
+                _sort_prompt(text, bool(NEG_KEY.search(title)), positive, negative)
+
+        if not (positive or negative):
+            # No standard encoder, or none resolved: some packs keep the prompt
+            # on a node of their own (WeiLinPromptUI, StringConstantMultiline).
+            for node in graph.values():
+                if not isinstance(node, dict):
+                    continue
+                for key, value in (node.get("inputs") or {}).items():
+                    if not isinstance(value, str):
+                        continue
+                    text = value.strip()
+                    if len(text) < 12 or WIDGET_NOISE.match(text):
+                        continue
+                    if NEG_KEY.search(str(key)) or _looks_negative(text):
+                        negative.append(text)
+                    elif str(key).lower() in TEXT_KEYS:
+                        positive.append(text)
+
+    if not (positive or negative):
+        # Only the UI workflow was saved. Its nodes keep widget values in a
+        # positional list, so there are no key names to go by - only the node
+        # type, its title, and what the text looks like.
+        if isinstance(workflow, str):
+            workflow = _loads(workflow)
+        if isinstance(workflow, dict):
+            for node in workflow.get("nodes") or []:
+                if not isinstance(node, dict):
+                    continue
+                kind = str(node.get("type", ""))
+                if not any(k in kind for k in ("CLIPTextEncode", "Text", "Prompt")):
+                    continue
+                title = str(node.get("title") or "")
+                labelled = bool(NEG_KEY.search(title) or NEG_KEY.search(kind))
+                for value in node.get("widgets_values") or []:
+                    if not isinstance(value, str):
+                        continue
+                    text = value.strip()
+                    if len(text) < 12 or WIDGET_NOISE.match(text):
+                        continue
+                    _sort_prompt(text, labelled, positive, negative)
+
     if not (positive or negative):
         return None
+
+    def join(parts):
+        seen, ordered = set(), []
+        for part in parts:
+            if part not in seen:
+                seen.add(part)
+                ordered.append(part)
+        return "\n".join(ordered) or None
+
     return {
-        "tags": _clean("\n".join(positive)),
-        "negative": _clean("\n".join(negative)),
+        "tags": _clean(join(positive)),
+        "negative": _clean(join(negative)),
         "promptSource": "node-graph-heuristic",
     }
 
 
 def _comfyui_fields(fields: dict) -> dict:
     out = {"hasWorkflow": True}
-    out.update(_from_node_graph(fields.get("prompt")) or {})
+    out.update(_from_node_graph(fields.get("prompt"), fields.get("workflow")) or {})
     return out
 
 
@@ -387,7 +497,7 @@ def _unknown_fields(fields: dict) -> dict:
     "prompt" that is really JSON, and a title made of ``{"10002": {...``.
     """
     prompt = fields.get("prompt")
-    from_graph = _from_node_graph(prompt)
+    from_graph = _from_node_graph(prompt, fields.get("workflow"))
     if from_graph:
         return {**from_graph, "hasWorkflow": True}
     if isinstance(prompt, dict):

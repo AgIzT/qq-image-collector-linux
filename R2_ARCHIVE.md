@@ -162,8 +162,23 @@ qqai-set-r2 test         # 连一次，确认读写都通
 |---|---|
 | `novelai`、`novelai-unreadable` | `Description` 是正向；`Comment` 是**字符串形式的 JSON**，再 `json.loads` 一次才拿到 `uc`（负向）和采样参数。少数记录走 EXIF 通道，顶层是 `UserComment` |
 | `a1111-compatible` | `parameters` 是 A1111 那种纯文本：正向 → `Negative prompt:` → `Steps: ...` 键值尾巴 |
-| `comfyui` | 没有提示词字段。从节点图里 `CLIPTextEncode` 的 `inputs.text` 猜，猜出来的标 `promptSource: "node-graph-heuristic"` |
+| `comfyui` | 没有提示词字段，只能从节点图里猜，见下。猜出来的标 `promptSource: "node-graph-heuristic"` |
 | `unknown-generator` | 多半是 ComfyUI 的分支，`prompt` 常常是序列化的节点图而非文本，同上处理。认不出结构就宁可留空，也不把一坨 JSON 当提示词 |
+
+ComfyUI 那条按可信度依次试三种：
+
+1. `CLIPTextEncode` 节点的 `inputs.text`。**注意 ComfyUI 的 input 要么是值本身，
+   要么是一根连到上游节点的线**——提示词打在 `CR Text` 里再连进编码器时，
+   `inputs.text` 是 `[节点号, 槽位]` 而不是字符串，得顺着线找过去。不顺线的话
+   一半的 ComfyUI 图会显示成"没有提示词"。
+2. 没有标准编码器时，找任何挂着长字符串、键名像提示词的节点
+   （`WeiLinPromptUI.positive`、`StringConstantMultiline.string` 之类）。
+3. 只存了 UI `workflow` 没存 API `prompt` 的，从 `widgets_values` 里捞。
+
+**正负怎么分**：节点标题里有 negative/uc 就按标题；标题认不出来就看文本本身——
+`worst quality`、`lowres`、`bad anatomy`、`score_1..4` 这类词在正向提示词里
+基本不出现，命中两个及以上就判为负向。不这么做的话，未标注的图会把正负两段
+拼成一条 `tags`，比留空更糟——用户复制走的提示词里混着负向词。
 
 **写消费端时不要假设某个键一定存在。** `tags`、`negative`、`params`、`model`
 都可能缺；ComfyUI 的图经常只有 `hasWorkflow: true`。
