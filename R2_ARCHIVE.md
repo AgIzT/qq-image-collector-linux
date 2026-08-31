@@ -50,8 +50,14 @@ originals/<sha256[0:2]>/<sha256><ext>
 > 这种键是猜得出来的，等于把群号和 QQ 号挂到公网上。
 >
 > 展示端要读图，正确做法是走 Worker 绑定这个桶，并且**按前缀白名单**放行：
-> 只放 `originals/`、`meta/`、`data/`。站内 `ATLAS_DATA_BUCKET` 就是这个模式。
+> 只放 `originals/`、`meta/`、`data/`。站内已经有现成的两个例子——
+> `functions/r2/[[key]].js` 用一行 `key.startsWith('community/img/')` 挡掉
+> 其余的键，`functions/data/[[path]].js` 则连路径段都逐个校验。照那个写。
 > 如果哪天真的需要整桶公开，先把 `private/` 挪到另一个桶再说。
+
+站内的数据是"发布快照"式的（`data/current.json` 指向 `data/releases/r-<hash>/`），
+归档不用那一套：日索引是追加的，写完就不再改，所以 `data/index.json` 直接就是
+当前状态。别照搬 release 指针。
 
 JSON 都带 `Content-Encoding: gzip`（图片不压——PNG/WebP 已压过，收益 0-2%）。
 浏览器 `fetch` 透明解压；`curl` 要加 `--compressed`。
