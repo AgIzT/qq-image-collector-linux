@@ -44,12 +44,17 @@ DEFAULTS: dict[str, Any] = {
     # A heartbeat is written every ten seconds, so a minute of silence is
     # already far outside normal.
     "heartbeat_max_age_seconds": 180,
-    # Quiet groups genuinely go quiet at night, so silence alone is not a
-    # fault.  This only fires alongside a hard signal (QQ gone, stream
-    # disconnected) or once it passes the point where every group being quiet
-    # stops being plausible.
+    # Silence on the socket means the transport itself died.  NapCat sends an
+    # OneBot heartbeat every 30s whether or not the account is signed in, so
+    # this threshold is about the connection, never about whether data flows.
     "no_event_warn_seconds": 3600,
     "no_event_critical_seconds": 10800,
+    # Group traffic is the thing the collector exists to receive.  Over the 601
+    # hours before the 2026-09-14 outage the quietest hour still carried two
+    # group messages and no hour carried none, so an hour of true silence is
+    # already outside anything this account has ever done.
+    "no_message_warn_seconds": 3600,
+    "no_message_critical_seconds": 10800,
     "disk_warn_percent": 85,
     "disk_critical_percent": 93,
     # Repeat interval while a problem persists, chosen by severity.  One
@@ -214,30 +219,59 @@ def check_heartbeats(connection: sqlite3.Connection, config: dict[str, Any]) -> 
     return findings
 
 
-def check_intake(connection: sqlite3.Connection, config: dict[str, Any]) -> Finding:
-    """Are messages still arriving?
+def check_intake(connection: sqlite3.Connection, config: dict[str, Any]) -> list[Finding]:
+    """Is group traffic still arriving?
 
-    Every service can report healthy while nothing flows, which is what a dead
-    QQ looks like from the collector's side, and what a full disk looks like
-    once downloads start deferring.  This is the only check that measures the
-    thing the system exists to do.
+    This used to watch `last_event_at` and call it "no group messages".  It is
+    not: the collector stamps that field on every frame the WebSocket delivers,
+    and NapCat keeps sending an OneBot heartbeat every 30 seconds while the QQ
+    account is signed out.  On 2026-09-14 the account dropped at about 12:40 and
+    the counters recorded exactly 120 events an hour - heartbeat and nothing
+    else - with zero group messages for three days, while every check here,
+    including this one, reported healthy.
+
+    So the two are measured apart now: one finding for the socket being alive,
+    and one for messages actually coming down it.
     """
 
     now = int(time.time())
+    findings: list[Finding] = []
+
     stream = _runtime_state(connection, "event_stream")
     last_event = int(stream.get("last_event_at") or 0)
     if last_event <= 0:
-        return Finding("intake", WARN, "尚未收到过任何事件")
-    age = now - last_event
-    if age >= int(config["no_event_critical_seconds"]):
-        return Finding(
-            "intake",
+        findings.append(Finding("stream", WARN, "事件流尚未收到过任何帧"))
+    else:
+        age = now - last_event
+        if age >= int(config["no_event_critical_seconds"]):
+            findings.append(Finding("stream", CRITICAL, f"已经 {age // 60} 分钟连心跳都没有，事件流已断"))
+        elif age >= int(config["no_event_warn_seconds"]):
+            findings.append(Finding("stream", WARN, f"{age // 60} 分钟没有任何帧（含心跳）"))
+        else:
+            findings.append(Finding("stream", OK, f"事件流 {age} 秒前还在收帧（含心跳）"))
+
+    row = connection.execute(
+        "SELECT MAX(bucket_start) FROM hourly_counters WHERE group_messages > 0"
+    ).fetchone()
+    last_bucket = int(row[0]) if row and row[0] else 0
+    if last_bucket <= 0:
+        findings.append(Finding("messages", WARN, "从未统计到群消息"))
+        return findings
+
+    # Counters are hourly buckets; the newest one with traffic may still be
+    # filling, so silence is measured from the end of that hour.
+    quiet = now - (last_bucket + 3600)
+    if quiet >= int(config["no_message_critical_seconds"]):
+        findings.append(Finding(
+            "messages",
             CRITICAL,
-            f"已经 {age // 60} 分钟没有收到任何群消息事件",
-        )
-    if age >= int(config["no_event_warn_seconds"]):
-        return Finding("intake", WARN, f"{age // 60} 分钟没有新事件")
-    return Finding("intake", OK, f"最后一条事件在 {age} 秒前")
+            f"已经 {quiet // 3600} 小时没有任何群消息，心跳却正常——多半是 QQ 账号掉线",
+        ))
+    elif quiet >= int(config["no_message_warn_seconds"]):
+        findings.append(Finding("messages", WARN, f"{quiet // 60} 分钟没有群消息"))
+    else:
+        findings.append(Finding("messages", OK, "群消息仍在进来"))
+    return findings
 
 
 def check_disks(config: dict[str, Any]) -> list[Finding]:
@@ -384,7 +418,7 @@ def run_checks(config: dict[str, Any]) -> list[Finding]:
         try:
             connection.execute("PRAGMA busy_timeout=15000")
             findings.extend(check_heartbeats(connection, config))
-            findings.append(check_intake(connection, config))
+            findings.extend(check_intake(connection, config))
             findings.extend(check_policy_alarms(connection))
         finally:
             connection.close()
@@ -415,10 +449,11 @@ def main() -> int:
 
     recovery = maybe_restart_napcat(config, state, findings, dry_run=args.dry_run)
 
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
     for finding in findings:
-        print(f"[{finding.level:8}] {finding.key}: {finding.message}")
+        print(f"{stamp} [{finding.level:8}] {finding.key}: {finding.message}")
     if recovery:
-        print(f"[recovery] {recovery}")
+        print(f"{stamp} [recovery] {recovery}")
 
     now = int(time.time())
     signature = "|".join(f"{f.key}:{f.level}" for f in problems)
