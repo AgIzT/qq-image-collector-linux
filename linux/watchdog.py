@@ -57,13 +57,18 @@ DEFAULTS: dict[str, Any] = {
     "no_message_critical_seconds": 10800,
     "disk_warn_percent": 85,
     "disk_critical_percent": 93,
-    # Repeat interval while a problem persists, chosen by severity.  One
-    # interval for both meant a slow, known condition - a disk filling over
-    # days - pushed as often as a dead QQ, and an alert that repeats hourly
-    # about something the operator has already decided to handle on Thursday
-    # is how people learn to swipe the channel away.
-    "notify_cooldown_seconds": 3600,
-    "warn_cooldown_seconds": 43200,
+    # Repeat interval while a problem persists.  A first push always goes out
+    # on the spot; this only governs the nagging afterwards, and its real job is
+    # covering a push that never arrived.  Four days of silence in September
+    # were not caused by these intervals, but twelve hours between reminders was
+    # far too long to be the backstop for a dropped notification.
+    "notify_cooldown_seconds": 1800,
+    "warn_cooldown_seconds": 14400,
+    # A disk filling over days is the one thing an operator legitimately parks
+    # until the weekend, and it was explicitly asked to stop shouting hourly.
+    # Everything else gets the interval above.
+    "quiet_check_prefixes": ["disk_"],
+    "quiet_cooldown_seconds": 43200,
     "recovery_cooldown_seconds": 3600,
     # Restarting NapCat re-launches QQ.  Off by default: turning it on is a
     # decision about whether an unattended restart is preferable to waiting for
@@ -458,11 +463,17 @@ def main() -> int:
     now = int(time.time())
     signature = "|".join(f"{f.key}:{f.level}" for f in problems)
     changed = signature != str(state.get("last_signature") or "")
-    cooldown = int(
-        config["notify_cooldown_seconds"]
-        if worst == RANK[CRITICAL]
-        else config.get("warn_cooldown_seconds", config["notify_cooldown_seconds"])
-    )
+    def repeat_interval(finding: Finding) -> int:
+        quiet = tuple(config.get("quiet_check_prefixes") or ())
+        if finding.level != CRITICAL and finding.key.startswith(quiet):
+            return int(config.get("quiet_cooldown_seconds", config["warn_cooldown_seconds"]))
+        if finding.level == CRITICAL:
+            return int(config["notify_cooldown_seconds"])
+        return int(config.get("warn_cooldown_seconds", config["notify_cooldown_seconds"]))
+
+    # The most urgent problem sets the pace, so a parked disk warning cannot
+    # slow down the reminder about a dead collector sitting next to it.
+    cooldown = min((repeat_interval(f) for f in problems), default=int(config["notify_cooldown_seconds"]))
     # `changed` still bypasses this, so a warn escalating to critical pushes at
     # once rather than waiting out the gentler interval it was throttled by.
     cooled = now - int(state.get("last_notified_at") or 0) >= cooldown
