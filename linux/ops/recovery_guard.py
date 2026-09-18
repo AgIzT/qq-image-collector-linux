@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+"""Keep a bounded history-window recovery running until it actually finishes.
+
+The recovery for the 2026-09-14 outage is a ~70 hour job at 60 history calls an
+hour, run detached inside the collector container.  It is resumable - every page
+anchor lives in window_recovery_jobs - but nothing restarts it, and a container
+restart or an unhandled error would leave it stopped with no sign.  That is the
+same shape of failure as the outage it is recovering from: quiet, and only
+visible if somebody happens to look.
+
+So this checks every few minutes and restarts it, unless the run has reached a
+state where restarting is wrong:
+
+  finished       the window is fully paged; nothing to do
+  failed_policy  a safety check refused the run, and repeating the same command
+                 would just refuse again, loudly, forever
+
+Restarts are logged and capped.  A run that keeps dying is a fault to look at,
+not something to relaunch several hundred times.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shlex
+import sqlite3
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+DB = os.environ.get("QQAI_DATABASE", "/var/lib/qqai-state/collector_state.sqlite3")
+STATE = Path(os.environ.get("QQAI_RECOVERY_GUARD_STATE", "/var/lib/qqai-recovery-guard.json"))
+CONTAINER = os.environ.get("QQAI_COLLECTOR_CONTAINER", "qqai-collector-console")
+LOG = "/data/qq-image-collector/window-recovery-0918.log"
+MAX_RESTARTS = 40
+TERMINAL_PHASES = {"finished", "failed_policy"}
+
+WINDOW = (
+    int(os.environ.get("QQAI_RECOVERY_NOT_BEFORE", "1789361700")),
+    int(os.environ.get("QQAI_RECOVERY_NOT_AFTER", "1789743600")),
+)
+
+COMMAND = (
+    "python3 -m qq_image_collector.window_recovery"
+    " --config /data/qq-image-collector/config/collector_config.json"
+    f" --not-before {WINDOW[0]} --not-after {WINDOW[1]}"
+    " --expected-groups 15 --page-size 20"
+    " --hourly-limit 60 --daily-limit 1440"
+    " --max-calls-per-group 1500"
+    " --window-override"
+    f" >> {LOG} 2>&1"
+)
+
+
+def say(message: str) -> None:
+    print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}", flush=True)
+
+
+def read_state() -> dict:
+    try:
+        return json.loads(STATE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def write_state(state: dict) -> None:
+    temporary = STATE.with_suffix(".tmp")
+    temporary.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+    temporary.replace(STATE)
+
+
+def recovery_phase() -> tuple[str, dict]:
+    connection = sqlite3.connect(f"file:{DB}?mode=ro", uri=True, timeout=20)
+    try:
+        row = connection.execute(
+            "SELECT value_json FROM runtime_state WHERE key='window_recovery'"
+        ).fetchone()
+    finally:
+        connection.close()
+    if not row:
+        return "unknown", {}
+    try:
+        value = json.loads(str(row[0]))
+    except ValueError:
+        return "unknown", {}
+    if not isinstance(value, dict):
+        return "unknown", {}
+    # State published for some other window says nothing about this one.
+    if int(value.get("not_before") or 0) != WINDOW[0]:
+        return "other_window", value
+    return str(value.get("phase") or "unknown"), value
+
+
+def running() -> bool:
+    result = subprocess.run(
+        ["ps", "-eo", "args"], capture_output=True, text=True, check=False
+    )
+    return any(
+        "qq_image_collector.window_recovery" in line and f"--not-before {WINDOW[0]}" in line
+        for line in result.stdout.splitlines()
+    )
+
+
+def main() -> int:
+    phase, value = recovery_phase()
+    if phase in TERMINAL_PHASES:
+        say(f"recovery {phase}; nothing to restart")
+        return 0
+    if phase == "other_window":
+        say("runtime state belongs to a different window; leaving it alone")
+        return 0
+    if running():
+        return 0
+
+    state = read_state()
+    restarts = int(state.get("restarts") or 0)
+    if restarts >= MAX_RESTARTS:
+        say(f"refusing to restart again after {restarts} attempts; investigate the log")
+        return 1
+
+    command = ["docker", "exec", "-d", CONTAINER, "sh", "-lc", COMMAND]
+    result = subprocess.run(command, capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        say(f"restart failed: {result.stderr.strip()[:200]}")
+        return 1
+    state["restarts"] = restarts + 1
+    state["last_restart_at"] = int(time.time())
+    state["last_phase"] = phase
+    state["calls"] = value.get("history_calls")
+    state["images_enqueued"] = value.get("images_enqueued")
+    write_state(state)
+    say(
+        f"restarted recovery (attempt {restarts + 1}); was phase={phase} "
+        f"calls={value.get('history_calls')} enqueued={value.get('images_enqueued')}"
+    )
+    say(f"command: {shlex.join(command[:4])} ...")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
