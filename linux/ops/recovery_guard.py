@@ -42,13 +42,23 @@ WINDOW = (
     int(os.environ.get("QQAI_RECOVERY_NOT_AFTER", "1789743600")),
 )
 
+# The per-group ceiling stops one group whose paging never converges from
+# spending the whole budget.  It counts every call ever made for the group in
+# this window, so it has to cover what was already spent as well.  1500 was
+# set for the first run from an estimate that left the biggest group almost no
+# margin, and hitting it was silent; replays burned it on 519382846 and
+# 726877770.  For the 2026-09-26 re-run of 519382846: 1,500 already spent, and
+# its window is ~15,900 messages, about 840 pages from the top anchor, so 3000
+# leaves ~1.8x.  A group that reaches it now shows up in the watchdog.
+MAX_CALLS_PER_GROUP = 3000
+
 COMMAND = (
     "python3 -m qq_image_collector.window_recovery"
     " --config /data/qq-image-collector/config/collector_config.json"
     f" --not-before {WINDOW[0]} --not-after {WINDOW[1]}"
     " --expected-groups 15 --page-size 20"
     " --hourly-limit 60 --daily-limit 1440"
-    " --max-calls-per-group 1500"
+    f" --max-calls-per-group {MAX_CALLS_PER_GROUP}"
     " --window-override"
     f" >> {LOG} 2>&1"
 )
