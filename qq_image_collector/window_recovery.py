@@ -49,6 +49,9 @@ from .onebot import OneBotClient, OneBotError
 NONTERMINAL_STATUSES = ("probe", "queued", "deferred")
 CURRENT_UPPER = "current-upper"
 LATEST_BOOTSTRAP = "latest-bootstrap"
+# Consecutive failed calls on one short anchor before it is treated as expired
+# and the job replays from its durable raw anchor.
+SHORT_ANCHOR_RETRIES = 3
 TERMINAL_STATUSES = (
     "completed",
     "partial_source_exhausted",
@@ -629,8 +632,33 @@ class WindowRecoveryRunner:
         now = int(time.time())
         retries = int(job["retry_count"] or 0) + 1
         short_anchor = str(job["next_anchor_id"]) != str(job["start_anchor_id"])
-        if short_anchor:
-            # A NapCat restart invalidates the in-memory short-ID map.  Reset
+        if short_anchor and retries <= SHORT_ANCHOR_RETRIES:
+            # One failed call says nothing about the short-ID map.  In the
+            # September recovery 16 of 5,091 calls failed while NapCat never
+            # restarted, and every one of them sent its group back to the top
+            # of the window: the two busiest groups spent their whole call
+            # budget re-reading the same two days and never reached 9/14-9/16.
+            # Retrying the same anchor is safe - if it has stopped meaning the
+            # message it meant, the page will not contain that message, and the
+            # WindowDirectionError path replays from the durable anchor.
+            self.connection.execute(
+                """
+                UPDATE window_recovery_jobs
+                SET retry_count=?, history_calls=history_calls+1,
+                    next_retry_at=?, last_error=?, updated_at=?
+                WHERE id=?
+                """,
+                (
+                    retries,
+                    now + min(300, 30 * (2 ** (retries - 1))),
+                    f"short anchor retry {retries} after {type(exc).__name__}",
+                    now,
+                    int(job["id"]),
+                ),
+            )
+        elif short_anchor:
+            # Consecutive failures on one anchor are what a NapCat restart
+            # looks like: it invalidates the in-memory short-ID map.  Reset
             # to the immutable raw NT msgId and safely replay using real_seq
             # deduplication instead of substituting msgSeq as an API anchor.
             self.connection.execute(

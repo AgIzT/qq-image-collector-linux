@@ -13,6 +13,7 @@ from unittest import mock
 from qq_image_collector.database import increment_counter
 from qq_image_collector.onebot import OneBotError
 from qq_image_collector.window_recovery import (
+    SHORT_ANCHOR_RETRIES,
     WindowPolicyError,
     WindowRecoveryRunner,
     main as window_recovery_main,
@@ -880,8 +881,14 @@ class WindowRecoveryTests(unittest.TestCase):
             runner.process_one_page()
         self.assertEqual(fake.calls, [])
 
-    def test_short_anchor_failures_keep_replaying_from_durable_anchor(self) -> None:
-        fake = FakeOneBot(OneBotError("short id expired"), OneBotError("expired again"))
+    def test_a_single_failed_call_retries_the_same_short_anchor(self) -> None:
+        fake = FakeOneBot(
+            OneBotError("timeout"),
+            page(
+                history_message(102, NOT_AFTER - 2, message_id=8102, image=True),
+                history_message(103, NOT_AFTER - 1, message_id=8103),
+            ),
+        )
         runner = self.make_runner(fake, queue_threshold=10)
         runner.initialize()
         runner._budget_wait_seconds = lambda _now: 0  # type: ignore[method-assign]
@@ -889,10 +896,46 @@ class WindowRecoveryTests(unittest.TestCase):
             """
             UPDATE window_recovery_jobs
             SET status='queued', probe_ok=1, next_anchor_id='8103',
-                next_anchor_seq='103', next_anchor_time=?, replay_count=2,
-                next_retry_at=0
+                next_anchor_seq='103', next_anchor_time=?, next_retry_at=0
             """,
             (NOT_AFTER - 1,),
+        )
+        runner.connection.commit()
+
+        self.assertTrue(runner.process_one_page())
+        job = runner.connection.execute("SELECT * FROM window_recovery_jobs").fetchone()
+        # Progress is kept: same anchor, no replay, a short backoff.
+        self.assertEqual(job["status"], "queued")
+        self.assertEqual(job["next_anchor_id"], "8103")
+        self.assertEqual(job["replay_count"], 0)
+        self.assertEqual(job["retry_count"], 1)
+        self.assertGreater(job["next_retry_at"], 0)
+
+        runner.connection.execute("UPDATE window_recovery_jobs SET next_retry_at=0")
+        runner.connection.commit()
+        self.assertTrue(runner.process_one_page())
+
+        self.assertEqual(fake.calls[1][1]["message_seq"], "8103")
+        job = runner.connection.execute("SELECT * FROM window_recovery_jobs").fetchone()
+        self.assertEqual(job["next_anchor_id"], "8102")
+        self.assertEqual(job["retry_count"], 0)
+        self.assertEqual(job["replay_count"], 0)
+
+    def test_short_anchor_failures_keep_replaying_from_durable_anchor(self) -> None:
+        fake = FakeOneBot(OneBotError("short id expired"), OneBotError("expired again"))
+        runner = self.make_runner(fake, queue_threshold=10)
+        runner.initialize()
+        runner._budget_wait_seconds = lambda _now: 0  # type: ignore[method-assign]
+        # Already failed on this anchor as many times as a transient error is
+        # given; the next failure is treated as an expired short-ID map.
+        runner.connection.execute(
+            """
+            UPDATE window_recovery_jobs
+            SET status='queued', probe_ok=1, next_anchor_id='8103',
+                next_anchor_seq='103', next_anchor_time=?, replay_count=2,
+                retry_count=?, next_retry_at=0
+            """,
+            (NOT_AFTER - 1, SHORT_ANCHOR_RETRIES),
         )
         runner.connection.commit()
 
@@ -908,9 +951,10 @@ class WindowRecoveryTests(unittest.TestCase):
             """
             UPDATE window_recovery_jobs
             SET status='queued', probe_ok=1, next_anchor_id='8102',
-                next_anchor_seq='102', next_anchor_time=?, next_retry_at=0
+                next_anchor_seq='102', next_anchor_time=?, retry_count=?,
+                next_retry_at=0
             """,
-            (NOT_AFTER - 2,),
+            (NOT_AFTER - 2, SHORT_ANCHOR_RETRIES),
         )
         runner.connection.commit()
         self.assertTrue(runner.process_one_page())
