@@ -202,7 +202,8 @@ class WindowRecoveryRunner:
         self.pending_timeout_seconds = int(pending_timeout_seconds)
         self.no_yield_pages = int(no_yield_pages)
         self.window_override = bool(window_override)
-        self.onebot = onebot or OneBotClient.from_settings(self.settings["onebot"])
+        self._override_announced = False
+        self.onebot =onebot or OneBotClient.from_settings(self.settings["onebot"])
         self.stop_event = threading.Event()
         self._last_state_publish_at = 0.0
         self._last_published_state: dict[str, Any] = {}
@@ -257,11 +258,14 @@ class WindowRecoveryRunner:
         # --window-override skips only this equality check; the group-count and
         # frozen-job checks below and above still apply.
         if self.window_override:
-            print(
-                "window-override: skipping the production marker comparison; "
-                f"recovering [{self.not_before}, {self.not_after}] on operator instruction",
-                file=sys.stderr,
-            )
+            # This runs before every page; saying it once is enough.
+            if not self._override_announced:
+                print(
+                    "window-override: skipping the production marker comparison; "
+                    f"recovering [{self.not_before}, {self.not_after}] on operator instruction",
+                    file=sys.stderr,
+                )
+                self._override_announced = True
         else:
             if int(_setting(self.connection, "production_history_floor", 0)) != self.not_before:
                 raise WindowPolicyError(
@@ -1028,10 +1032,17 @@ class WindowRecoveryRunner:
 
     def _publish_state(self, phase: str, **extra: Any) -> dict[str, Any]:
         now = time.monotonic()
+        # Waiting on the hourly budget re-checks every poll; publishing each of
+        # those wrote the database and a full JSON line every two seconds, and
+        # the September run's log reached 80 MB that way.  A wait repeats its
+        # phase at most once a minute; the stop-and-go of real pages keeps the
+        # original two-second throttle.
+        quiet = {"running": 2.0, "waiting_budget": 60.0, "waiting_queue": 60.0, "waiting_login": 60.0}.get(phase)
         if (
-            phase == "running"
+            quiet is not None
             and self._last_published_state
-            and now - self._last_state_publish_at < 2.0
+            and (phase == "running" or self._last_published_state.get("phase") == phase)
+            and now - self._last_state_publish_at < quiet
         ):
             return dict(self._last_published_state)
         state = self._aggregate(phase, **extra)
@@ -1057,8 +1068,14 @@ class WindowRecoveryRunner:
             if progressed:
                 continue
             state = self._aggregate("idle")
-            delay = 3600 if not state["active"] else self.poll_seconds
-            self.stop_event.wait(delay)
+            if not state["active"]:
+                # Every group is terminal and no page is waiting to drain, so
+                # nothing more can happen in this process.  It used to wake
+                # hourly forever: the September run finished on 9/22 and was
+                # still alive a week later, holding the old per-group limit and
+                # ready to re-close any job someone re-queued.
+                return
+            self.stop_event.wait(self.poll_seconds)
 
 
 def build_parser() -> argparse.ArgumentParser:

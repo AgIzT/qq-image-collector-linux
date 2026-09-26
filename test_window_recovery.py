@@ -5,6 +5,7 @@ import json
 import sqlite3
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -296,6 +297,43 @@ class WindowRecoveryTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual(aggregate.call_count, 2)
         self.assertEqual(runner.interval_seconds, 0)
+
+    def test_waiting_on_budget_publishes_once_a_minute_not_every_poll(self) -> None:
+        runner = WindowRecoveryRunner(
+            self.config_path,
+            not_before=NOT_BEFORE,
+            not_after=NOT_AFTER,
+            expected_groups=1,
+            onebot=FakeOneBot(),
+        )
+        self.runners.append(runner)
+        runner._aggregate = lambda phase, **_extra: {"phase": phase}  # type: ignore[method-assign]
+        writes = mock.Mock()
+        with mock.patch("qq_image_collector.window_recovery.set_runtime_state", writes), \
+                mock.patch("sys.stdout", new_callable=io.StringIO):
+            for _poll in range(30):
+                runner._publish_state("waiting_budget")
+            self.assertEqual(writes.call_count, 1)
+            # A change of phase is never held back.
+            runner._publish_state("finished")
+            self.assertEqual(writes.call_count, 2)
+
+    def test_a_finished_run_exits_instead_of_idling(self) -> None:
+        runner = self.make_runner(FakeOneBot())
+        runner.initialize()
+        runner.connection.execute(
+            "UPDATE window_recovery_jobs SET status='completed', probe_ok=1"
+        )
+        runner.connection.commit()
+        runner._budget_wait_seconds = lambda _now: 0  # type: ignore[method-assign]
+        runner.initialize = lambda: None  # type: ignore[method-assign]
+
+        worker = threading.Thread(target=runner.run, daemon=True)
+        worker.start()
+        worker.join(timeout=5)
+        stuck = worker.is_alive()
+        runner.request_stop()
+        self.assertFalse(stuck, "a run with every group terminal kept waiting")
 
     def insert_anchor(
         self,
