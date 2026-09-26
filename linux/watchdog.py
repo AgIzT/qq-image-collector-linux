@@ -84,6 +84,10 @@ DEFAULTS: dict[str, Any] = {
     # means images are failing one by one without stopping the run.
     "gallery_pending_warn": 200,
     "gallery_storage_warn_percent": 90,
+    # History recovery gaps that are known and accepted as permanent, as
+    # "<not_before>:<group_id>".  Anything else a recovery run left partial or
+    # failed is reported until it is recovered or listed here.
+    "recovery_acknowledged": [],
     # Restarting NapCat re-launches QQ.  Off by default: turning it on is a
     # decision about whether an unattended restart is preferable to waiting for
     # a person, and that depends on whether the session can re-login on its own.
@@ -367,6 +371,48 @@ def check_gallery(config: dict[str, Any]) -> list[Finding]:
     return findings
 
 
+def check_recovery_gaps(connection: sqlite3.Connection, config: dict[str, Any]) -> list[Finding]:
+    """A recovery that stopped short is data that will not come back on its own.
+
+    The September run ended "finished" with two groups at their per-group call
+    limit, and the only trace was a status in a table.  QQ keeps group history
+    for a limited time, so a gap nobody hears about is a gap that becomes
+    permanent.
+    """
+    try:
+        rows = connection.execute(
+            """
+            SELECT group_id, not_before, not_after, status, next_anchor_time
+            FROM window_recovery_jobs
+            WHERE status LIKE 'partial%' OR status LIKE 'failed%'
+            ORDER BY not_before, group_id
+            """
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []  # no recovery has ever been run on this database
+    acknowledged = {str(value) for value in config.get("recovery_acknowledged") or []}
+    stamp = lambda value: time.strftime("%m-%d %H:%M", time.localtime(int(value)))
+    gaps = []
+    for group_id, not_before, not_after, status, anchor_time in rows:
+        if f"{not_before}:{group_id}" in acknowledged:
+            continue
+        # Only images the recovery itself paged through say how deep it got;
+        # live images from the edges of the window would hide a hole between.
+        deepest = connection.execute(
+            """
+            SELECT MIN(sent_at) FROM images
+            WHERE group_id=? AND sent_at BETWEEN ? AND ?
+              AND resolver_json LIKE '%window-recovery%'
+            """,
+            (group_id, not_before, not_after),
+        ).fetchone()[0]
+        reached = min(int(v) for v in (anchor_time, deepest, not_after) if v)
+        gaps.append(f"群 {group_id}（{status}）{stamp(not_before)} 到 {stamp(reached)} 没翻到")
+    if not gaps:
+        return [Finding("recovery", OK, "历史回捞没有未补完的群")]
+    return [Finding("recovery", WARN, f"历史回捞有 {len(gaps)} 个群没补完：" + "；".join(gaps))]
+
+
 def check_policy_alarms(connection: sqlite3.Connection) -> list[Finding]:
     findings: list[Finding] = []
     alarm = _runtime_state(connection, "critical_alarm")
@@ -484,6 +530,7 @@ def run_checks(config: dict[str, Any]) -> list[Finding]:
             findings.extend(check_heartbeats(connection, config))
             findings.extend(check_intake(connection, config))
             findings.extend(check_policy_alarms(connection))
+            findings.extend(check_recovery_gaps(connection, config))
         finally:
             connection.close()
     findings.append(check_qq_alive(config))
