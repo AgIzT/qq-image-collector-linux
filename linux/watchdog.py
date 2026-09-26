@@ -19,6 +19,7 @@ Stdlib only, so it keeps working when the container does not.
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import json
 import os
 import shutil
@@ -67,9 +68,22 @@ DEFAULTS: dict[str, Any] = {
     # A disk filling over days is the one thing an operator legitimately parks
     # until the weekend, and it was explicitly asked to stop shouting hourly.
     # Everything else gets the interval above.
-    "quiet_check_prefixes": ["disk_"],
+    "quiet_check_prefixes": ["disk_", "gallery_storage"],
     "quiet_cooldown_seconds": 43200,
     "recovery_cooldown_seconds": 3600,
+    # The gallery's server maintenance writes this after every run.  It is what
+    # gives new images a thumbnail and the privacy approval that lets anyone
+    # open them, and on 2026-09-23 it hit its storage cap and stopped for three
+    # days with nothing but a JSON field to say so.  A missing file means the
+    # gallery is not installed on this host, and the check stays out of the way.
+    "gallery_maintenance_report": "/var/lib/enter-gallery/maintenance-latest.json",
+    # Runs every six hours and may take up to 45 minutes.
+    "gallery_maintenance_warn_seconds": 8 * 3600,
+    "gallery_maintenance_critical_seconds": 24 * 3600,
+    # A run that finishes normally leaves a handful pending at most; hundreds
+    # means images are failing one by one without stopping the run.
+    "gallery_pending_warn": 200,
+    "gallery_storage_warn_percent": 90,
     # Restarting NapCat re-launches QQ.  Off by default: turning it on is a
     # decision about whether an unattended restart is preferable to waiting for
     # a person, and that depends on whether the session can re-login on its own.
@@ -308,6 +322,51 @@ def check_disks(config: dict[str, Any]) -> list[Finding]:
     return findings
 
 
+def check_gallery(config: dict[str, Any]) -> list[Finding]:
+    path = Path(str(config.get("gallery_maintenance_report") or ""))
+    if not str(path) or not path.is_file():
+        return []
+    try:
+        report = json.loads(path.read_text(encoding="utf-8"))
+        finished = dt.datetime.fromisoformat(str(report["finishedAt"]).replace("Z", "+00:00"))
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        return [Finding("gallery", WARN, f"图库维护报告读不了：{type(exc).__name__}")]
+
+    findings: list[Finding] = []
+    age = time.time() - finished.timestamp()
+    pending = int(report.get("thumbnailPending") or 0)
+    stopped = str(report.get("stopped") or "")
+    hours = age / 3600
+    if stopped:
+        # The run itself says it gave up.  New images stay without a thumbnail
+        # and without approval until someone changes a limit, so this does not
+        # get better by waiting.
+        findings.append(Finding(
+            "gallery", CRITICAL,
+            f"图库维护被 {stopped} 挡住，{pending} 张新图没有缩略图也打不开",
+        ))
+    elif age >= int(config["gallery_maintenance_critical_seconds"]):
+        findings.append(Finding("gallery", CRITICAL, f"图库维护 {hours:.0f} 小时没有完成过"))
+    elif age >= int(config["gallery_maintenance_warn_seconds"]):
+        findings.append(Finding("gallery", WARN, f"图库维护 {hours:.0f} 小时没有完成过"))
+    elif pending >= int(config["gallery_pending_warn"]):
+        findings.append(Finding(
+            "gallery", WARN,
+            f"图库维护跑完了但还有 {pending} 张缺缩略图，失败 {report.get('failed', 0)} 张",
+        ))
+    else:
+        findings.append(Finding("gallery", OK, f"图库维护 {hours:.1f} 小时前完成，缺缩略图 {pending} 张"))
+
+    used = report.get("retainedBytesAfter")
+    limit = report.get("storageLimit")
+    if isinstance(used, int) and isinstance(limit, int) and limit > 0:
+        percent = 100.0 * used / limit
+        detail = f"图库衍生存储 {used / 1e9:.2f} / {limit / 1e9:.0f} GB（{percent:.0f}%）"
+        warn = float(config["gallery_storage_warn_percent"])
+        findings.append(Finding("gallery_storage", WARN if percent >= warn else OK, detail))
+    return findings
+
+
 def check_policy_alarms(connection: sqlite3.Connection) -> list[Finding]:
     findings: list[Finding] = []
     alarm = _runtime_state(connection, "critical_alarm")
@@ -429,6 +488,7 @@ def run_checks(config: dict[str, Any]) -> list[Finding]:
             connection.close()
     findings.append(check_qq_alive(config))
     findings.extend(check_disks(config))
+    findings.extend(check_gallery(config))
     return findings
 
 
