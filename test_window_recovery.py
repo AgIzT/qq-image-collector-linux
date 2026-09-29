@@ -318,6 +318,33 @@ class WindowRecoveryTests(unittest.TestCase):
             runner._publish_state("finished")
             self.assertEqual(writes.call_count, 2)
 
+    def add_enabled_group(self, connection: sqlite3.Connection, group_id: str, *, enabled: int = 1) -> None:
+        now = NOT_AFTER + 1
+        connection.execute(
+            "INSERT INTO monitored_groups(group_id, enabled, created_at, updated_at) VALUES (?, ?, ?, ?)",
+            (group_id, enabled, now, now),
+        )
+        connection.commit()
+
+    def test_named_groups_limit_the_window_to_those_groups(self) -> None:
+        runner = self.make_runner(FakeOneBot(), groups=[GROUP])
+        self.add_enabled_group(runner.connection, "100000009")
+
+        runner.initialize()
+
+        jobs = [row[0] for row in runner.connection.execute("SELECT group_id FROM window_recovery_jobs")]
+        self.assertEqual(jobs, [GROUP])
+
+    def test_a_named_group_that_is_not_enabled_is_refused(self) -> None:
+        runner = self.make_runner(FakeOneBot(), groups=["100000009"])
+        self.add_enabled_group(runner.connection, "100000009", enabled=0)
+
+        with self.assertRaises(WindowPolicyError):
+            runner.initialize()
+        self.assertEqual(
+            runner.connection.execute("SELECT count(*) FROM window_recovery_jobs").fetchone()[0], 0
+        )
+
     def test_a_finished_run_exits_instead_of_idling(self) -> None:
         runner = self.make_runner(FakeOneBot())
         runner.initialize()

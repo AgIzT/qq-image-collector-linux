@@ -169,6 +169,7 @@ class WindowRecoveryRunner:
         pending_timeout_seconds: int = 1200,
         no_yield_pages: int = 50,
         window_override: bool = False,
+        groups: list[str] | None = None,
         onebot: OneBotClient | None = None,
     ) -> None:
         if not_before <= 0 or not_after <= not_before:
@@ -202,6 +203,10 @@ class WindowRecoveryRunner:
         self.pending_timeout_seconds = int(pending_timeout_seconds)
         self.no_yield_pages = int(no_yield_pages)
         self.window_override = bool(window_override)
+        # None means every enabled group, which is what a collector-wide outage
+        # needs.  A single group coming back - re-enabled after the account
+        # joined it - must not re-page every other group's window as well.
+        self.groups = None if groups is None else sorted({str(group) for group in groups})
         self._override_announced = False
         self.onebot =onebot or OneBotClient.from_settings(self.settings["onebot"])
         self.stop_event = threading.Event()
@@ -226,12 +231,17 @@ class WindowRecoveryRunner:
         self.stop_event.set()
 
     def _enabled_groups(self) -> list[str]:
-        return [
+        enabled = [
             str(row[0])
             for row in self.connection.execute(
                 "SELECT group_id FROM monitored_groups WHERE enabled=1 ORDER BY group_id"
             ).fetchall()
         ]
+        if self.groups is None:
+            return enabled
+        # A named subset still has to be enabled: a group the collector is not
+        # watching drops out here, and the expected-count check refuses the run.
+        return [group for group in enabled if group in self.groups]
 
     def _safety_check(self) -> list[str]:
         groups = self._enabled_groups()
@@ -1107,6 +1117,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="recover a window other than the production markers, without editing them",
     )
     parser.add_argument(
+        "--groups",
+        type=lambda value: [part.strip() for part in value.split(",") if part.strip()],
+        default=None,
+        help="comma-separated group ids to recover instead of every enabled group; "
+        "each must be enabled, and --expected-groups must equal their count",
+    )
+    parser.add_argument(
         "--allow-unlimited",
         action="store_true",
         help="permit 0 (no limit) for the call budgets; without it a 0 is refused",
@@ -1153,6 +1170,7 @@ def main() -> int:
         pending_timeout_seconds=args.pending_timeout_seconds,
         no_yield_pages=args.no_yield_pages,
         window_override=args.window_override,
+        groups=args.groups,
     )
     signal.signal(signal.SIGTERM, runner.request_stop)
     signal.signal(signal.SIGINT, runner.request_stop)
