@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import sqlite3
 import subprocess
@@ -32,36 +33,65 @@ from pathlib import Path
 
 DB = os.environ.get("QQAI_DATABASE", "/var/lib/qqai-state/collector_state.sqlite3")
 STATE = Path(os.environ.get("QQAI_RECOVERY_GUARD_STATE", "/var/lib/qqai-recovery-guard.json"))
+TARGET_FILE = Path(os.environ.get("QQAI_RECOVERY_TARGET", "/etc/qqai-recovery-guard.json"))
 CONTAINER = os.environ.get("QQAI_COLLECTOR_CONTAINER", "qqai-collector-console")
-LOG = "/data/qq-image-collector/window-recovery-0918.log"
 MAX_RESTARTS = 40
 TERMINAL_PHASES = {"finished", "failed_policy"}
 
-WINDOW = (
-    int(os.environ.get("QQAI_RECOVERY_NOT_BEFORE", "1789361700")),
-    int(os.environ.get("QQAI_RECOVERY_NOT_AFTER", "1789743600")),
-)
+# The run this guard keeps alive.  TARGET_FILE replaces any of these for a new
+# window; without it the guard watches the September outage recovery.
+DEFAULT_TARGET = {
+    "not_before": 1789361700,
+    "not_after": 1789743600,
+    "expected_groups": 15,
+    # Empty means every enabled group.
+    "groups": [],
+    # The per-group ceiling stops one group whose paging never converges from
+    # spending the whole budget.  It counts every call ever made for the group
+    # in this window, so it has to cover what was already spent as well.  1500
+    # was set for the first run from an estimate that left the biggest group
+    # almost no margin, and hitting it was silent; replays burned it on
+    # 519382846 and 726877770.  For the 2026-09-26 re-run of 519382846: 1,500
+    # already spent, and its window is ~15,900 messages, about 840 pages from
+    # the top anchor, so 3000 leaves ~1.8x.  A group that reaches it now shows
+    # up in the watchdog.
+    "max_calls_per_group": 3000,
+    "log": "/data/qq-image-collector/window-recovery-0918.log",
+}
 
-# The per-group ceiling stops one group whose paging never converges from
-# spending the whole budget.  It counts every call ever made for the group in
-# this window, so it has to cover what was already spent as well.  1500 was
-# set for the first run from an estimate that left the biggest group almost no
-# margin, and hitting it was silent; replays burned it on 519382846 and
-# 726877770.  For the 2026-09-26 re-run of 519382846: 1,500 already spent, and
-# its window is ~15,900 messages, about 840 pages from the top anchor, so 3000
-# leaves ~1.8x.  A group that reaches it now shows up in the watchdog.
-MAX_CALLS_PER_GROUP = 3000
 
-COMMAND = (
-    "python3 -m qq_image_collector.window_recovery"
-    " --config /data/qq-image-collector/config/collector_config.json"
-    f" --not-before {WINDOW[0]} --not-after {WINDOW[1]}"
-    " --expected-groups 15 --page-size 20"
-    " --hourly-limit 60 --daily-limit 1440"
-    f" --max-calls-per-group {MAX_CALLS_PER_GROUP}"
-    " --window-override"
-    f" >> {LOG} 2>&1"
-)
+def load_target() -> dict:
+    target = dict(DEFAULT_TARGET)
+    try:
+        target.update(json.loads(TARGET_FILE.read_text(encoding="utf-8")))
+    except FileNotFoundError:
+        pass
+    groups = [str(group) for group in target.get("groups") or []]
+    # These end up in a shell command line.
+    if any(not re.fullmatch(r"\d{5,12}", group) for group in groups):
+        raise ValueError(f"{TARGET_FILE}: group ids must be plain numbers")
+    target["groups"] = groups
+    return target
+
+
+def build_command(target: dict) -> str:
+    groups = ",".join(target["groups"])
+    return (
+        "python3 -m qq_image_collector.window_recovery"
+        " --config /data/qq-image-collector/config/collector_config.json"
+        f" --not-before {int(target['not_before'])} --not-after {int(target['not_after'])}"
+        f" --expected-groups {int(target['expected_groups'])} --page-size 20"
+        " --hourly-limit 60 --daily-limit 1440"
+        f" --max-calls-per-group {int(target['max_calls_per_group'])}"
+        + (f" --groups {groups}" if groups else "")
+        + " --window-override"
+        f" >> {shlex.quote(str(target['log']))} 2>&1"
+    )
+
+
+TARGET = load_target()
+WINDOW = (int(TARGET["not_before"]), int(TARGET["not_after"]))
+COMMAND = build_command(TARGET)
 
 
 def say(message: str) -> None:
@@ -125,6 +155,9 @@ def main() -> int:
         return 0
 
     state = read_state()
+    # Restarts are counted per window; a new run starts with a clean slate.
+    if state.get("window") != list(WINDOW):
+        state = {"window": list(WINDOW)}
     restarts = int(state.get("restarts") or 0)
     if restarts >= MAX_RESTARTS:
         say(f"refusing to restart again after {restarts} attempts; investigate the log")
