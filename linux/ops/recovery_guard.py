@@ -36,7 +36,6 @@ STATE = Path(os.environ.get("QQAI_RECOVERY_GUARD_STATE", "/var/lib/qqai-recovery
 TARGET_FILE = Path(os.environ.get("QQAI_RECOVERY_TARGET", "/etc/qqai-recovery-guard.json"))
 CONTAINER = os.environ.get("QQAI_COLLECTOR_CONTAINER", "qqai-collector-console")
 MAX_RESTARTS = 40
-TERMINAL_PHASES = {"finished", "failed_policy"}
 
 # The run this guard keeps alive.  TARGET_FILE replaces any of these for a new
 # window; without it the guard watches the September outage recovery.
@@ -133,6 +132,26 @@ def recovery_phase() -> tuple[str, dict]:
     return str(value.get("phase") or "unknown"), value
 
 
+def unfinished_jobs() -> int:
+    """Jobs in this window that still have pages to fetch.
+
+    The published phase alone is not enough: before 2026-09-29 the runner
+    also said "finished" while a job waited between pages, and a process that
+    died then was left for dead with its job still queued.
+    """
+    connection = sqlite3.connect(f"file:{DB}?mode=ro", uri=True, timeout=20)
+    try:
+        return int(connection.execute(
+            """
+            SELECT count(*) FROM window_recovery_jobs
+            WHERE not_before=? AND not_after=? AND status IN ('probe','queued','deferred')
+            """,
+            WINDOW,
+        ).fetchone()[0])
+    finally:
+        connection.close()
+
+
 def running() -> bool:
     result = subprocess.run(
         ["ps", "-eo", "args"], capture_output=True, text=True, check=False
@@ -145,7 +164,7 @@ def running() -> bool:
 
 def main() -> int:
     phase, value = recovery_phase()
-    if phase in TERMINAL_PHASES:
+    if phase == "failed_policy" or (phase == "finished" and not unfinished_jobs()):
         say(f"recovery {phase}; nothing to restart")
         return 0
     if phase == "other_window":
