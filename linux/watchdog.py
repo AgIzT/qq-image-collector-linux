@@ -22,6 +22,7 @@ import argparse
 import datetime as dt
 import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -84,6 +85,11 @@ DEFAULTS: dict[str, Any] = {
     # means images are failing one by one without stopping the run.
     "gallery_pending_warn": 200,
     "gallery_storage_warn_percent": 90,
+    # New images reach the site only after the archive publishes its index.
+    # If no maintenance run has started since the archive last finished, they
+    # are on the site without thumbnails; allow a run this long to get going.
+    "archive_log": "/opt/qqai-archive.log",
+    "gallery_after_archive_grace_seconds": 3600,
     # History recovery gaps that are known and accepted as permanent, as
     # "<not_before>:<group_id>".  Anything else a recovery run left partial or
     # failed is reported until it is recovered or listed here.
@@ -326,6 +332,21 @@ def check_disks(config: dict[str, Any]) -> list[Finding]:
     return findings
 
 
+def _last_archive_end(path: Path) -> float | None:
+    """When the archive last finished, from its own log's closing line."""
+    try:
+        with path.open("rb") as handle:
+            handle.seek(max(0, path.stat().st_size - 65536))
+            tail = handle.read().decode("utf-8", errors="replace")
+    except OSError:
+        return None
+    for line in reversed(tail.splitlines()):
+        match = re.match(r"===== (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) 结束", line)
+        if match:
+            return time.mktime(time.strptime(match.group(1), "%Y-%m-%d %H:%M:%S"))
+    return None
+
+
 def check_gallery(config: dict[str, Any]) -> list[Finding]:
     path = Path(str(config.get("gallery_maintenance_report") or ""))
     if not str(path) or not path.is_file():
@@ -360,6 +381,22 @@ def check_gallery(config: dict[str, Any]) -> list[Finding]:
         ))
     else:
         findings.append(Finding("gallery", OK, f"图库维护 {hours:.1f} 小时前完成，缺缩略图 {pending} 张"))
+
+    # On late-September mornings the 05:00 run read the index before the
+    # archive finished writing it, so every run looked clean while the newest
+    # images sat on the site without thumbnails until 11:00.  Maintenance now
+    # waits for the archive; this catches it if that ever stops holding.
+    archived = _last_archive_end(Path(str(config.get("archive_log") or "")))
+    try:
+        started = dt.datetime.fromisoformat(str(report["startedAt"]).replace("Z", "+00:00")).timestamp()
+    except (KeyError, ValueError, TypeError):
+        started = 0.0
+    grace = int(config["gallery_after_archive_grace_seconds"])
+    if archived and started and archived > started and time.time() - archived > grace:
+        findings.append(Finding(
+            "gallery_order", WARN,
+            f"归档 {time.strftime('%m-%d %H:%M', time.localtime(archived))} 写完后还没有图库维护跑过，新图没有缩略图",
+        ))
 
     used = report.get("retainedBytesAfter")
     limit = report.get("storageLimit")
