@@ -408,6 +408,45 @@ def check_gallery(config: dict[str, Any]) -> list[Finding]:
     return findings
 
 
+def check_disabled_groups(connection: sqlite3.Connection, config: dict[str, Any]) -> list[Finding]:
+    """A group switched off for a reason that has since gone away.
+
+    627217018 was disabled on 8/17 because the account then collecting was not
+    in it.  The account joined later and the group ran for weeks with every
+    message reaching QQ and none reaching the collector, which drops events
+    from disabled groups without a trace.  NapCat's own log still shows them.
+    """
+    disabled = {
+        str(group_id): str(name or "")
+        for group_id, name in connection.execute(
+            "SELECT group_id, display_name FROM monitored_groups WHERE enabled=0"
+        ).fetchall()
+    }
+    if not disabled:
+        return [Finding("disabled_groups", OK, "没有停用的群")]
+    if shutil.which("docker") is None:
+        return []
+    try:
+        result = subprocess.run(
+            ["docker", "logs", "--since", "1h", str(config["napcat_container"])],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, errors="replace", timeout=60, check=False,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        return [Finding("disabled_groups", WARN, f"读不了 NapCat 日志，没法核对停用的群：{type(exc).__name__}")]
+    received: dict[str, int] = {}
+    for group_id in re.findall(r"接收 <- 群聊 \[[^\]]*\((\d+)\)\]", result.stdout or ""):
+        if group_id in disabled:
+            received[group_id] = received.get(group_id, 0) + 1
+    if not received:
+        return [Finding("disabled_groups", OK, f"{len(disabled)} 个停用的群过去一小时没有消息")]
+    detail = "；".join(
+        f"{disabled[group_id] or group_id}（{group_id}）{count} 条"
+        for group_id, count in sorted(received.items(), key=lambda item: -item[1])
+    )
+    return [Finding("disabled_groups", WARN, f"停用的群还在收消息，要不要重新启用：{detail}")]
+
+
 def check_recovery_gaps(connection: sqlite3.Connection, config: dict[str, Any]) -> list[Finding]:
     """A recovery that stopped short is data that will not come back on its own.
 
@@ -568,6 +607,7 @@ def run_checks(config: dict[str, Any]) -> list[Finding]:
             findings.extend(check_intake(connection, config))
             findings.extend(check_policy_alarms(connection))
             findings.extend(check_recovery_gaps(connection, config))
+            findings.extend(check_disabled_groups(connection, config))
         finally:
             connection.close()
     findings.append(check_qq_alive(config))
