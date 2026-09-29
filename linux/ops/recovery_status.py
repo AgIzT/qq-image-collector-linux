@@ -45,7 +45,13 @@ jobs = connection.execute(
     (NOT_BEFORE,),
 ).fetchall()
 
-print(f"进程          {running} 个" + ("" if running else "   <- 已停；守护会在 5 分钟内拉起"))
+if running:
+    note = ""
+elif state.get("phase") in ("finished", "failed_policy"):
+    note = "   <- 已结束，不会再拉起"
+else:
+    note = "   <- 已停；守护会在 5 分钟内拉起"
+print(f"进程          {running} 个{note}")
 print(f"状态          {state.get('phase')}")
 print(f"群进度        {state.get('groups_terminal')}/{state.get('groups_total')}")
 print(f"history 调用  {state.get('history_calls')}   最近一小时 {calls_hour}（上限 60）")
