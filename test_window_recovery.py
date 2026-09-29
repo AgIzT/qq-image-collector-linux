@@ -345,6 +345,26 @@ class WindowRecoveryTests(unittest.TestCase):
             runner.connection.execute("SELECT count(*) FROM window_recovery_jobs").fetchone()[0], 0
         )
 
+    def test_a_job_between_pages_is_waiting_not_finished(self) -> None:
+        runner = self.make_runner(FakeOneBot())
+        runner.initialize()
+        phases: list[str] = []
+        runner._publish_state = lambda phase, **_extra: phases.append(phase) or {}  # type: ignore[method-assign]
+        runner._budget_wait_seconds = lambda _now: 0  # type: ignore[method-assign]
+        runner.connection.execute(
+            "UPDATE window_recovery_jobs SET status='queued', probe_ok=1, next_retry_at=?",
+            (int(time.time()) + 600,),
+        )
+        runner.connection.commit()
+
+        self.assertFalse(runner.process_one_page())
+        self.assertEqual(phases[-1], "waiting_retry")
+
+        runner.connection.execute("UPDATE window_recovery_jobs SET status='completed'")
+        runner.connection.commit()
+        self.assertFalse(runner.process_one_page())
+        self.assertEqual(phases[-1], "finished")
+
     def test_a_finished_run_exits_instead_of_idling(self) -> None:
         runner = self.make_runner(FakeOneBot())
         runner.initialize()

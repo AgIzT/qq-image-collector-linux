@@ -760,7 +760,11 @@ class WindowRecoveryRunner:
             return False
         job = self._next_job(now)
         if not job:
-            self._publish_state("finished")
+            # No job ready is not the same as no job left: between pages a job
+            # waits out its interval.  Calling that "finished" told the guard
+            # there was nothing to restart if the process died right then.
+            active = self._aggregate("idle")["active"]
+            self._publish_state("waiting_retry" if active else "finished")
             return False
         if (
             self.max_calls_per_group > 0
@@ -1047,7 +1051,13 @@ class WindowRecoveryRunner:
         # the September run's log reached 80 MB that way.  A wait repeats its
         # phase at most once a minute; the stop-and-go of real pages keeps the
         # original two-second throttle.
-        quiet = {"running": 2.0, "waiting_budget": 60.0, "waiting_queue": 60.0, "waiting_login": 60.0}.get(phase)
+        quiet = {
+            "running": 2.0,
+            "waiting_budget": 60.0,
+            "waiting_queue": 60.0,
+            "waiting_login": 60.0,
+            "waiting_retry": 60.0,
+        }.get(phase)
         if (
             quiet is not None
             and self._last_published_state
