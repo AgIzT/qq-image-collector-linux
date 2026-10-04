@@ -52,6 +52,10 @@ LATEST_BOOTSTRAP = "latest-bootstrap"
 # Consecutive failed calls on one short anchor before it is treated as expired
 # and the job replays from its durable raw anchor.
 SHORT_ANCHOR_RETRIES = 3
+# Replays from the top before a point that keeps failing is taken as the end of
+# the history this account can read.  A NapCat restart costs one replay; a wall
+# such as the account's join date costs every replay there is.
+SHORT_ANCHOR_REPLAYS = 3
 TERMINAL_STATUSES = (
     "completed",
     "partial_source_exhausted",
@@ -666,6 +670,29 @@ class WindowRecoveryRunner:
                     retries,
                     now + min(300, 30 * (2 ** (retries - 1))),
                     f"short anchor retry {retries} after {type(exc).__name__}",
+                    now,
+                    int(job["id"]),
+                ),
+            )
+        elif short_anchor and int(job["replay_count"] or 0) >= SHORT_ANCHOR_REPLAYS:
+            # Replaying from the top has not got past this point several times
+            # over, so the history behind it is not coming.  627217018 replayed
+            # 22 times into the same wall - history before the account joined -
+            # and spent 1,806 calls over two days without one new image before
+            # the call ceiling stopped it.  End here and let the gap be reported.
+            self.connection.execute(
+                """
+                UPDATE window_recovery_jobs
+                SET status='partial_source_exhausted', retry_count=?,
+                    history_calls=history_calls+1, next_retry_at=0,
+                    last_error=?, updated_at=?, finished_at=?
+                WHERE id=?
+                """,
+                (
+                    retries,
+                    f"history stopped answering below {time.strftime('%m-%d %H:%M', time.localtime(int(job['next_anchor_time'] or 0)))}"
+                    f" after {int(job['replay_count'] or 0)} replays from the top ({type(exc).__name__})",
+                    now,
                     now,
                     int(job["id"]),
                 ),

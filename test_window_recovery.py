@@ -14,6 +14,7 @@ from unittest import mock
 from qq_image_collector.database import increment_counter
 from qq_image_collector.onebot import OneBotError
 from qq_image_collector.window_recovery import (
+    SHORT_ANCHOR_REPLAYS,
     SHORT_ANCHOR_RETRIES,
     WindowPolicyError,
     WindowRecoveryRunner,
@@ -1030,8 +1031,9 @@ class WindowRecoveryTests(unittest.TestCase):
         self.assertEqual(job["replay_count"], 3)
         self.assertEqual(job["next_anchor_id"], RAW_ANCHOR)
 
-        # A later short-ID failure starts another safe replay instead of
-        # permanently abandoning the bounded recovery window.
+        # Once the replays allowed are spent, the next point that will not
+        # answer ends the job instead of sending it back to the top again:
+        # 627217018 replayed 22 times into the same wall.
         runner.connection.execute(
             """
             UPDATE window_recovery_jobs
@@ -1042,12 +1044,15 @@ class WindowRecoveryTests(unittest.TestCase):
             (NOT_AFTER - 2, SHORT_ANCHOR_RETRIES),
         )
         runner.connection.commit()
+        self.assertEqual(SHORT_ANCHOR_REPLAYS, 3)
         self.assertTrue(runner.process_one_page())
 
         job = runner.connection.execute("SELECT * FROM window_recovery_jobs").fetchone()
-        self.assertEqual(job["status"], "probe")
-        self.assertEqual(job["replay_count"], 4)
-        self.assertEqual(job["next_anchor_id"], RAW_ANCHOR)
+        self.assertEqual(job["status"], "partial_source_exhausted")
+        self.assertEqual(job["replay_count"], 3)
+        self.assertEqual(job["next_anchor_id"], "8102")
+        self.assertIn("after 3 replays", job["last_error"])
+        self.assertIsNotNone(job["finished_at"])
         self.assertEqual(len(fake.calls), 2)
 
 
