@@ -94,6 +94,9 @@ DEFAULTS: dict[str, Any] = {
     # "<not_before>:<group_id>".  Anything else a recovery run left partial or
     # failed is reported until it is recovered or listed here.
     "recovery_acknowledged": [],
+    # The ceiling history recovery runs are approved for, in calls per day
+    # (60 an hour).  The live collector keeps its own 300 a day.
+    "recovery_daily_calls": 1440,
     # Restarting NapCat re-launches QQ.  Off by default: turning it on is a
     # decision about whether an unattended restart is preferable to waiting for
     # a person, and that depends on whether the session can re-login on its own.
@@ -489,7 +492,7 @@ def check_recovery_gaps(connection: sqlite3.Connection, config: dict[str, Any]) 
     return [Finding("recovery", WARN, f"历史回捞有 {len(gaps)} 个群没补完：" + "；".join(gaps))]
 
 
-def check_policy_alarms(connection: sqlite3.Connection) -> list[Finding]:
+def check_policy_alarms(connection: sqlite3.Connection, config: dict[str, Any]) -> list[Finding]:
     findings: list[Finding] = []
     alarm = _runtime_state(connection, "critical_alarm")
     if alarm.get("active"):
@@ -503,12 +506,27 @@ def check_policy_alarms(connection: sqlite3.Connection) -> list[Finding]:
     else:
         findings.append(Finding("policy_alarm", OK, "无策略告警"))
     row = connection.execute(
-        "SELECT coalesce(sum(get_image_blocked), 0), coalesce(sum(history_calls), 0) "
+        "SELECT coalesce(sum(get_image_blocked), 0), coalesce(sum(history_calls), 0), "
+        "coalesce(sum(window_history_calls), 0) "
         "FROM hourly_counters WHERE bucket_start>=?",
         (int(time.time()) - 86400,),
     ).fetchone()
     blocked = int(row[0] or 0)
-    history = int(row[1] or 0)
+    # Recovery calls are counted in both columns.  They run under their own
+    # operator-approved ceiling (60 an hour, 1,440 a day), so holding them to
+    # the live collector's 300 a day warned every five minutes for the whole of
+    # every approved recovery - early October's pushes were mostly this.
+    history = int(row[1] or 0) - int(row[2] or 0)
+    # Counted from the call log rather than hourly buckets: ">= 24 hours ago"
+    # takes in 25 buckets, which put a recovery running exactly at its ceiling
+    # 14 calls over it.
+    try:
+        recovery = int(connection.execute(
+            "SELECT count(*) FROM window_recovery_calls WHERE called_at>?",
+            (int(time.time()) - 86400,),
+        ).fetchone()[0])
+    except sqlite3.OperationalError:
+        recovery = 0
     if blocked:
         findings.append(
             Finding(
@@ -524,6 +542,12 @@ def check_policy_alarms(connection: sqlite3.Connection) -> list[Finding]:
         if history <= 300
         else Finding("history", WARN, f"24 小时历史调用 {history} 次，已超过日配额 300")
     )
+    if recovery:
+        findings.append(
+            Finding("recovery_calls", OK, f"24 小时历史回捞调用 {recovery} 次")
+            if recovery <= int(config.get("recovery_daily_calls", 1440))
+            else Finding("recovery_calls", WARN, f"24 小时历史回捞调用 {recovery} 次，超过批准的每天 {config.get('recovery_daily_calls', 1440)} 次")
+        )
     return findings
 
 
@@ -605,7 +629,7 @@ def run_checks(config: dict[str, Any]) -> list[Finding]:
             connection.execute("PRAGMA busy_timeout=15000")
             findings.extend(check_heartbeats(connection, config))
             findings.extend(check_intake(connection, config))
-            findings.extend(check_policy_alarms(connection))
+            findings.extend(check_policy_alarms(connection, config))
             findings.extend(check_recovery_gaps(connection, config))
             findings.extend(check_disabled_groups(connection, config))
         finally:
