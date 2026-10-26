@@ -649,11 +649,25 @@ def notify(config: dict[str, Any], title: str, body: str) -> bool:
     request = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
-            response.read(2048)
-        return True
+            reply = response.read(2048)
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         print(f"notify failed: {type(exc).__name__}: {exc}", file=sys.stderr)
         return False
+    # Push services answer 200 to a message they refuse and say so in the body:
+    # ServerChan with a non-zero "code" (its free tier caps messages a day),
+    # Telegram with "ok": false.  Bark reports success as code 200.  Taking the
+    # status alone as delivered marks an alert sent that never arrived.
+    try:
+        answer = json.loads(reply.decode("utf-8", errors="replace"))
+    except ValueError:
+        answer = None
+    if isinstance(answer, dict):
+        code = answer.get("code", 0)
+        if answer.get("ok") is False or (isinstance(code, int) and code not in (0, 200)):
+            reason = answer.get("message") or answer.get("description") or answer
+            print(f"notify rejected: {str(reason)[:200]}", file=sys.stderr)
+            return False
+    return True
 
 
 def maybe_restart_napcat(
@@ -776,6 +790,7 @@ def main() -> int:
         lines.extend(f"· {f.message}" for f in findings if f.level == OK)
         if notify(config, title, "\n".join(lines)):
             state["last_notified_at"] = now
+            print(f"{stamp} [push    ] {title}")
     state["last_signature"] = signature
     state["last_run_at"] = now
     if not args.dry_run:

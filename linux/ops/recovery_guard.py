@@ -82,6 +82,11 @@ def build_command(target: dict) -> str:
         f" --expected-groups {int(target['expected_groups'])} --page-size 20"
         " --hourly-limit 60 --daily-limit 1440"
         f" --max-calls-per-group {int(target['max_calls_per_group'])}"
+        # The runner gives up after 50 pages that never reach the window.  A
+        # window that ends days before its upper anchor needs more than that
+        # just to get there: the 2026-10-26 replay of 519382846 had ~480 pages
+        # of newer messages above it.
+        + (f" --no-yield-pages {int(target['no_yield_pages'])}" if target.get("no_yield_pages") else "")
         + (f" --groups {groups}" if groups else "")
         + " --window-override"
         f" >> {shlex.quote(str(target['log']))} 2>&1"
