@@ -69,7 +69,7 @@ DEFAULTS: dict[str, Any] = {
     # A disk filling over days is the one thing an operator legitimately parks
     # until the weekend, and it was explicitly asked to stop shouting hourly.
     # Everything else gets the interval above.
-    "quiet_check_prefixes": ["disk_", "gallery_storage", "archive_slow", "download_stuck"],
+    "quiet_check_prefixes": ["disk_", "gallery_storage", "archive_slow", "download_stuck", "group_silence"],
     "quiet_cooldown_seconds": 43200,
     "recovery_cooldown_seconds": 3600,
     # The gallery's server maintenance writes this after every run.  It is what
@@ -106,6 +106,14 @@ DEFAULTS: dict[str, Any] = {
     # October averaged about one CDN failure a day; ten means something broke.
     "download_stuck_seconds": 3 * 86400,
     "download_lost_warn_per_day": 10,
+    # How long an enabled group may go without a message before it is
+    # reported: two days for one that averaged an image a day over the past
+    # month, two weeks for a quieter one.  Groups known to be gone are listed
+    # in group_silence_acknowledged; private_groups are named only generically.
+    "group_silence_busy_seconds": 2 * 86400,
+    "group_silence_quiet_seconds": 14 * 86400,
+    "group_silence_acknowledged": [],
+    "private_groups": [],
     # Restarting NapCat re-launches QQ.  Off by default: turning it on is a
     # decision about whether an unattended restart is preferable to waiting for
     # a person, and that depends on whether the session can re-login on its own.
@@ -558,6 +566,50 @@ def check_download_outcomes(connection: sqlite3.Connection, config: dict[str, An
     return findings
 
 
+def check_group_silence(connection: sqlite3.Connection, config: dict[str, Any]) -> list[Finding]:
+    """Enabled groups that have stopped delivering messages.
+
+    In October six enabled groups had gone quiet for one to eight weeks with
+    nothing said: one had dropped the account from its member list, and the
+    rest were still listed while not one of their messages reached NapCat.
+    Nothing downstream can tell a quiet group from a lost one, so this weighs
+    each group's silence against how busy it was over the past month.
+    """
+    now = time.time()
+    acknowledged = {str(value) for value in config.get("group_silence_acknowledged") or []}
+    private = {str(value) for value in config.get("private_groups") or []}
+    rows = connection.execute(
+        """
+        SELECT g.group_id, coalesce(r.last_message_time, 0)
+        FROM monitored_groups g LEFT JOIN group_runtime r ON r.group_id = g.group_id
+        WHERE g.enabled = 1
+        """
+    ).fetchall()
+    silent = []
+    for group_id, last_message in rows:
+        if str(group_id) in acknowledged:
+            continue
+        images = connection.execute(
+            "SELECT count(*) FROM images WHERE group_id=? AND sent_at > ?",
+            (group_id, now - 30 * 86400),
+        ).fetchone()[0]
+        # About one image a day or more counts as busy.
+        busy = images >= 30
+        limit = int(config["group_silence_busy_seconds" if busy else "group_silence_quiet_seconds"])
+        quiet_for = now - int(last_message)
+        if quiet_for >= limit:
+            label = "不公开的群" if str(group_id) in private else f"群 {group_id}"
+            days = f"{quiet_for / 86400:.0f} 天" if last_message else "从未"
+            silent.append((quiet_for, f"{label} {days}没有消息"))
+    if not silent:
+        return [Finding("group_silence", OK, f"{len(rows)} 个启用的群都在正常收消息")]
+    silent.sort(reverse=True)
+    return [Finding(
+        "group_silence", WARN,
+        f"{len(silent)} 个启用的群异常安静（可能被踢或收不到推送）：" + "；".join(text for _, text in silent),
+    )]
+
+
 def check_policy_alarms(connection: sqlite3.Connection, config: dict[str, Any]) -> list[Finding]:
     findings: list[Finding] = []
     alarm = _runtime_state(connection, "critical_alarm")
@@ -712,6 +764,7 @@ def run_checks(config: dict[str, Any]) -> list[Finding]:
             findings.extend(check_policy_alarms(connection, config))
             findings.extend(check_recovery_gaps(connection, config))
             findings.extend(check_download_outcomes(connection, config))
+            findings.extend(check_group_silence(connection, config))
             findings.extend(check_disabled_groups(connection, config))
         finally:
             connection.close()
