@@ -69,7 +69,7 @@ DEFAULTS: dict[str, Any] = {
     # A disk filling over days is the one thing an operator legitimately parks
     # until the weekend, and it was explicitly asked to stop shouting hourly.
     # Everything else gets the interval above.
-    "quiet_check_prefixes": ["disk_", "gallery_storage", "archive_slow"],
+    "quiet_check_prefixes": ["disk_", "gallery_storage", "archive_slow", "download_stuck"],
     "quiet_cooldown_seconds": 43200,
     "recovery_cooldown_seconds": 3600,
     # The gallery's server maintenance writes this after every run.  It is what
@@ -102,6 +102,10 @@ DEFAULTS: dict[str, Any] = {
     # The ceiling history recovery runs are approved for, in calls per day
     # (60 an hour).  The live collector keeps its own 300 a day.
     "recovery_daily_calls": 1440,
+    # Images still queued after this long, and images given up on in a day.
+    # October averaged about one CDN failure a day; ten means something broke.
+    "download_stuck_seconds": 3 * 86400,
+    "download_lost_warn_per_day": 10,
     # Restarting NapCat re-launches QQ.  Off by default: turning it on is a
     # decision about whether an unattended restart is preferable to waiting for
     # a person, and that depends on whether the session can re-login on its own.
@@ -512,6 +516,48 @@ def check_recovery_gaps(connection: sqlite3.Connection, config: dict[str, Any]) 
     return [Finding("recovery", WARN, f"历史回捞有 {len(gaps)} 个群没补完：" + "；".join(gaps))]
 
 
+def check_download_outcomes(connection: sqlite3.Connection, config: dict[str, Any]) -> list[Finding]:
+    """Images found but never stored: stuck in the queue, or given up on.
+
+    502 images from the September recovery sat "deferred" for a month, each
+    waiting for a page replay that nothing was going to run, while the
+    recovery itself reported success.  A queued image is normally stored
+    within minutes and a backlog clears within a day, so anything still
+    queued after days is not going to resolve by waiting.
+    """
+    now = time.time()
+    stuck_seconds = int(config["download_stuck_seconds"])
+    count, oldest, attempts, error = connection.execute(
+        """
+        SELECT count(*), min(discovered_at), max(attempts),
+               (SELECT substr(coalesce(error, ''), 1, 60) FROM images
+                WHERE status IN ('queued','deferred','downloading') AND discovered_at < ?
+                GROUP BY 1 ORDER BY count(*) DESC LIMIT 1)
+        FROM images
+        WHERE status IN ('queued','deferred','downloading') AND discovered_at < ?
+        """,
+        (now - stuck_seconds, now - stuck_seconds),
+    ).fetchone()
+    findings: list[Finding] = []
+    if count:
+        findings.append(Finding(
+            "download_stuck", WARN,
+            f"{count} 张图排队超过 {stuck_seconds // 86400} 天还没下载下来"
+            f"（最早 {time.strftime('%m-%d', time.localtime(int(oldest)))} 发现，重试最多 {attempts} 次"
+            + (f"，多为：{error}" if error else "") + "）",
+        ))
+    lost = connection.execute(
+        """
+        SELECT count(*) FROM images
+        WHERE status IN ('failed_terminal','expired') AND updated_at > ?
+        """,
+        (now - 86400,),
+    ).fetchone()[0]
+    level = WARN if lost >= int(config["download_lost_warn_per_day"]) else OK
+    findings.append(Finding("download_lost", level, f"24 小时内放弃下载 {lost} 张图"))
+    return findings
+
+
 def check_policy_alarms(connection: sqlite3.Connection, config: dict[str, Any]) -> list[Finding]:
     findings: list[Finding] = []
     alarm = _runtime_state(connection, "critical_alarm")
@@ -651,6 +697,7 @@ def run_checks(config: dict[str, Any]) -> list[Finding]:
             findings.extend(check_intake(connection, config))
             findings.extend(check_policy_alarms(connection, config))
             findings.extend(check_recovery_gaps(connection, config))
+            findings.extend(check_download_outcomes(connection, config))
             findings.extend(check_disabled_groups(connection, config))
         finally:
             connection.close()
