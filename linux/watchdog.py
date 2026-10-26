@@ -84,6 +84,8 @@ DEFAULTS: dict[str, Any] = {
     # A run that finishes normally leaves a handful pending at most; hundreds
     # means images are failing one by one without stopping the run.
     "gallery_pending_warn": 200,
+    # Images the last run could not approve; one oversized file is expected.
+    "gallery_blocked_warn": 10,
     "gallery_storage_warn_percent": 90,
     # New images reach the site only after the archive publishes its index.
     # If no maintenance run has started since the archive last finished, they
@@ -409,6 +411,20 @@ def check_gallery(config: dict[str, Any]) -> list[Finding]:
         ))
     else:
         findings.append(Finding("gallery", OK, f"图库维护 {hours:.1f} 小时前完成，缺缩略图 {pending} 张"))
+
+    # An image in the catalog without a privacy approval is listed on the site
+    # and cannot be opened.  Right after a run that is only what failed it:
+    # quarantined until the processing policy changes, or deferred for retry.
+    try:
+        blocked = int(report["catalog"]) - int(report["approvalsPublished"])
+    except (KeyError, TypeError, ValueError):
+        blocked = 0
+    if blocked >= int(config["gallery_blocked_warn"]):
+        reasons = "、".join(f"{code} {count}" for code, count in (report.get("failureSummary") or {}).items())
+        findings.append(Finding(
+            "gallery_blocked", WARN,
+            f"图库有 {blocked} 张图没通过隐私检查，站上打不开" + (f"（{reasons}）" if reasons else ""),
+        ))
 
     # On late-September mornings the 05:00 run read the index before the
     # archive finished writing it, so every run looked clean while the newest
