@@ -69,7 +69,7 @@ DEFAULTS: dict[str, Any] = {
     # A disk filling over days is the one thing an operator legitimately parks
     # until the weekend, and it was explicitly asked to stop shouting hourly.
     # Everything else gets the interval above.
-    "quiet_check_prefixes": ["disk_", "gallery_storage"],
+    "quiet_check_prefixes": ["disk_", "gallery_storage", "archive_slow"],
     "quiet_cooldown_seconds": 43200,
     "recovery_cooldown_seconds": 3600,
     # The gallery's server maintenance writes this after every run.  It is what
@@ -90,6 +90,11 @@ DEFAULTS: dict[str, Any] = {
     # are on the site without thumbnails; allow a run this long to get going.
     "archive_log": "/opt/qqai-archive.log",
     "gallery_after_archive_grace_seconds": 3600,
+    # The archive starts at 04:30 and the 05:00 maintenance run waits for it
+    # for an hour, so past about 90 minutes the morning run is skipped.  It
+    # crept there a minute a day through October and skipped one on 2026-10-26
+    # before anything said so; a normal run takes a few minutes.
+    "archive_warn_seconds": 3600,
     # History recovery gaps that are known and accepted as permanent, as
     # "<not_before>:<group_id>".  Anything else a recovery run left partial or
     # failed is reported until it is recovered or listed here.
@@ -335,19 +340,27 @@ def check_disks(config: dict[str, Any]) -> list[Finding]:
     return findings
 
 
-def _last_archive_end(path: Path) -> float | None:
-    """When the archive last finished, from its own log's closing line."""
+def _last_archive_run(path: Path) -> tuple[float | None, float | None]:
+    """When the last finished archive run started and ended, from its own log."""
     try:
         with path.open("rb") as handle:
             handle.seek(max(0, path.stat().st_size - 65536))
             tail = handle.read().decode("utf-8", errors="replace")
     except OSError:
-        return None
+        return None, None
+    ended = None
     for line in reversed(tail.splitlines()):
-        match = re.match(r"===== (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) 结束", line)
-        if match:
-            return time.mktime(time.strptime(match.group(1), "%Y-%m-%d %H:%M:%S"))
-    return None
+        match = re.match(r"===== (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) (开始|结束)", line)
+        if not match:
+            continue
+        stamp = time.mktime(time.strptime(match.group(1), "%Y-%m-%d %H:%M:%S"))
+        # A run still in progress has a start and no end yet; skip past it.
+        if ended is None:
+            if match.group(2) == "结束":
+                ended = stamp
+        elif match.group(2) == "开始":
+            return stamp, ended
+    return None, ended
 
 
 def check_gallery(config: dict[str, Any]) -> list[Finding]:
@@ -389,7 +402,7 @@ def check_gallery(config: dict[str, Any]) -> list[Finding]:
     # archive finished writing it, so every run looked clean while the newest
     # images sat on the site without thumbnails until 11:00.  Maintenance now
     # waits for the archive; this catches it if that ever stops holding.
-    archived = _last_archive_end(Path(str(config.get("archive_log") or "")))
+    began, archived = _last_archive_run(Path(str(config.get("archive_log") or "")))
     try:
         started = dt.datetime.fromisoformat(str(report["startedAt"]).replace("Z", "+00:00")).timestamp()
     except (KeyError, ValueError, TypeError):
@@ -399,6 +412,13 @@ def check_gallery(config: dict[str, Any]) -> list[Finding]:
         findings.append(Finding(
             "gallery_order", WARN,
             f"归档 {time.strftime('%m-%d %H:%M', time.localtime(archived))} 写完后还没有图库维护跑过，新图没有缩略图",
+        ))
+    if began and archived and archived - began >= int(config["archive_warn_seconds"]):
+        findings.append(Finding(
+            "archive_slow", WARN,
+            f"归档 {time.strftime('%m-%d', time.localtime(began))} 用了 {(archived - began) / 60:.0f} 分钟"
+            f"（{time.strftime('%H:%M', time.localtime(began))}–{time.strftime('%H:%M', time.localtime(archived))}），"
+            "早上的图库维护最多等到 6 点左右，再慢就会跳过那一轮",
         ))
 
     used = report.get("retainedBytesAfter")
