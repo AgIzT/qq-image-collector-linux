@@ -14,8 +14,10 @@ from unittest import mock
 from qq_image_collector.database import increment_counter
 from qq_image_collector.onebot import OneBotError
 from qq_image_collector.window_recovery import (
+    RAW_ANCHOR_RETRIES,
     SHORT_ANCHOR_REPLAYS,
     SHORT_ANCHOR_RETRIES,
+    anchor_retry_delay,
     WindowPolicyError,
     WindowRecoveryRunner,
     main as window_recovery_main,
@@ -485,6 +487,42 @@ class WindowRecoveryTests(unittest.TestCase):
         self.assertEqual(job["next_anchor_seq"], "103")
         self.assertEqual(job["images_enqueued"], 1)
 
+    def test_a_failed_upper_anchor_is_retried_in_place_before_anything_else(self) -> None:
+        fake = FakeOneBot(
+            OneBotError("history temporarily unavailable"),
+            page(
+                history_message(103, NOT_AFTER - 1, image=True),
+                history_message(104, NOT_AFTER + 1),
+            ),
+        )
+        runner = self.make_runner(fake)
+        runner.initialize()
+        runner._budget_wait_seconds = lambda _now: 0  # type: ignore[method-assign]
+
+        self.assertTrue(runner.process_one_page())
+        job = runner.connection.execute("SELECT * FROM window_recovery_jobs").fetchone()
+        self.assertEqual(job["anchor_mode"], "current-upper")
+        self.assertEqual(job["next_anchor_id"], RAW_ANCHOR)
+        self.assertEqual(job["retry_count"], 1)
+        self.assertGreater(job["next_retry_at"], 0)
+
+        runner.connection.execute("UPDATE window_recovery_jobs SET next_retry_at=0")
+        runner.connection.commit()
+        self.assertTrue(runner.process_one_page())
+        self.assertEqual(fake.calls[1][1]["message_seq"], RAW_ANCHOR)
+        job = runner.connection.execute("SELECT * FROM window_recovery_jobs").fetchone()
+        self.assertEqual(job["anchor_mode"], "current-upper")
+        self.assertEqual(job["retry_count"], 0)
+        self.assertEqual(job["images_enqueued"], 1)
+
+    def test_anchor_retries_outlast_an_hour_long_history_outage(self) -> None:
+        # Half an hour of failures on 2026-10-26 ended a replay that had
+        # three minutes of patience.
+        for limit in (SHORT_ANCHOR_RETRIES, RAW_ANCHOR_RETRIES):
+            self.assertGreaterEqual(sum(anchor_retry_delay(n) for n in range(1, limit + 1)), 3600)
+        self.assertEqual(anchor_retry_delay(1), 60)
+        self.assertEqual(anchor_retry_delay(20), 1800)
+
     def test_invalid_current_upper_anchor_switches_once_to_latest_bootstrap(self) -> None:
         fake = FakeOneBot(
             OneBotError("current raw anchor is unavailable"),
@@ -496,6 +534,11 @@ class WindowRecoveryTests(unittest.TestCase):
         runner = self.make_runner(fake)
         runner.initialize()
         runner._budget_wait_seconds = lambda _now: 0  # type: ignore[method-assign]
+        # The anchor has already failed as often as a transient error is given.
+        runner.connection.execute(
+            "UPDATE window_recovery_jobs SET retry_count=?", (RAW_ANCHOR_RETRIES,)
+        )
+        runner.connection.commit()
 
         self.assertTrue(runner.process_one_page())
 

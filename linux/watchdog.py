@@ -509,7 +509,7 @@ def check_recovery_gaps(connection: sqlite3.Connection, config: dict[str, Any]) 
     try:
         rows = connection.execute(
             """
-            SELECT group_id, not_before, not_after, status, next_anchor_time
+            SELECT group_id, not_before, not_after, status, next_anchor_time, messages_in_window
             FROM window_recovery_jobs
             WHERE status LIKE 'partial%' OR status LIKE 'failed%'
             ORDER BY not_before, group_id
@@ -520,8 +520,14 @@ def check_recovery_gaps(connection: sqlite3.Connection, config: dict[str, Any]) 
     acknowledged = {str(value) for value in config.get("recovery_acknowledged") or []}
     stamp = lambda value: time.strftime("%m-%d %H:%M", time.localtime(int(value)))
     gaps = []
-    for group_id, not_before, not_after, status, anchor_time in rows:
+    for group_id, not_before, not_after, status, anchor_time, in_window in rows:
         if f"{not_before}:{group_id}" in acknowledged:
+            continue
+        if not in_window:
+            # Images an earlier run found in the same window say nothing about
+            # how far this one got; on 2026-10-28 they turned a replay that
+            # never arrived into "09-15 21:27 到 09-15 21:27 没翻到".
+            gaps.append(f"群 {group_id}（{status}）{stamp(not_before)} 到 {stamp(not_after)} 一页都没翻进去")
             continue
         # Only images the recovery itself paged through say how deep it got;
         # live images from the edges of the window would hide a hole between.

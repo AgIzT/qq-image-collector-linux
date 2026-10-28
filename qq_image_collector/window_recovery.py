@@ -49,9 +49,16 @@ from .onebot import OneBotClient, OneBotError
 NONTERMINAL_STATUSES = ("probe", "queued", "deferred")
 CURRENT_UPPER = "current-upper"
 LATEST_BOOTSTRAP = "latest-bootstrap"
-# Consecutive failed calls on one short anchor before it is treated as expired
-# and the job replays from its durable raw anchor.
-SHORT_ANCHOR_RETRIES = 3
+# Consecutive failed calls on one anchor before the anchor itself is blamed:
+# a short anchor is then taken as expired and the job replays from its durable
+# raw anchor, and a raw upper anchor gives way to a latest-page bootstrap.  The
+# retries back off from one minute to thirty, about an hour in all.  On
+# 2026-10-26 every history call failed for half an hour; three retries over
+# three minutes sent a replay of 519382846 back to the top after 237 pages, and
+# one failure on the raw anchor switched it to a bootstrap from the group's
+# newest message, which cannot reach a window six weeks old, ending the job.
+SHORT_ANCHOR_RETRIES = 6
+RAW_ANCHOR_RETRIES = 6
 # Replays from the top before a point that keeps failing is taken as the end of
 # the history this account can read.  A NapCat restart costs one replay; a wall
 # such as the account's join date costs every replay there is.
@@ -144,6 +151,11 @@ def _normalized_history_page(
     if not page:
         raise WindowDirectionError("history response contains no usable messages")
     return page
+
+
+def anchor_retry_delay(retries: int) -> int:
+    """Seconds before retry ``retries`` of a failed anchor: 1, 2, 4 ... 30 min."""
+    return min(1800, 60 * (2 ** (max(1, retries) - 1)))
 
 
 def _page_fingerprint(page: list[dict[str, Any]]) -> str:
@@ -653,7 +665,12 @@ class WindowRecoveryRunner:
         now = int(time.time())
         retries = int(job["retry_count"] or 0) + 1
         short_anchor = str(job["next_anchor_id"]) != str(job["start_anchor_id"])
-        if short_anchor and retries <= SHORT_ANCHOR_RETRIES:
+        retry_in_place = (
+            retries <= SHORT_ANCHOR_RETRIES
+            if short_anchor
+            else str(job["anchor_mode"]) == CURRENT_UPPER and retries <= RAW_ANCHOR_RETRIES
+        )
+        if retry_in_place:
             # One failed call says nothing about the short-ID map.  In the
             # September recovery 16 of 5,091 calls failed while NapCat never
             # restarted, and every one of them sent its group back to the top
@@ -671,8 +688,8 @@ class WindowRecoveryRunner:
                 """,
                 (
                     retries,
-                    now + min(300, 30 * (2 ** (retries - 1))),
-                    f"short anchor retry {retries} after {type(exc).__name__}",
+                    now + anchor_retry_delay(retries),
+                    f"{'short' if short_anchor else 'upper'} anchor retry {retries} after {type(exc).__name__}",
                     now,
                     int(job["id"]),
                 ),
@@ -713,13 +730,12 @@ class WindowRecoveryRunner:
                     next_anchor_seq=start_anchor_seq,
                     next_anchor_time=start_anchor_time,
                     last_page_fingerprint=NULL,
-                    retry_count=?, replay_count=replay_count+1,
+                    retry_count=0, replay_count=replay_count+1,
                     history_calls=history_calls+1,
                     next_retry_at=?, last_error=?, updated_at=?
                 WHERE id=?
                 """,
                 (
-                    retries,
                     now + max(2, self.interval_seconds),
                     f"short anchor reset after {type(exc).__name__}",
                     now,
