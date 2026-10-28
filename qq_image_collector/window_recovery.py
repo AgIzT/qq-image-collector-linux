@@ -629,7 +629,10 @@ class WindowRecoveryRunner:
         try:
             payload = self.onebot.call("get_group_msg_history", params)
         except Exception as exc:
-            self._finish_call(call_id, "error", type(exc).__name__)
+            # Keep NapCat's own wording.  On 2026-10-26 a replay failed with
+            # nothing but the class name on record, and NapCat's log had
+            # rotated past the call by the time anyone asked why.
+            self._finish_call(call_id, "error", f"{type(exc).__name__}: {exc}")
             raise
         self._finish_call(call_id, "ok")
         return call_id, payload
