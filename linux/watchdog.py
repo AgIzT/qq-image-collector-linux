@@ -546,6 +546,10 @@ def check_recovery_gaps(connection: sqlite3.Connection, config: dict[str, Any]) 
     return [Finding("recovery", WARN, f"历史回捞有 {len(gaps)} 个群没补完：" + "；".join(gaps))]
 
 
+# Prefix of the error recorded when an operator gives up on images by hand.
+OPERATOR_CLOSED = "closed by operator"
+
+
 def check_download_outcomes(connection: sqlite3.Connection, config: dict[str, Any]) -> list[Finding]:
     """Images found but never stored: stuck in the queue, or given up on.
 
@@ -576,12 +580,15 @@ def check_download_outcomes(connection: sqlite3.Connection, config: dict[str, An
             f"（最早 {time.strftime('%m-%d', time.localtime(int(oldest)))} 发现，重试最多 {attempts} 次"
             + (f"，多为：{error}" if error else "") + "）",
         ))
+    # Images an operator has written off were decided on, not lost; counting
+    # them turned the closing of 413 unrecoverable images into a day of alarms.
     lost = connection.execute(
         """
         SELECT count(*) FROM images
         WHERE status IN ('failed_terminal','expired') AND updated_at > ?
+          AND coalesce(error, '') NOT LIKE ?
         """,
-        (now - 86400,),
+        (now - 86400, OPERATOR_CLOSED + "%"),
     ).fetchone()[0]
     level = WARN if lost >= int(config["download_lost_warn_per_day"]) else OK
     findings.append(Finding("download_lost", level, f"24 小时内放弃下载 {lost} 张图"))
@@ -602,13 +609,13 @@ def check_group_silence(connection: sqlite3.Connection, config: dict[str, Any]) 
     private = {str(value) for value in config.get("private_groups") or []}
     rows = connection.execute(
         """
-        SELECT g.group_id, coalesce(r.last_message_time, 0)
+        SELECT g.group_id, coalesce(r.last_message_time, 0), coalesce(g.created_at, 0)
         FROM monitored_groups g LEFT JOIN group_runtime r ON r.group_id = g.group_id
         WHERE g.enabled = 1
         """
     ).fetchall()
     silent = []
-    for group_id, last_message in rows:
+    for group_id, last_message, added in rows:
         if str(group_id) in acknowledged:
             continue
         images = connection.execute(
@@ -618,13 +625,20 @@ def check_group_silence(connection: sqlite3.Connection, config: dict[str, Any]) 
         # About one image a day or more counts as busy.
         busy = images >= 30
         limit = int(config["group_silence_busy_seconds" if busy else "group_silence_quiet_seconds"])
-        quiet_for = now - int(last_message)
+        # A group added an hour ago has not been silent since 1970.
+        quiet_for = now - max(int(last_message), int(added))
         if quiet_for >= limit:
             label = "不公开的群" if str(group_id) in private else f"群 {group_id}"
-            days = f"{quiet_for / 86400:.0f} 天" if last_message else "从未"
-            silent.append((quiet_for, f"{label} {days}没有消息"))
+            if last_message:
+                silent.append((quiet_for, f"{label} {quiet_for / 86400:.0f} 天没有消息"))
+            else:
+                silent.append((quiet_for, f"{label} 加入监控 {quiet_for / 86400:.0f} 天一直没有消息"))
+    known = sum(1 for row in rows if str(row[0]) in acknowledged)
     if not silent:
-        return [Finding("group_silence", OK, f"{len(rows)} 个启用的群都在正常收消息")]
+        return [Finding(
+            "group_silence", OK,
+            f"{len(rows) - known} 个启用的群都在正常收消息" + (f"，另有 {known} 个已知静默" if known else ""),
+        )]
     silent.sort(reverse=True)
     return [Finding(
         "group_silence", WARN,
