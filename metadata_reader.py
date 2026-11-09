@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import struct
 import zlib
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -22,6 +23,9 @@ from typing import Any
 
 from PIL import Image, PngImagePlugin
 
+
+EXIF_USER_COMMENT = 37510
+EXIF_SUB_IFD = 0x8769
 
 PNG_TEXT_CHUNK_LIMIT = 16 * 1024 * 1024
 PNG_TEXT_TOTAL_LIMIT = 64 * 1024 * 1024
@@ -76,6 +80,42 @@ class MetadataResult:
     image_format: str
 
 
+def _unicode_comment_encodings(raw: bytes) -> list[str]:
+    """Pick the byte order of an EXIF ``UNICODE`` comment.
+
+    The EXIF payload carries no BOM; it follows the TIFF byte order. A1111 and
+    piexif write big-endian, while Python's ``utf-16`` codec assumes
+    little-endian without a BOM and turns that text into CJK-looking garbage
+    instead of failing. Prompts are mostly ASCII, so the zero high bytes reveal
+    the order; without that evidence keep the previous little-endian default.
+    """
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return ["utf-16", "utf-8"]
+    if raw[0::2].count(0) > raw[1::2].count(0):
+        return ["utf-16-be", "utf-16-le", "utf-8"]
+    return ["utf-16-le", "utf-16-be", "utf-8"]
+
+
+def _read_exif_user_comment(image: Image.Image) -> Any:
+    """Return EXIF UserComment from IFD0 or the standard Exif sub-IFD.
+
+    ``Image.getexif()`` only exposes IFD0. Writers that follow the EXIF spec
+    (A1111/Forge through piexif, cameras, most editors) store UserComment in
+    the Exif sub-IFD (0x8769), which ``getexif().get(37510)`` never sees.
+    """
+    try:
+        exif = image.getexif()
+    except (AttributeError, ValueError, TypeError, OSError, SyntaxError):
+        return None
+    user_comment = exif.get(EXIF_USER_COMMENT)
+    if user_comment is not None:
+        return user_comment
+    try:
+        return exif.get_ifd(EXIF_SUB_IFD).get(EXIF_USER_COMMENT)
+    except (AttributeError, ValueError, TypeError, OSError, SyntaxError, KeyError, struct.error):
+        return None
+
+
 def _decode_user_comment(value: Any) -> str | None:
     if value is None:
         return None
@@ -89,7 +129,8 @@ def _decode_user_comment(value: Any) -> str | None:
     if raw.startswith(b"ASCII\x00\x00\x00"):
         raw, encodings = raw[8:], ["utf-8", "latin-1"]
     elif raw.startswith(b"UNICODE\x00"):
-        raw, encodings = raw[8:], ["utf-16", "utf-16-be", "utf-8"]
+        raw = raw[8:]
+        encodings = _unicode_comment_encodings(raw)
     elif raw.startswith(b"JIS\x00\x00\x00\x00\x00"):
         raw, encodings = raw[8:], ["shift_jis", "utf-8"]
     else:
@@ -449,10 +490,7 @@ def inspect_image(path: str | Path) -> MetadataResult:
             if isinstance(value, (str, int, float, bool, dict, list)):
                 info_fields[str(key)] = _json_safe(value)
 
-        try:
-            user_comment = image.getexif().get(37510)
-        except (AttributeError, ValueError, TypeError):
-            user_comment = None
+        user_comment = _read_exif_user_comment(image)
         decoded_comment = _decode_user_comment(user_comment)
         exif_fields = {"UserComment": decoded_comment} if decoded_comment else {}
         if decoded_comment:

@@ -13,6 +13,7 @@ from linux.diagnostic_compare import metadata_summary
 from qq_image_collector.database import accepted_path_for, category_for_source
 from metadata_reader import (
     PNG_TEXT_CHUNK_LIMIT,
+    _decode_user_comment,
     _decompress_png_text,
     _extract_stealth_png,
     inspect_image,
@@ -435,6 +436,63 @@ class MetadataReaderTests(unittest.TestCase):
         self.assertTrue(result.accepted)
         self.assertEqual(result.source, "a1111-compatible")
         self.assertIn("Steps: 20", result.fields["UserComment"])
+
+    A1111_TEXT = "cat, 1girl\nNegative prompt: bad\nSteps: 20, Sampler: Euler a, Seed: 2, Size: 8x8"
+
+    def test_user_comment_in_exif_sub_ifd(self) -> None:
+        # A1111/Forge (piexif) store UserComment in the Exif sub-IFD, which
+        # Image.getexif() does not expose as a top-level tag.
+        path = self.root / "a1111-sub-ifd.jpg"
+        image = Image.new("RGB", (8, 8), "white")
+        exif = image.getexif()
+        exif.get_ifd(0x8769)[37510] = b"UNICODE\x00" + self.A1111_TEXT.encode("utf-16-be")
+        image.save(path, exif=exif)
+
+        result = inspect_image(path)
+        self.assertTrue(result.accepted)
+        self.assertEqual(result.source, "a1111-compatible")
+        self.assertEqual(result.fields["UserComment"], self.A1111_TEXT)
+
+    def test_user_comment_in_webp_exif_sub_ifd(self) -> None:
+        path = self.root / "a1111-sub-ifd.webp"
+        image = Image.new("RGB", (8, 8), "white")
+        exif = image.getexif()
+        exif.get_ifd(0x8769)[37510] = b"ASCII\x00\x00\x00" + self.A1111_TEXT.encode()
+        image.save(path, exif=exif)
+
+        result = inspect_image(path)
+        self.assertEqual(result.source, "a1111-compatible")
+        self.assertEqual(result.fields["UserComment"], self.A1111_TEXT)
+
+    def test_ifd0_user_comment_wins_over_sub_ifd(self) -> None:
+        path = self.root / "both-ifds.jpg"
+        image = Image.new("RGB", (8, 8), "white")
+        exif = image.getexif()
+        exif[37510] = b"ASCII\x00\x00\x00" + self.A1111_TEXT.encode()
+        exif.get_ifd(0x8769)[37510] = b"ASCII\x00\x00\x00creator note"
+        image.save(path, exif=exif)
+
+        result = inspect_image(path)
+        self.assertEqual(result.fields["UserComment"], self.A1111_TEXT)
+
+    def test_unicode_user_comment_byte_order(self) -> None:
+        for encoding in ("utf-16-be", "utf-16-le"):
+            with self.subTest(encoding=encoding):
+                raw = b"UNICODE\x00" + self.A1111_TEXT.encode(encoding)
+                self.assertEqual(_decode_user_comment(raw), self.A1111_TEXT)
+        with_bom = b"UNICODE\x00" + "猫, Steps: 20".encode("utf-16")
+        self.assertEqual(_decode_user_comment(with_bom), "猫, Steps: 20")
+        cjk_only = b"UNICODE\x00" + "猫猫".encode("utf-16-le")
+        self.assertEqual(_decode_user_comment(cjk_only), "猫猫")
+
+    def test_plain_user_comment_in_sub_ifd_is_rejected(self) -> None:
+        path = self.root / "camera.jpg"
+        image = Image.new("RGB", (8, 8), "white")
+        exif = image.getexif()
+        exif.get_ifd(0x8769)[37510] = b"ASCII\x00\x00\x00shot on my phone"
+        image.save(path, exif=exif)
+
+        self.assertFalse(inspect_image(path).accepted)
 
     def test_nested_bytes_metadata_is_json_serializable(self) -> None:
         class FakeImage:

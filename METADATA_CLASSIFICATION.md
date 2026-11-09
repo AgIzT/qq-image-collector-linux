@@ -53,7 +53,10 @@ Alpha is a normal NovelAI fallback channel, not evidence of unreadability. zTXt
 is also not allowed to downgrade a complete ordinary `tEXt`/`iTXt` Comment.
 
 Supported channels are PNG `tEXt`, `iTXt`, and `zTXt`, EXIF `UserComment`, and
-NovelAI `stealth_pngcomp` Alpha data. The parser keeps ordinary PNG text separate
+NovelAI `stealth_pngcomp` Alpha data. `UserComment` is read from IFD0 first and
+then from the standard Exif sub-IFD (`0x8769`), where A1111/Forge and piexif
+write it. A `UNICODE` comment has no BOM and follows the TIFF byte order, so its
+byte order is detected from the text instead of assuming little-endian. The parser keeps ordinary PNG text separate
 from zTXt so Pillow's merged `Image.info` view cannot change the official fallback
 decision. SHA-256 deduplicates stored image entities;
 message occurrences remain in SQLite.
@@ -62,7 +65,9 @@ message occurrences remain in SQLite.
 
 The parser keeps legacy `novelai-stealth` and `novelai-ztxt` values mapped to
 `NAI含参但不可直接读取的`. Parser version `5` records the corrected official
-fallback simulation in the asset table.
+fallback simulation in the asset table. Parser version `6` adds the Exif sub-IFD
+`UserComment` and big-endian `UNICODE` decoding; images that version `5` rejected
+for this reason were never stored, so there is nothing to reclassify.
 
 Normal event Worker startup never reclassifies or rehashes existing assets. This
 does not affect classification of newly collected files. Explicit provenance
