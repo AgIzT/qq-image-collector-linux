@@ -27,7 +27,42 @@
 
 生产探针（只听 WS，不调用 OneBot HTTP）确认：链接直接 GET 返回 200、
 `application/octet-stream`、`Content-Length` 等于 `file_size`，首字节为 PNG 魔数；
-观测到 `gzc-download`、`njc-download` 两个地区主机。
+观测到 `gzc-download`、`njc-download`、`tjc-download` 三个地区主机。坏链接返回 403
+（不会 200 返回错误页），同一链接 10 分钟后仍可重复下载。
+
+### 已有群文件的一次性补采
+
+图片名的群文件基本是永久文件（`busid=102`、`dead_time=0`），上线前发的仍可下载：
+2026-11-18 统计 25 个启用群共 6934 个图片名文件（含已过期的临时文件 `busid=104`
+不到 200 个）。补采是运维工具 `python -m qq_image_collector.group_file_backfill`，
+不属于 Worker：
+
+- 只用三个 Worker 从不调用的动作：`get_group_root_files`、
+  `get_group_files_by_folder`、`get_group_file_url`，各自走工具内的白名单客户端。
+  `get_group_file_url` 与 NapCat 处理每条实时文件消息时调用的是同一个
+  GetGroupFileUrl；每个文件间隔 2 秒，下载本身串行。
+- NapCat 4.18 等待内核 `onGroupFileInfoUpdate` 时不核对群号，一次超时后，前一个
+  请求的迟到结果会交给下一个请求。列表条目自带真实 `group_id`，工具只保留与请求
+  一致的条目；整份结果都属于别的群时本轮跳过该群。列表里的 `file_id` 是 NapCat
+  内存缓存令牌（5000 条、24 小时），每次列表都变，所以稳定身份是
+  `groupfile:` + sha256(群、文件名、大小、`modify_time`)；`upload_time` 恒为 0，
+  `modify_time` 才是上传时间，用作 `sent_at`。
+- 与实时文件同群、同名、同大小的跳过；字节相同的由 SHA-256 去重。行插入时直接是
+  `downloading`，同一次运行内结束，Worker 不会领取；万一残留，`url_refresh_attempted`
+  与 `url_refresh_failures` 预置到上限前一次，Worker 第一次刷新就放弃，绝不拿
+  编造的锚点调用 `get_group_msg_history`。下次运行先把残留行关成 `expired` 再重试；
+  `expired` 失败两轮后不再重试。
+- 图库卷本地保留 14 天、常年只剩几 GB，写满时采集会静默停止（见 R2_ARCHIVE.md）。
+  工具在剩余空间低于 `--min-free-bytes`（默认 3 GiB）前停下，并把写过的日期记在
+  `state/group_file_backfill.json`。宿主机上的
+  `linux/ops/group_file_backfill_driver.py` 循环：日期静默满 `seal_hours`
+  且早于 `keep_days` 后，对这些日期跑一次常规 `archive_to_r2.py --upload --purge`
+  （同一把 `qqai-archive.lock`、同样的 HEAD 核对，缩略图已由 fast-update 从本地
+  文件生成），腾出空间再补下一批。以 transient unit `qqai-group-file-backfill`
+  运行，日志 `/var/log/qqai-group-file-backfill.log`，可随时停下重跑。
+
+试跑（709223435 群 12 个文件）：4 张入库、8 张无元数据，下载约 150 MB，只落盘
+6.8 MB；平均每个文件约 10 秒。
 
 ## 2026-08-04 PNG 大型元数据与单图容错
 
