@@ -53,6 +53,7 @@ COUNTER_COLUMNS = frozenset(
         "duplicates",
         "failed",
         "expired",
+        "group_file_images",
     }
 )
 
@@ -349,6 +350,7 @@ def connect_database(
             duplicates INTEGER NOT NULL DEFAULT 0,
             failed INTEGER NOT NULL DEFAULT 0,
             expired INTEGER NOT NULL DEFAULT 0,
+            group_file_images INTEGER NOT NULL DEFAULT 0,
             updated_at INTEGER NOT NULL
         )
         """
@@ -362,6 +364,7 @@ def connect_database(
             "cdn_400": "INTEGER NOT NULL DEFAULT 0",
             "expired": "INTEGER NOT NULL DEFAULT 0",
             "window_history_calls": "INTEGER NOT NULL DEFAULT 0",
+            "group_file_images": "INTEGER NOT NULL DEFAULT 0",
         },
     )
     connection.execute(

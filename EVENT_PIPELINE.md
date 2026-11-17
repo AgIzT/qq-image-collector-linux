@@ -3,6 +3,32 @@
 本文记录生产链路的不可变约束。流程、解析或风险模型更新时，必须同时更新本文、
 测试和控制台字段。
 
+## 2026-11-17 群文件形式的原图
+
+不少用户为保留原图元数据，把 1–10 MB 的 PNG/JPG 作为群文件而不是图片发送；此前
+解析器只看 `image` 段，这部分全部漏采（NapCat 日志约 27 小时内有 117 个图片名的
+群文件）。NapCat 4.18 在把 `fileElement` 转成 OneBot `file` 段时，已经自行调用
+`GetGroupFileUrl`（OIDB 包），把 `https://<地区>-download.ftn.qq.com/ftn_handler/<hex>/?fname=`
+写进 `data.url`；历史接口默认 `disable_get_url=false`，同样带链接。因此采集器不新增
+任何 OneBot 动作，白名单仍只有四个动作。
+
+- 只入队文件名后缀为 `.png/.jpg/.jpeg/.webp/.avif` 的 `file` 段；其余文件（压缩包、
+  视频、模型、GIF）不下载。`file` 段按 `file_id == raw fileUuid`、再按文件名与 raw
+  `fileElement` 配对；转换失败只剩 raw 时仍以 `raw-only` 入队，靠历史刷新取链接。
+- 文件条目的 `image_index` 排在同一消息全部图片之后，`resolver_json.source_kind`
+  为 `group_file`，`original_flag=1`（群文件是发送者原始字节），`url_expires_at`
+  留空：尚未观测到群文件链接的 TTL，链接照常请求，400/403/404/410 时与图片相同，
+  用 raw `msgId` 调一次 `get_group_msg_history` 换新链接。
+- 下载白名单额外放行 HTTPS、主机以 `.ftn.qq.com` 结尾且路径以 `/ftn_handler/` 开头
+  的 URL；其余主机、端口、认证字段仍失败关闭。字节格式、GIF 魔数、128 MiB 上限、
+  元数据判定与 SHA-256 去重完全复用图片链路，同一张图既发图片又发文件只存一份。
+- `hourly_counters.group_file_images` 单独计数入队的群文件图片，`image_segments`
+  不再包含它们；`images_seen` 仍是两者之和。控制台 `/api/status` 的 `today` 带此字段。
+
+生产探针（只听 WS，不调用 OneBot HTTP）确认：链接直接 GET 返回 200、
+`application/octet-stream`、`Content-Length` 等于 `file_size`，首字节为 PNG 魔数；
+观测到 `gzc-download`、`njc-download` 两个地区主机。
+
 ## 2026-08-04 PNG 大型元数据与单图容错
 
 生产恢复页出现了超过 Pillow 默认 1 MiB 压缩文本限制的 PNG 工作流。解析器现允许

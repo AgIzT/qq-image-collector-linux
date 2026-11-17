@@ -27,6 +27,11 @@ from .database import (
 ALLOWED_CDN_HOSTS = frozenset(
     {"gchat.qpic.cn", "multimedia.nt.qq.com.cn", "gxh.vip.qq.com"}
 )
+# Group files come from QQ's file-transfer servers.  NapCat 4.18 builds the
+# link as https://<downloadDns>/ftn_handler/<hex>/?fname= from its OIDB reply;
+# the DNS name varies by region, so the suffix and path are fixed instead.
+GROUP_FILE_HOST_SUFFIX = ".ftn.qq.com"
+GROUP_FILE_PATH_PREFIX = "/ftn_handler/"
 GIF_SIGNATURES = (b"GIF87a", b"GIF89a")
 QQ_PARCEL_EXPRESSION_HOSTS = frozenset({"gxh.vip.qq.com", "p.qpic.cn"})
 METADATA_DECODE_ERRORS = (
@@ -159,7 +164,10 @@ def validate_cdn_url(url: str) -> str:
     except ValueError as exc:
         raise DownloadPolicyError(f"invalid CDN URL: {exc}") from exc
     hostname = (parsed.hostname or "").lower()
-    if parsed.scheme != "https" or hostname not in ALLOWED_CDN_HOSTS:
+    group_file = hostname.endswith(GROUP_FILE_HOST_SUFFIX) and parsed.path.startswith(
+        GROUP_FILE_PATH_PREFIX
+    )
+    if parsed.scheme != "https" or not (hostname in ALLOWED_CDN_HOSTS or group_file):
         raise DownloadPolicyError(f"CDN URL is not allowed: {parsed.scheme}://{hostname}")
     if parsed.username or parsed.password or parsed.port not in {None, 443}:
         raise DownloadPolicyError("CDN URL contains forbidden authority fields")

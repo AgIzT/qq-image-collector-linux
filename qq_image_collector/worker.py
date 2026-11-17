@@ -82,6 +82,14 @@ def _brief(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {detail[:240]}" if detail else type(exc).__name__
 
 
+def _count_queued_item(connection: sqlite3.Connection, item: dict[str, Any]) -> None:
+    increment_counter(connection, "images_seen")
+    if (item.get("resolver_data") or {}).get("source_kind") == "group_file":
+        increment_counter(connection, "group_file_images")
+    else:
+        increment_counter(connection, "image_segments")
+
+
 def _setting(connection: sqlite3.Connection, key: str, default: Any) -> Any:
     row = connection.execute("SELECT value_json FROM app_settings WHERE key=?", (key,)).fetchone()
     if not row:
@@ -187,8 +195,7 @@ class CollectorWorker:
                 from .database import enqueue_image
 
                 for item in items:
-                    increment_counter(self.connection, "images_seen")
-                    increment_counter(self.connection, "image_segments")
+                    _count_queued_item(self.connection, item)
                     enqueue_image(self.connection, item)
                     mark_group_image(self.connection, item["group_id"], int(time.time()))
                 return
@@ -410,8 +417,7 @@ class CollectorWorker:
                 if not in_gap:
                     continue
                 for item in items:
-                    increment_counter(self.connection, "images_seen")
-                    increment_counter(self.connection, "image_segments")
+                    _count_queued_item(self.connection, item)
                     enqueue_image(self.connection, item)
                     discovered += 1
             if job_id is not None:

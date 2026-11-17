@@ -20,6 +20,10 @@ MD5_TOKEN = re.compile(r"(?i)(?<![0-9a-f])([0-9a-f]{32})(?![0-9a-f])")
 # 30 minutes and 400 responses around 60 minutes.  This is a scheduling window,
 # not a claim about the server-side token's exact TTL.
 RKEY_TTL_HINT_SECONDS = 30 * 60
+# Original images are often posted as group files instead of pictures; the
+# extension is the only signal before the bytes arrive, and the downloader
+# still decides by magic.  GIF is left out because it is never kept.
+IMAGE_FILE_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".webp", ".avif"})
 
 
 def _text(value: Any) -> str | None:
@@ -68,6 +72,44 @@ def _raw_picture_elements(raw: dict[str, Any]) -> list[dict[str, Any]]:
         if isinstance(picture, dict):
             pictures.append(picture)
     return pictures
+
+
+def _raw_file_elements(raw: dict[str, Any]) -> list[dict[str, Any]]:
+    files: list[dict[str, Any]] = []
+    for element in raw.get("elements") or []:
+        if not isinstance(element, dict):
+            continue
+        file_element = element.get("fileElement")
+        if isinstance(file_element, dict):
+            files.append(file_element)
+    return files
+
+
+def is_image_file_name(value: Any) -> bool:
+    name = _file_name(value)
+    return "." in name and name[name.rindex(".") :] in IMAGE_FILE_EXTENSIONS
+
+
+def _match_raw_file(
+    data: dict[str, Any],
+    files: list[dict[str, Any]],
+    used: set[int],
+) -> tuple[dict[str, Any], str]:
+    """Pair a OneBot file segment with its raw fileElement by UUID, then name."""
+
+    file_id = str(data.get("file_id") or "")
+    if file_id:
+        for index, element in enumerate(files):
+            if index not in used and str(element.get("fileUuid") or "") == file_id:
+                used.add(index)
+                return element, "file-uuid"
+    name = _file_name(data.get("file"))
+    if name:
+        for index, element in enumerate(files):
+            if index not in used and _file_name(element.get("fileName")) == name:
+                used.add(index)
+                return element, "file-name"
+    return {}, "missing"
 
 
 def _md5_token(*values: Any) -> str | None:
@@ -249,20 +291,77 @@ def parse_group_event(message: dict[str, Any]) -> tuple[dict[str, Any] | None, l
             "declared_size": declared_size,
             "resolver_data": resolver_data,
             "original_flag": original,
-            "group_uin": group_id,
-            "group_name": _text(message.get("group_name")),
-            "sender_uin": _text(
-                raw.get("senderUin") or message.get("user_id") or sender.get("user_id")
-            ),
-            "sender_uid": _text(
-                raw.get("senderUid") or sender.get("user_uid") or sender.get("uid")
-            ),
-            "sender_member_name": _text(raw.get("sendMemberName") or sender.get("card")),
-            "sender_nickname": _text(raw.get("sendNickName") or sender.get("nickname")),
-            "sender_remark_name": _text(raw.get("sendRemarkName") or sender.get("remark")),
-            "message_text": _message_text(message),
             "discovered_at": discovered_at,
+            **message_fields,
         }
+
+    def build_file_item(
+        data: dict[str, Any],
+        element: dict[str, Any],
+        raw_match: str,
+        index: int,
+    ) -> dict[str, Any]:
+        # NapCat fetches a group-file download URL while converting the event
+        # (GetGroupFileUrl), so the live segment normally already carries it;
+        # the collector itself makes no extra account call for a file.
+        url = str(data.get("url") or "")
+        host, has_rkey = _url_traits(url)
+        discovered_at = int(time.time())
+        resolver_data = {
+            "source_kind": "group_file",
+            "url": url,
+            "origin_url": "",
+            "url_host": host,
+            "origin_url_host": "",
+            "data_url_has_rkey": has_rkey,
+            "origin_url_has_rkey": False,
+            # No TTL has been observed for group-file URLs.  Leaving the hint
+            # empty keeps the URL requestable; a 4xx still triggers a refresh.
+            "url_expires_at": None,
+            "url_expiry_basis": None,
+            "raw_message_id": raw_nt_message_id or None,
+            "raw_message_seq": raw_nt_message_seq
+            or str(message.get("real_seq") or "")
+            or None,
+            "raw_match": raw_match,
+            "file_id": str(data.get("file_id") or element.get("fileUuid") or "") or None,
+            "width": _integer(element.get("picWidth")),
+            "height": _integer(element.get("picHeight")),
+            "md5": str(element.get("fileMd5") or ""),
+            "summary": "",
+            "sub_type": None,
+            "emoji_signal": False,
+            "url_refreshed": False,
+        }
+        return {
+            "group_id": group_id,
+            "message_id": raw_message_id,
+            "message_seq": message_seq,
+            "sent_at": sent_at,
+            "image_index": index,
+            "file": str(data.get("file") or element.get("fileName") or ""),
+            "declared_size": _integer(data.get("file_size") or element.get("fileSize")),
+            "resolver_data": resolver_data,
+            # A group file is the sender's exact bytes, never recompressed.
+            "original_flag": 1,
+            "discovered_at": discovered_at,
+            **message_fields,
+        }
+
+    message_fields = {
+        "group_uin": group_id,
+        "group_name": _text(message.get("group_name")),
+        "sender_uin": _text(
+            raw.get("senderUin") or message.get("user_id") or sender.get("user_id")
+        ),
+        "sender_uid": _text(
+            raw.get("senderUid") or sender.get("user_uid") or sender.get("uid")
+        ),
+        "sender_member_name": _text(raw.get("sendMemberName") or sender.get("card")),
+        "sender_nickname": _text(raw.get("sendNickName") or sender.get("nickname")),
+        "sender_remark_name": _text(raw.get("sendRemarkName") or sender.get("remark")),
+        "message_text": _message_text(message),
+    }
 
     for segment in message.get("message") or []:
         if not isinstance(segment, dict) or segment.get("type") != "image":
@@ -280,6 +379,25 @@ def parse_group_event(message: dict[str, Any]) -> tuple[dict[str, Any] | None, l
         if raw_index in used_raw_pictures:
             continue
         image_items.append(build_item({}, picture, "raw-only", image_index))
+        image_index += 1
+
+    # Group files get indexes after every picture so a message's existing
+    # picture rows keep their identity.  Only image-named files are queued.
+    raw_files = _raw_file_elements(raw)
+    used_raw_files: set[int] = set()
+    for segment in message.get("message") or []:
+        if not isinstance(segment, dict) or segment.get("type") != "file":
+            continue
+        data = segment.get("data") if isinstance(segment.get("data"), dict) else {}
+        element, raw_match = _match_raw_file(data, raw_files, used_raw_files)
+        if not is_image_file_name(data.get("file") or element.get("fileName")):
+            continue
+        image_items.append(build_file_item(data, element, raw_match, image_index))
+        image_index += 1
+    for raw_index, element in enumerate(raw_files):
+        if raw_index in used_raw_files or not is_image_file_name(element.get("fileName")):
+            continue
+        image_items.append(build_file_item({}, element, "raw-only", image_index))
         image_index += 1
     return cursor, image_items
 

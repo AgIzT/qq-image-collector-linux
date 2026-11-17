@@ -105,6 +105,47 @@ def image_event(*, url: str, original: object = True, two: bool = False) -> dict
     }
 
 
+FILE_URL = "https://njc-download.ftn.qq.com/ftn_handler/0a1b2c3d/?fname="
+FILE_UUID = "/7c1f0e6a-0000-4000-8000-000000000001"
+
+
+def file_event(*, name: str = "ComfyUI_00001_.png", url: str | None = FILE_URL) -> dict:
+    """A group-file message as NapCat 4.18 converts it (debug raw attached)."""
+
+    data: dict = {"file": name, "file_id": FILE_UUID, "file_size": "3456789"}
+    if url is not None:
+        data["url"] = url
+    return {
+        "post_type": "message",
+        "message_type": "group",
+        "group_id": int(GROUP),
+        "user_id": int(SENDER),
+        "message_id": 12346,
+        "time": 1_704_067_260,
+        "sender": {"user_id": int(SENDER), "nickname": "synthetic-sender"},
+        "message": [{"type": "file", "data": data}],
+        "raw": {
+            "msgId": str(int(MESSAGE) + 7),
+            "msgSeq": "12399",
+            "msgTime": 1_704_067_260,
+            "senderUin": SENDER,
+            "elements": [
+                {
+                    "elementType": 3,
+                    "fileElement": {
+                        "fileName": name,
+                        "fileSize": "3456789",
+                        "fileUuid": FILE_UUID,
+                        "fileMd5": "11" * 16,
+                        "picWidth": 2048,
+                        "picHeight": 3072,
+                    },
+                }
+            ],
+        },
+    }
+
+
 def a1111_png() -> bytes:
     metadata = PngInfo()
     metadata.add_text(
@@ -437,6 +478,46 @@ class EventPipelineTests(unittest.TestCase):
         self.assertEqual(items[1]["resolver_data"]["raw_match"], "raw-only")
         self.assertTrue(items[1]["resolver_data"]["origin_url"])
 
+    def test_image_group_files_are_queued_and_other_files_are_not(self) -> None:
+        cursor, items = parse_group_event(file_event())
+        self.assertEqual(cursor["message_id"], str(int(MESSAGE) + 7))
+        self.assertEqual(len(items), 1)
+        item = items[0]
+        self.assertEqual(item["image_index"], 0)
+        self.assertEqual(item["file"], "ComfyUI_00001_.png")
+        self.assertEqual(item["declared_size"], 3_456_789)
+        self.assertEqual(item["original_flag"], 1)
+        self.assertEqual(item["sender_uin"], SENDER)
+        resolver = item["resolver_data"]
+        self.assertEqual(resolver["source_kind"], "group_file")
+        self.assertEqual(resolver["raw_match"], "file-uuid")
+        self.assertEqual(resolver["url"], FILE_URL)
+        self.assertEqual(resolver["width"], 2048)
+        self.assertIsNone(resolver["url_expires_at"])
+
+        self.assertEqual(len(parse_group_event(file_event(name="SHOT.JPEG"))[1]), 1)
+        for name in ("napcat.rar", "clip.mp4", "anim.gif", "model.safetensors", "png"):
+            self.assertEqual(parse_group_event(file_event(name=name))[1], [], name)
+
+        # Without a converted segment the raw element still queues, URL-less,
+        # so the worker asks history for the link instead of losing the file.
+        event = file_event()
+        event["message"] = []
+        _cursor, items = parse_group_event(event)
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["resolver_data"]["raw_match"], "raw-only")
+        self.assertEqual(items[0]["resolver_data"]["url"], "")
+
+        # A file that shares a message with a picture never takes its index.
+        event = image_event(url="https://gchat.qpic.cn/path?rkey=x")
+        event["message"] += file_event()["message"]
+        event["raw"]["elements"] += file_event()["raw"]["elements"]
+        _cursor, items = parse_group_event(event)
+        self.assertEqual(
+            [(i["image_index"], i["resolver_data"].get("source_kind")) for i in items],
+            [(0, None), (1, "group_file")],
+        )
+
     def test_terminal_result_removes_rkey_and_raw_url(self) -> None:
         _cursor, items = parse_group_event(
             image_event(url="https://gchat.qpic.cn/path?rkey=super-secret")
@@ -485,7 +566,12 @@ class EventPipelineTests(unittest.TestCase):
             ),
             "https://gxh.vip.qq.com/club/item/parcel/item/00/hash/raw300.gif",
         )
+        self.assertEqual(validate_cdn_url(FILE_URL), FILE_URL)
         for value in (
+            "http://njc-download.ftn.qq.com/ftn_handler/0a1b/?fname=",
+            "https://njc-download.ftn.qq.com/other/0a1b",
+            "https://njc-download.ftn.qq.com.example/ftn_handler/0a1b/",
+            "https://ftn.qq.com/ftn_handler/0a1b/",
             "http://gchat.qpic.cn/path",
             "https://example.invalid/path",
             "https://user:pass@gchat.qpic.cn/path",
@@ -643,6 +729,37 @@ class EventPipelineTests(unittest.TestCase):
             ).fetchone()[0]
             self.assertEqual(status, "filtered_gif")
             self.assertFalse(any((self.root / "temp").glob("*.part")))
+
+        asyncio.run(scenario())
+
+    def test_group_file_downloads_from_its_file_server_url(self) -> None:
+        async def scenario() -> None:
+            png = a1111_png()
+            requested: list[str] = []
+
+            async def handler(request: httpx.Request) -> httpx.Response:
+                requested.append(str(request.url))
+                return httpx.Response(200, content=png)
+
+            _cursor, items = parse_group_event(file_event())
+            enqueue_image(self.connection, items[0])
+            row = claim_next_image(self.connection)
+            downloader = CdnDownloader(
+                self.connection, self.root, max_bytes=1024 * 1024, daily_limit=10
+            )
+            await downloader.client.aclose()
+            downloader.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+            self.assertEqual(await downloader.process(row), "accepted")
+            await downloader.close()
+            self.assertEqual(requested, [FILE_URL])
+            status, resolver = self.connection.execute(
+                "SELECT status, resolver_json FROM images"
+            ).fetchone()
+            self.assertEqual(status, "accepted")
+            redacted = json.loads(resolver)
+            self.assertNotIn("url", redacted)
+            self.assertEqual(redacted["url_host"], "njc-download.ftn.qq.com")
+            self.assertEqual(redacted["source_kind"], "group_file")
 
         asyncio.run(scenario())
 

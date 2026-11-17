@@ -18,7 +18,7 @@ from qq_image_collector.database import claim_next_image, connect_database, enqu
 from qq_image_collector.events import parse_group_event
 from qq_image_collector.onebot import OneBotError
 from qq_image_collector.worker import CollectorWorker, HistoryPaused
-from test_event_pipeline import GROUP, MESSAGE, a1111_png, image_event
+from test_event_pipeline import FILE_URL, GROUP, MESSAGE, a1111_png, file_event, image_event
 
 
 def write_config(root: Path, ws_url: str) -> Path:
@@ -287,6 +287,48 @@ class WorkerIntegrationTests(unittest.IsolatedAsyncioTestCase):
             """
         ).fetchone()
         self.assertEqual(tuple(counters), (1, 2, 1, 1, 0))
+        await worker.downloader.close()
+        worker.connection.close()
+
+    async def test_group_file_counts_and_refreshes_its_link_from_history(self) -> None:
+        worker = CollectorWorker(write_config(self.root, "ws://127.0.0.1:9"))
+        fresh_url = FILE_URL.replace("0a1b2c3d", "fresh0001")
+
+        async def file_server(request: httpx.Request) -> httpx.Response:
+            if str(request.url) == FILE_URL:
+                return httpx.Response(400)
+            return httpx.Response(200, content=a1111_png())
+
+        await worker.downloader.client.aclose()
+        worker.downloader.client = httpx.AsyncClient(
+            transport=httpx.MockTransport(file_server)
+        )
+        await worker.handle_event(file_event())
+        history_calls = 0
+
+        async def history(action: str, params: dict) -> dict:
+            nonlocal history_calls
+            history_calls += 1
+            self.assertEqual(action, "get_group_msg_history")
+            self.assertEqual(params["message_seq"], str(int(MESSAGE) + 7))
+            return {"messages": [file_event(url=fresh_url)]}
+
+        worker.onebot.call_async = history  # type: ignore[method-assign]
+        await worker._process_claimed(claim_next_image(worker.connection))
+        status, resolver = worker.connection.execute(
+            "SELECT status, resolver_json FROM images"
+        ).fetchone()
+        self.assertEqual(status, "accepted")
+        self.assertEqual(json.loads(resolver)["source_kind"], "group_file")
+        self.assertEqual(history_calls, 1)
+        counters = worker.connection.execute(
+            """
+            SELECT sum(images_seen), sum(image_segments), sum(group_file_images),
+                   sum(cdn_400), sum(cdn_downloads)
+            FROM hourly_counters
+            """
+        ).fetchone()
+        self.assertEqual(tuple(counters), (1, 0, 1, 1, 1))
         await worker.downloader.close()
         worker.connection.close()
 

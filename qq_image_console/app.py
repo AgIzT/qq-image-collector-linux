@@ -106,6 +106,7 @@ class AppContext:
             "events",
             "images_seen",
             "image_segments",
+            "group_file_images",
             "cdn_requests",
             "cdn_downloads",
             "cdn_bytes",
