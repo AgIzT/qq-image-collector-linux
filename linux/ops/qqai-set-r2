@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+"""把 R2 凭证写进归档配置。用法见 --help。
+
+凭证不放在仓库里，只放 /etc/qqai-archive.json（0600）。
+换成"只能访问这一个桶"的 token 时，跑一次 set 就够了，其他都不用动。
+"""
+import json
+import os
+import stat
+import sys
+
+CONF = "/etc/qqai-archive.json"
+DEFAULTS = {
+    "bucket": "qqai-image-archive",
+    "region": "auto",
+    "keep_days": 14,
+    "seal_hours": 6,
+    "workers": 8,
+}
+USAGE = """用法：
+  qqai-set-r2 set <account_id> <access_key_id> <secret_access_key> [bucket]
+  qqai-set-r2 keep <天数>          # 本地保留多少天的图（默认 14）
+  qqai-set-r2 show                 # 打印当前配置，密钥打码
+  qqai-set-r2 test                 # 连一次 R2，确认凭证和桶都能用
+"""
+
+
+def load():
+    if os.path.exists(CONF):
+        with open(CONF, encoding="utf-8") as handle:
+            return json.load(handle)
+    return dict(DEFAULTS)
+
+
+def save(conf):
+    with open(CONF, "w", encoding="utf-8") as handle:
+        json.dump(conf, handle, ensure_ascii=False, indent=2)
+    os.chmod(CONF, stat.S_IRUSR | stat.S_IWUSR)
+    print(f"已写入 {CONF}（0600）。验证一下：qqai-set-r2 test")
+
+
+def mask(value):
+    text = str(value)
+    return text if len(text) < 12 else f"{text[:6]}...{text[-4:]}"
+
+
+args = sys.argv[1:]
+if not args or args[0] in ("-h", "--help"):
+    print(USAGE)
+    raise SystemExit(0)
+
+command = args[0]
+
+if command == "set" and len(args) in (4, 5):
+    conf = load()
+    conf.update({
+        "account_id": args[1],
+        "access_key_id": args[2],
+        "secret_access_key": args[3],
+    })
+    if len(args) == 5:
+        conf["bucket"] = args[4]
+    for key, value in DEFAULTS.items():
+        conf.setdefault(key, value)
+    save(conf)
+
+elif command == "keep" and len(args) == 2:
+    conf = load()
+    conf["keep_days"] = int(args[1])
+    save(conf)
+
+elif command == "show":
+    conf = load()
+    for key, value in conf.items():
+        secret = "secret" in key or "key" in key or key == "account_id"
+        print(f"  {key} = {mask(value) if secret else value}")
+
+elif command == "test":
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from archive_to_r2 import R2Client  # noqa: E402
+
+    conf = load()
+    missing = [k for k in ("account_id", "access_key_id", "secret_access_key") if not conf.get(k)]
+    if missing:
+        raise SystemExit(f"配置里还缺：{', '.join(missing)}\n{USAGE}")
+    client = R2Client(conf)
+    status, _, body = client.request("GET", "", query={"list-type": "2", "max-keys": "1"})
+    if status == 200:
+        print(f"OK：桶 {conf['bucket']} 可读。")
+    else:
+        raise SystemExit(f"读桶失败 HTTP {status}：{body[:300].decode('utf-8', 'replace')}")
+    client.put_bytes(".probe", b"ok", "text/plain")
+    print("OK：可写。凭证没问题。")
+
+else:
+    print(USAGE)
+    raise SystemExit(2)

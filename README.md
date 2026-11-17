@@ -60,6 +60,12 @@ Alpha `stealth_pngcomp`。规则见 [METADATA_CLASSIFICATION.md](METADATA_CLASSI
 
 现有图库升级时不会重分类、重哈希或复制。
 
+## 存储
+
+图库卷 49 GB，日增约 1.5 GB，写满不会报错——只会静默停止入库。所以有一个每日
+归档任务把老图传到 Cloudflare R2 再删本地，本地稳定保留最近 14 天。对象布局、
+删除前的核对条件和展示端的数据格式见 [R2_ARCHIVE.md](R2_ARCHIVE.md)。
+
 ## 部署与验收
 
 ```bash
