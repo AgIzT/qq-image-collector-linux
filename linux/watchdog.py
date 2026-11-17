@@ -104,6 +104,12 @@ DEFAULTS: dict[str, Any] = {
     # The ceiling history recovery runs are approved for, in calls per day
     # (60 an hour).  The live collector keeps its own 300 a day.
     "recovery_daily_calls": 1440,
+    # The live collector's daily history ceiling when its database carries no
+    # history_daily_limit override; it matches the collector's own default.
+    "history_daily_limit": 300,
+    # How long NapCat may keep failing history calls before it is a warning.
+    # The collector pauses refreshes meanwhile, so images wait, not vanish.
+    "history_failing_warn_seconds": 6 * 3600,
     # Images still queued after this long, and images given up on in a day.
     # October averaged about one CDN failure a day; ten means something broke.
     "download_stuck_seconds": 3 * 86400,
@@ -139,6 +145,9 @@ OK = "ok"
 WARN = "warn"
 CRITICAL = "critical"
 RANK = {OK: 0, WARN: 1, CRITICAL: 2}
+
+# The collector's calendar days, and so its daily history budget, run in UTC+8.
+COLLECTOR_TIMEZONE = dt.timezone(dt.timedelta(hours=8))
 
 
 class Finding:
@@ -646,6 +655,47 @@ def check_group_silence(connection: sqlite3.Connection, config: dict[str, Any]) 
     )]
 
 
+def _history_daily_limit(connection: sqlite3.Connection, config: dict[str, Any]) -> int:
+    """The collector's daily ceiling: its app_settings override, else ours."""
+    try:
+        row = connection.execute(
+            "SELECT value_json FROM app_settings WHERE key='history_daily_limit'"
+        ).fetchone()
+        value = int(json.loads(str(row[0]))) if row else 0
+    except (sqlite3.OperationalError, TypeError, ValueError):
+        value = 0
+    return value if value > 0 else int(config.get("history_daily_limit", 300))
+
+
+def check_history_breaker(connection: sqlite3.Connection, config: dict[str, Any]) -> list[Finding]:
+    """Say why image refreshes are waiting when NapCat keeps failing history calls.
+
+    The collector pauses all history calls for an hour once NapCat fails a few
+    in a row, then probes with one.  Images wait rather than being given up,
+    so a pause that clears within hours is normal - NapCat failed every call
+    from 02:00 to 07:40 on 2026-11-17.  Only failures that keep coming for longer are a warning;
+    the span is measured between real failures, so a pause nobody has probed
+    yet does not grow into one by itself.
+    """
+    breaker = _runtime_state(connection, "history_breaker")
+    failures = int(breaker.get("failures") or 0)
+    threshold = int(breaker.get("threshold") or 0)
+    if not threshold or failures < threshold:
+        return []
+    stamp = lambda value: time.strftime("%m-%d %H:%M", time.localtime(int(value)))
+    first = int(breaker.get("first_failed_at") or 0)
+    last = int(breaker.get("last_failed_at") or first)
+    until = int(breaker.get("paused_until") or 0)
+    waiting = f"暂停到 {stamp(until)}" if until > time.time() else "等下一次探测"
+    error = str(breaker.get("last_error") or "")[:120]
+    message = (
+        f"NapCat 历史接口自 {stamp(first)} 起连续 {failures} 次出错，图片链接刷新{waiting}"
+        + (f"（最近：{error}）" if error else "")
+    )
+    level = WARN if last - first >= int(config["history_failing_warn_seconds"]) else OK
+    return [Finding("history_paused", level, message)]
+
+
 def check_policy_alarms(connection: sqlite3.Connection, config: dict[str, Any]) -> list[Finding]:
     findings: list[Finding] = []
     alarm = _runtime_state(connection, "critical_alarm")
@@ -659,18 +709,33 @@ def check_policy_alarms(connection: sqlite3.Connection, config: dict[str, Any]) 
         )
     else:
         findings.append(Finding("policy_alarm", OK, "无策略告警"))
+    now = int(time.time())
+    blocked = int(connection.execute(
+        "SELECT coalesce(sum(get_image_blocked), 0) FROM hourly_counters WHERE bucket_start>=?",
+        (now - 86400,),
+    ).fetchone()[0] or 0)
+    # The collector holds history calls to its daily limit per calendar day in
+    # UTC+8, so this counts from the same midnight.  A rolling 24 hours added
+    # the previous evening to a day that stopped exactly at its limit: on
+    # 2026-11-17 the collector halted at 300 by 07:40 and this reported "320,
+    # over quota" every five minutes until 19:00 although the ceiling had held.
+    day_start = int(
+        dt.datetime.now(COLLECTOR_TIMEZONE)
+        .replace(hour=0, minute=0, second=0, microsecond=0)
+        .timestamp()
+    )
     row = connection.execute(
-        "SELECT coalesce(sum(get_image_blocked), 0), coalesce(sum(history_calls), 0), "
-        "coalesce(sum(window_history_calls), 0) "
+        "SELECT coalesce(sum(history_calls), 0), coalesce(sum(window_history_calls), 0) "
         "FROM hourly_counters WHERE bucket_start>=?",
-        (int(time.time()) - 86400,),
+        (day_start,),
     ).fetchone()
-    blocked = int(row[0] or 0)
+    total = int(row[0] or 0)
     # Recovery calls are counted in both columns.  They run under their own
     # operator-approved ceiling (60 an hour, 1,440 a day), so holding them to
     # the live collector's 300 a day warned every five minutes for the whole of
     # every approved recovery - early October's pushes were mostly this.
-    history = int(row[1] or 0) - int(row[2] or 0)
+    history = total - int(row[1] or 0)
+    limit = _history_daily_limit(connection, config)
     # Counted from the call log rather than hourly buckets: ">= 24 hours ago"
     # takes in 25 buckets, which put a recovery running exactly at its ceiling
     # 14 calls over it.
@@ -691,11 +756,22 @@ def check_policy_alarms(connection: sqlite3.Connection, config: dict[str, Any]) 
         )
     else:
         findings.append(Finding("get_image", OK, "get_image 拦截计数为 0"))
-    findings.append(
-        Finding("history", OK, f"24 小时账号会话历史调用 {history} 次")
-        if history <= 300
-        else Finding("history", WARN, f"24 小时历史调用 {history} 次，已超过日配额 300")
-    )
+    # The collector refuses a call once the day's total reaches the limit, so
+    # only a broken ceiling can take the live count past it.  Reaching it is
+    # reported but is the ceiling working: refreshes wait for midnight.
+    if history > limit:
+        findings.append(Finding(
+            "history", WARN,
+            f"今日历史调用 {history} 次，超过采集器日配额 {limit}——额度限制没有拦住",
+        ))
+    elif total >= limit:
+        findings.append(Finding(
+            "history", OK,
+            f"今日账号会话历史调用 {history}/{limit} 次，额度已用完，图片链接刷新等到 0 点",
+        ))
+    else:
+        findings.append(Finding("history", OK, f"今日账号会话历史调用 {history}/{limit} 次"))
+    findings.extend(check_history_breaker(connection, config))
     if recovery:
         findings.append(
             Finding("recovery_calls", OK, f"24 小时历史回捞调用 {recovery} 次")

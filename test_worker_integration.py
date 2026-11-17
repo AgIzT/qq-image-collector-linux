@@ -16,7 +16,8 @@ from PIL.PngImagePlugin import PngInfo
 
 from qq_image_collector.database import claim_next_image, connect_database, enqueue_image
 from qq_image_collector.events import parse_group_event
-from qq_image_collector.worker import CollectorWorker
+from qq_image_collector.onebot import OneBotError
+from qq_image_collector.worker import CollectorWorker, HistoryPaused
 from test_event_pipeline import GROUP, MESSAGE, a1111_png, image_event
 
 
@@ -471,6 +472,145 @@ class WorkerIntegrationTests(unittest.IsolatedAsyncioTestCase):
         )
         await worker.downloader.close()
         worker.connection.close()
+
+    async def _stale_worker(
+        self, count: int, *, fresh_ok: bool = False, root: Path | None = None
+    ) -> CollectorWorker:
+        worker = CollectorWorker(write_config(root or self.root, "ws://127.0.0.1:9"))
+
+        async def cdn(request: httpx.Request) -> httpx.Response:
+            if fresh_ok and "fresh" in request.url.path:
+                return httpx.Response(200, content=a1111_png())
+            return httpx.Response(400)
+
+        await worker.downloader.client.aclose()
+        worker.downloader.client = httpx.AsyncClient(transport=httpx.MockTransport(cdn))
+        for number in range(count):
+            event = image_event(
+                url=f"https://multimedia.nt.qq.com.cn/stale-{number}?rkey=old"
+            )
+            event["raw"]["msgId"] = str(int(MESSAGE) + number)
+            event["raw"]["msgSeq"] = str(12345 + number)
+            _cursor, items = parse_group_event(event)
+            enqueue_image(worker.connection, items[0])
+        return worker
+
+    def _breaker(self, worker: CollectorWorker) -> dict:
+        row = worker.connection.execute(
+            "SELECT value_json FROM runtime_state WHERE key='history_breaker'"
+        ).fetchone()
+        return json.loads(row[0]) if row else {}
+
+    async def test_failing_history_pauses_refreshes_instead_of_spending_budget(self) -> None:
+        worker = await self._stale_worker(5)
+        calls = 0
+
+        async def failing(_action: str, _params: dict) -> dict:
+            nonlocal calls
+            calls += 1
+            raise OneBotError("get_group_msg_history failed: synthetic refusal")
+
+        worker.onebot.call_async = failing  # type: ignore[method-assign]
+        for _ in range(5):
+            await worker._process_claimed(claim_next_image(worker.connection))
+        self.assertEqual(calls, 3)
+        rows = worker.connection.execute(
+            "SELECT status, error, resolver_json FROM images"
+        ).fetchall()
+        self.assertEqual({row[0] for row in rows}, {"deferred"})
+        failures = sorted(
+            int(json.loads(row[2]).get("url_refresh_failures") or 0) for row in rows
+        )
+        # The paused images wait without a failure counted against them.
+        self.assertEqual(failures, [0, 0, 1, 1, 1])
+        errors = [str(row[1]) for row in rows]
+        self.assertEqual(sum("synthetic refusal" in error for error in errors), 5)
+        self.assertEqual(sum("paused until" in error for error in errors), 2)
+        breaker = self._breaker(worker)
+        self.assertEqual(breaker["failures"], 3)
+        self.assertGreater(breaker["paused_until"], time.time() + 3000)
+        self.assertEqual(
+            worker.connection.execute(
+                "SELECT sum(history_calls) FROM hourly_counters"
+            ).fetchone()[0],
+            3,
+        )
+        await worker.downloader.close()
+        worker.connection.close()
+
+    async def test_history_pause_survives_a_worker_restart(self) -> None:
+        worker = await self._stale_worker(1)
+        now = int(time.time())
+        worker._history_breaker = {
+            "failures": 3,
+            "paused_until": now + 600,
+            "last_error": "OneBotError: synthetic",
+        }
+        worker._save_history_breaker()
+        worker.connection.close()
+        await worker.downloader.close()
+        restarted = CollectorWorker(write_config(self.root, "ws://127.0.0.1:9"))
+        calls = 0
+
+        async def history(_action: str, _params: dict) -> dict:
+            nonlocal calls
+            calls += 1
+            return {"messages": []}
+
+        restarted.onebot.call_async = history  # type: ignore[method-assign]
+        with self.assertRaises(HistoryPaused):
+            await restarted._history_call({"group_id": GROUP})
+        self.assertEqual(calls, 0)
+        await restarted.downloader.close()
+        restarted.connection.close()
+
+    async def test_history_breaker_probes_once_after_the_pause(self) -> None:
+        for probe_ok in (False, True):
+            with self.subTest(probe_ok=probe_ok):
+                case_root = self.root / f"probe-{probe_ok}"
+                case_root.mkdir()
+                worker = await self._stale_worker(2, fresh_ok=True, root=case_root)
+                now = int(time.time())
+                worker._history_breaker = {
+                    "failures": 3,
+                    "first_failed_at": now - 7200,
+                    "last_failed_at": now - 3700,
+                    "paused_until": now - 1,
+                    "last_error": "OneBotError: synthetic",
+                }
+                calls = 0
+
+                async def history(_action: str, _params: dict) -> dict:
+                    nonlocal calls
+                    calls += 1
+                    if not probe_ok:
+                        raise OneBotError("still refusing")
+                    return {
+                        "messages": [
+                            image_event(url="https://multimedia.nt.qq.com.cn/fresh?rkey=new")
+                        ]
+                    }
+
+                worker.onebot.call_async = history  # type: ignore[method-assign]
+                await worker._process_claimed(claim_next_image(worker.connection))
+                await worker._process_claimed(claim_next_image(worker.connection))
+                breaker = self._breaker(worker)
+                if probe_ok:
+                    self.assertEqual(calls, 2)
+                    self.assertEqual(breaker["failures"], 0)
+                    self.assertNotIn("paused_until", breaker)
+                    statuses = worker.connection.execute(
+                        "SELECT status FROM images"
+                    ).fetchall()
+                    self.assertEqual({row[0] for row in statuses}, {"accepted"})
+                else:
+                    # One probe, then paused again; the streak keeps its start.
+                    self.assertEqual(calls, 1)
+                    self.assertEqual(breaker["failures"], 4)
+                    self.assertEqual(breaker["first_failed_at"], now - 7200)
+                    self.assertGreater(breaker["paused_until"], time.time() + 3000)
+                await worker.downloader.close()
+                worker.connection.close()
 
     async def test_404_and_410_refresh_then_defer(self) -> None:
         for status_code in (404, 410):

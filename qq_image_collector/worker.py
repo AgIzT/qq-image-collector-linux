@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
 import json
 import os
 import random
 import signal
 import sqlite3
+import sys
 import time
 import traceback
 from contextlib import suppress
@@ -16,6 +18,7 @@ import httpx
 
 from .config import load_settings
 from .database import (
+    FILENAME_TIMEZONE,
     claim_next_image,
     connect_database,
     counter_sum,
@@ -43,7 +46,7 @@ from .events import (
     parse_group_event,
     record_group_cursor,
 )
-from .onebot import OneBotClient, OneBotError, websocket_settings
+from .onebot import OneBotClient, OneBotError, OneBotPolicyError, websocket_settings
 
 
 class JobCancelled(RuntimeError):
@@ -58,6 +61,25 @@ class HistoryBudgetExceeded(RuntimeError):
     ceiling a single misbehaving code path can sustain thousands of calls a
     day, which is the request pattern that got earlier accounts banned.
     """
+
+
+class HistoryPaused(HistoryBudgetExceeded):
+    """History calls are paused because NapCat failed several in a row.
+
+    A subclass of the budget error so every caller already treats it right:
+    an image waits without counting a refresh failure against itself, and a
+    reconnect gap is deferred instead of marked as an error.
+    """
+
+
+def _brief(exc: BaseException) -> str:
+    """Exception class and message, short enough for an image's error column.
+
+    The class name alone left the 2026-11-17 failures undiagnosable: fifty
+    images recorded only "OneBotError" and nothing said what NapCat answered.
+    """
+    detail = str(exc).strip()
+    return f"{type(exc).__name__}: {detail[:240]}" if detail else type(exc).__name__
 
 
 def _setting(connection: sqlite3.Connection, key: str, default: Any) -> Any:
@@ -121,6 +143,10 @@ class CollectorWorker:
         state = get_runtime_state(self.connection, "downloader", {}) or {}
         self._downloader_state = dict(state)
         self._downloader_state_written_at = 0.0
+        # Kept in runtime_state so a restart mid-outage stays paused and the
+        # watchdog can say why refreshes are waiting.
+        breaker = get_runtime_state(self.connection, "history_breaker", {})
+        self._history_breaker: dict[str, Any] = dict(breaker) if isinstance(breaker, dict) else {}
 
     def request_stop(self) -> None:
         self.listener.stop()
@@ -173,6 +199,14 @@ class CollectorWorker:
                 await asyncio.sleep(min(2.0, 0.1 * (2**attempt)))
 
     def _check_history_budget(self) -> None:
+        paused_until = int(self._history_breaker.get("paused_until") or 0)
+        if time.time() < paused_until:
+            clock = dt.datetime.fromtimestamp(paused_until, FILENAME_TIMEZONE)
+            raise HistoryPaused(
+                f"history calls paused until {clock:%m-%d %H:%M} after "
+                f"{self._history_breaker.get('failures')} failures in a row: "
+                f"{self._history_breaker.get('last_error')}"
+            )
         hourly = int(self.runtime("history_hourly_limit") or 0)
         daily = int(self.runtime("history_daily_limit") or 0)
         if hourly > 0:
@@ -192,8 +226,69 @@ class CollectorWorker:
     async def _history_call(self, params: dict[str, Any]) -> Any:
         async with self._history_lock:
             self._check_history_budget()
-            increment_counter(self.connection, "history_calls")
-            return await self.onebot.call_async("get_group_msg_history", params)
+            return await self._call_napcat_history(params)
+
+    async def _call_napcat_history(self, params: dict[str, Any]) -> Any:
+        """Count one get_group_msg_history call, make it, and feed the breaker.
+
+        The caller holds _history_lock and has already checked the budget.
+        """
+        increment_counter(self.connection, "history_calls")
+        try:
+            payload = await self.onebot.call_async("get_group_msg_history", params)
+        except OneBotPolicyError:
+            raise
+        except Exception as exc:
+            self._record_history_failure(exc)
+            raise
+        self._record_history_success()
+        return payload
+
+    def _record_history_failure(self, exc: Exception) -> None:
+        now = int(time.time())
+        state = self._history_breaker
+        failures = int(state.get("failures") or 0) + 1
+        if failures == 1:
+            state.clear()
+            state["first_failed_at"] = now
+        state["failures"] = failures
+        state["last_failed_at"] = now
+        state["last_error"] = f"{type(exc).__name__}: {exc}"[:300]
+        threshold = int(self.runtime("history_failure_pause_after") or 0)
+        state["threshold"] = threshold
+        if threshold > 0 and failures >= threshold:
+            pause = max(60, int(self.runtime("history_failure_pause_seconds") or 3600))
+            state["paused_until"] = now + pause
+            print(
+                f"history calls paused for {pause}s after {failures} failures in a row: "
+                f"{state['last_error']}",
+                file=sys.stderr,
+                flush=True,
+            )
+        self._save_history_breaker()
+
+    def _record_history_success(self) -> None:
+        failures = int(self._history_breaker.get("failures") or 0)
+        if not failures:
+            return
+        if int(self._history_breaker.get("paused_until") or 0):
+            print(
+                f"history calls resumed after {failures} failures in a row",
+                file=sys.stderr,
+                flush=True,
+            )
+        self._history_breaker = {"failures": 0, "recovered_at": int(time.time())}
+        self._save_history_breaker()
+
+    def _save_history_breaker(self) -> None:
+        try:
+            set_runtime_state(self.connection, "history_breaker", self._history_breaker)
+        except sqlite3.OperationalError as exc:
+            # The in-memory state still guards this process; only the
+            # watchdog's view of it is late.
+            self.connection.rollback()
+            if "locked" not in str(exc).casefold():
+                raise
 
     async def handle_reconnect(self, disconnected_seconds: float) -> None:
         if disconnected_seconds < float(self.runtime("ws_disconnect_gap_seconds")):
@@ -379,9 +474,7 @@ class CollectorWorker:
                     row["image_index"],
                 ),
             )
-            increment_counter(self.connection, "history_calls")
-            payload = await self.onebot.call_async(
-                "get_group_msg_history",
+            payload = await self._call_napcat_history(
                 {
                     "group_id": str(row["group_id"]),
                     "message_seq": raw_anchor,
@@ -640,7 +733,7 @@ class CollectorWorker:
                     self._defer_refresh_retry(
                         row,
                         delay_seconds=300,
-                        error=f"missing URL refresh retry after {type(refresh_error).__name__}",
+                        error=f"missing URL refresh retry after {_brief(refresh_error)}",
                     )
                     return
                 if await self._process_refreshed_url(row, outcome):
@@ -680,7 +773,7 @@ class CollectorWorker:
                     self._defer_refresh_retry(
                         row,
                         delay_seconds=300,
-                        error=f"URL refresh retry after {type(refresh_error).__name__}",
+                        error=f"URL refresh retry after {_brief(refresh_error)}",
                     )
                     return
                 if await self._process_refreshed_url(row, outcome):
