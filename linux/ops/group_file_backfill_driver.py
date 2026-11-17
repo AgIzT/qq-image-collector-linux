@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Run the one-time group-file backfill in chunks the image volume can hold.
 
-The volume keeps 14 days of images locally and sits a few GB from full; a
-full disk does not crash the collector, it silently stops storing images (see
+The volume keeps the last keep_days of images locally (/etc/qqai-archive.json;
+7 since 2026-11-18, 14 before, when it sat a few GB from full); a full disk
+does not crash the collector, it silently stops storing images (see
 R2_ARCHIVE.md).  The backfill's images mostly land on dates older than that,
 which the archive moves to R2 and deletes locally -- but only once a date has
 been quiet for seal_hours, so gallery maintenance has had time to build
@@ -42,10 +43,10 @@ ARCHIVE_CONFIG = Path("/etc/qqai-archive.json")
 ARCHIVE_LOCK = "/run/lock/qqai-archive.lock"
 LOG = Path("/var/log/qqai-group-file-backfill.log")
 # A day of live intake is about 2.3 GB and the nightly archive frees about the
-# same, so the volume normally bottoms out near 3.5 GB just before 04:30.  The
-# backfill's old-day files are archived away about six hours after a chunk,
-# and live intake keeps arriving meanwhile; four keeps that dip above where
-# the volume already goes every night.
+# same.  With 14 days kept the volume bottomed out near 3.5 GB just before
+# 04:30; with 7 it has about 20 GB to spare.  The backfill's old-day files are
+# archived away about six hours after a chunk, and live intake keeps arriving
+# meanwhile; four keeps that dip above where the volume went every night.
 RESERVE = int(float(os.environ.get("QQAI_BACKFILL_RESERVE_GB", "4")) * 1024**3)
 MIN_CHUNK = 512 * 1024**2
 SLEEP_SECONDS = 15 * 60
@@ -81,26 +82,29 @@ def day_age_days(day: str, now: float) -> float:
     return (now - start.timestamp()) / 86400
 
 
-def archive_ready_days(keep_days: int, seal_hours: float) -> list[str]:
+def unhanded_days(keep_days: int) -> dict[str, int]:
+    """Days the backfill wrote to that the driver still owes the archive.
+
+    Recent days stay local by design and the nightly run takes them when they
+    age out, so they are never owed.  That is decided afresh on every call,
+    not recorded, so a lower keep_days takes effect when the driver restarts.
+    """
     touched = read_json(STATE).get("touched_days") or {}
     handed = read_json(HANDED)
     now = time.time()
-    ready = []
-    changed = False
-    for day, written in sorted(touched.items()):
-        if int(written) <= int(handed.get(day) or 0):
-            continue
-        if day_age_days(day, now) <= keep_days + 1:
-            # Recent days stay local by design; the nightly run takes them
-            # when they age out.  Nothing for the driver to do.
-            handed[day] = int(written)
-            changed = True
-            continue
-        if now - int(written) >= seal_hours * 3600 + 900:
-            ready.append(day)
-    if changed:
-        write_json(HANDED, handed)
-    return ready
+    return {
+        day: int(written)
+        for day, written in sorted(touched.items())
+        if int(written) > int(handed.get(day) or 0) and day_age_days(day, now) > keep_days + 1
+    }
+
+
+def archive_ready_days(keep_days: int, seal_hours: float) -> list[str]:
+    now = time.time()
+    return [
+        day for day, written in unhanded_days(keep_days).items()
+        if now - written >= seal_hours * 3600 + 900
+    ]
 
 
 def run_archive(days: list[str]) -> bool:
@@ -219,12 +223,7 @@ def main() -> int:
                 last_wait_log = time.time()
                 log(f"free {free / 1024**3:.1f} GB; waiting for the archive to make room")
         else:
-            handed = read_json(HANDED)
-            pending = [
-                day for day, written in (read_json(STATE).get("touched_days") or {}).items()
-                if int(written) > int(handed.get(day) or 0)
-            ]
-            if not pending:
+            if not unhanded_days(keep_days):
                 log("all done")
                 return 0
         time.sleep(SLEEP_SECONDS)

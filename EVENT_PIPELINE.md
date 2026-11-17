@@ -52,9 +52,11 @@
   与 `url_refresh_failures` 预置到上限前一次，Worker 第一次刷新就放弃，绝不拿
   编造的锚点调用 `get_group_msg_history`。下次运行先把残留行关成 `expired` 再重试；
   `expired` 失败两轮后不再重试。
-- 图库卷本地保留 14 天、常年只剩几 GB（每晚 04:30 前约 3.5 GB），写满时采集会静默
-  停止（见 R2_ARCHIVE.md）。工具在剩余空间低于 `--min-free-bytes` 前停下（驱动用
-  4 GiB），并把写过的日期记在 `state/group_file_backfill.json`。最近
+- 图库卷本地保留 `keep_days` 天（`/etc/qqai-archive.json`），写满时采集会静默
+  停止（见 R2_ARCHIVE.md）。保留 14 天时常年只剩几 GB（每晚 04:30 前约 3.5 GB），
+  第一批补完就卡在预留线上；2026-11-18 改为 7 天，常态多出约 20 GB。工具在剩余空间
+  低于 `--min-free-bytes` 前停下（驱动用 4 GiB），并把写过的日期记在
+  `state/group_file_backfill.json`。最近
   `keep_days + 1` 天内上传的文件先不补（`--min-age-days`）：它们落在本地保留期内，
   补进来只会长期占掉实时采集的余量；驱动在其余文件补完后改为每天一轮，等它们
   过了保留期再取。宿主机上的
@@ -62,11 +64,18 @@
   且早于 `keep_days` 后，对这些日期跑一次常规 `archive_to_r2.py --upload --purge`
   （同一把 `qqai-archive.lock`、同样的 HEAD 核对，缩略图已由 fast-update 从本地
   文件生成），腾出空间再补下一批。以 transient unit `qqai-group-file-backfill`
-  运行，日志 `/var/log/qqai-group-file-backfill.log`，可随时停下重跑。
+  运行，日志 `/var/log/qqai-group-file-backfill.log`，可随时停下重跑。`keep_days`
+  只在驱动启动时读取；改了保留天数要重启驱动。哪些日期"留给每晚归档"每轮现算、
+  不落盘，所以重启后新的保留天数立即生效。
 
 试跑（709223435 群 12 个文件）：4 张入库、8 张无元数据，下载约 150 MB，只落盘
 6.8 MB；平均每个文件约 10 秒。第一批（ComfyUI 总群 357 个文件）210 张新入库、30 张
-重复、116 张无元数据、0 失败，落盘 0.71 GB，约 5 秒一个文件。
+重复、116 张无元数据、0 失败，落盘 0.71 GB，约 5 秒一个文件。之后剩余空间停在
+3.0 GB、低于 4 GiB 预留，驱动只能等归档；而被补过的 11-02 至 11-16 都要再静默 6 小时
+才能清理。当日把 `keep_days` 改为 7，确认 fast-update 报告 `thumbnailPending: 0`、
+这些日期全部已在 R2 后，以 `--seal-hours 3` 手动跑一次常规归档清理：11-04 至 11-11
+共 6710 个对象逐个 HEAD 核对后删除本地，腾出 19.5 GB（剩余 23 GB），驱动随即
+接着补。
 
 ## 2026-08-04 PNG 大型元数据与单图容错
 
