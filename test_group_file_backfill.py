@@ -216,6 +216,13 @@ class GroupFileBackfillTests(unittest.TestCase):
         self.assertEqual(summary["remaining"], 1)
         self.assertEqual(napcat.url_calls(), 0)
 
+    def test_recent_files_wait_until_they_can_be_archived(self) -> None:
+        now = int(time.time())
+        napcat = FakeNapCat([listed("old.png", modified=now - 30 * 86400), listed("new.png", modified=now - 3 * 86400)])
+        summary = self.run_backfill(self.backfill(napcat, min_age_days=15))
+        self.assertEqual(summary["stats"]["deferred_recent"], 1)
+        self.assertEqual([row["file_token"] for row in self.rows()], ["old.png"])
+
     def test_run_stops_before_the_disk_reserve(self) -> None:
         napcat = FakeNapCat([listed("a.png"), listed("b.png", modified=1_780_000_100)])
         summary = self.run_backfill(

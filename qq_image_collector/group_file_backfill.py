@@ -186,6 +186,7 @@ class GroupFileBackfill:
         min_free_bytes: int,
         max_stored_bytes: int,
         max_files: int = 0,
+        min_age_days: float = 0,
         pause: float = 2.0,
         state_path: Path | None = None,
         sleep: Callable[[float], Any] = asyncio.sleep,
@@ -201,6 +202,7 @@ class GroupFileBackfill:
         self.min_free_bytes = int(min_free_bytes)
         self.max_stored_bytes = int(max_stored_bytes)
         self.max_files = int(max_files)
+        self.min_age_seconds = float(min_age_days) * 86400
         self.pause = float(pause)
         self.state_path = state_path
         self.sleep = sleep
@@ -210,6 +212,7 @@ class GroupFileBackfill:
             "listed_images": 0,
             "skipped_known": 0,
             "skipped_too_large": 0,
+            "deferred_recent": 0,
             "processed": 0,
             "accepted": 0,
             "duplicate": 0,
@@ -267,6 +270,14 @@ class GroupFileBackfill:
             return False
         if (str(group_id), name, size) in self._live:
             self.stats["skipped_known"] += 1
+            return False
+        # Recent dates stay on the image volume for keep_days whatever the
+        # backfill does, so files that would land there wait until they can
+        # be archived like the rest instead of eating the headroom live
+        # collection needs.
+        modified = int(entry.get("modify_time") or 0)
+        if self.min_age_seconds and modified > time.time() - self.min_age_seconds:
+            self.stats["deferred_recent"] += 1
             return False
         return True
 
@@ -586,6 +597,8 @@ async def main_async(argv: list[str] | None = None) -> int:
     parser.add_argument("--min-free-bytes", type=float, default=3 * 1024**3)
     parser.add_argument("--max-stored-bytes", type=float, default=0, help="0 = no limit")
     parser.add_argument("--max-files", type=int, default=0)
+    parser.add_argument("--min-age-days", type=float, default=0,
+                        help="leave files uploaded more recently than this for a later run")
     parser.add_argument("--pause", type=float, default=2.0, help="seconds between files")
     args = parser.parse_args(argv)
 
@@ -607,6 +620,7 @@ async def main_async(argv: list[str] | None = None) -> int:
         min_free_bytes=int(args.min_free_bytes),
         max_stored_bytes=int(args.max_stored_bytes),
         max_files=args.max_files,
+        min_age_days=args.min_age_days,
         pause=args.pause,
         state_path=Path(settings["storage"]["database"]).parent / STATE_FILE,
     )

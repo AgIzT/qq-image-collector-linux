@@ -41,9 +41,12 @@ ARCHIVE = "/opt/qq-ai-image-collector-linux-event-a1cfe1a/linux/ops/archive_to_r
 ARCHIVE_CONFIG = Path("/etc/qqai-archive.json")
 ARCHIVE_LOCK = "/run/lock/qqai-archive.lock"
 LOG = Path("/var/log/qqai-group-file-backfill.log")
-# A day of live intake is about 2.3 GB, and the nightly archive frees about
-# the same; three keeps a full day of headroom under whatever the backfill does.
-RESERVE = int(float(os.environ.get("QQAI_BACKFILL_RESERVE_GB", "3")) * 1024**3)
+# A day of live intake is about 2.3 GB and the nightly archive frees about the
+# same, so the volume normally bottoms out near 3.5 GB just before 04:30.  The
+# backfill's old-day files are archived away about six hours after a chunk,
+# and live intake keeps arriving meanwhile; four keeps that dip above where
+# the volume already goes every night.
+RESERVE = int(float(os.environ.get("QQAI_BACKFILL_RESERVE_GB", "4")) * 1024**3)
 MIN_CHUNK = 512 * 1024**2
 SLEEP_SECONDS = 15 * 60
 TZ = dt.timezone(dt.timedelta(hours=8))
@@ -118,12 +121,13 @@ def run_archive(days: list[str]) -> bool:
     return True
 
 
-def run_chunk(budget: int) -> dict | None:
+def run_chunk(budget: int, min_age_days: int) -> dict | None:
     command = [
         "docker", "exec", "-w", "/app", CONTAINER,
         "python", "-u", "-m", "qq_image_collector.group_file_backfill",
         "--min-free-bytes", str(RESERVE),
         "--max-stored-bytes", str(budget),
+        "--min-age-days", str(min_age_days),
     ]
     log(f"backfill chunk, up to {budget / 1024**3:.1f} GB of new files")
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -147,7 +151,7 @@ def run_chunk(budget: int) -> dict | None:
     log(
         "chunk done: stop={stop_reason} remaining={remaining} processed={processed} "
         "accepted={accepted} duplicate={duplicate} rejected={rejected} expired={expired} "
-        "stored={stored:.2f}GB".format(
+        "deferred_recent={deferred} stored={stored:.2f}GB".format(
             stop_reason=summary.get("stop_reason"),
             remaining=summary.get("remaining"),
             processed=stats.get("processed"),
@@ -155,6 +159,7 @@ def run_chunk(budget: int) -> dict | None:
             duplicate=stats.get("duplicate"),
             rejected=stats.get("rejected"),
             expired=stats.get("expired"),
+            deferred=stats.get("deferred_recent"),
             stored=int(stats.get("stored_bytes") or 0) / 1024**3,
         )
     )
@@ -165,8 +170,17 @@ def main() -> int:
     config = read_json(ARCHIVE_CONFIG)
     keep_days = int(config.get("keep_days", 14))
     seal_hours = float(config.get("seal_hours", 6))
-    log(f"driver start: reserve {RESERVE / 1024**3:.1f} GB, keep {keep_days} d, seal {seal_hours} h")
+    min_age_days = keep_days + 1
+    log(
+        f"driver start: reserve {RESERVE / 1024**3:.1f} GB, keep {keep_days} d, "
+        f"seal {seal_hours} h, files newer than {min_age_days} d wait"
+    )
     finished = False
+    # Once only files too recent to archive are left, one pass a day picks
+    # them up as they age instead of listing every group every 15 minutes.
+    slow = False
+    last_chunk = 0.0
+    last_wait_log = 0.0
     failures = 0
     idle = 0
     while True:
@@ -176,8 +190,10 @@ def main() -> int:
         free = shutil.disk_usage(IMAGE_ROOT).free
         if not finished:
             budget = free - RESERVE
-            if budget >= MIN_CHUNK:
-                summary = run_chunk(budget)
+            due = not slow or time.time() - last_chunk >= 86400
+            if due and budget >= MIN_CHUNK:
+                summary = run_chunk(budget, min_age_days)
+                last_chunk = time.time()
                 if summary is None:
                     failures += 1
                     if failures >= 3:
@@ -185,19 +201,28 @@ def main() -> int:
                         return 1
                 else:
                     failures = 0
-                    processed = int((summary.get("stats") or {}).get("processed") or 0)
-                    idle = idle + 1 if processed == 0 else 0
-                    if summary.get("stop_reason") == "done" and (not summary.get("remaining") or idle >= 2):
-                        # Two passes that fetch nothing mean what is left
-                        # cannot be fetched (unlistable group, vanished file).
+                    stats = summary.get("stats") or {}
+                    idle = idle + 1 if int(stats.get("processed") or 0) == 0 else 0
+                    # Two passes that fetch nothing mean what is left cannot
+                    # be fetched (unlistable group, vanished file).
+                    exhausted = summary.get("stop_reason") == "done" and (
+                        not summary.get("remaining") or idle >= 2
+                    )
+                    if exhausted and int(stats.get("deferred_recent") or 0) > 0:
+                        if not slow:
+                            log(f"only files from the last {min_age_days} days remain; one pass a day from now")
+                        slow = True
+                    elif exhausted:
                         finished = True
                         log("backfill has nothing left; waiting for the archive to take the last days")
-            else:
+            elif due and time.time() - last_wait_log >= 3600:
+                last_wait_log = time.time()
                 log(f"free {free / 1024**3:.1f} GB; waiting for the archive to make room")
         else:
+            handed = read_json(HANDED)
             pending = [
                 day for day, written in (read_json(STATE).get("touched_days") or {}).items()
-                if int(written) > int(read_json(HANDED).get(day) or 0)
+                if int(written) > int(handed.get(day) or 0)
             ]
             if not pending:
                 log("all done")
