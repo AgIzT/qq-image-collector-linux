@@ -44,11 +44,23 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+
 from pathlib import Path
+
+try:
+    # Lives next to this file; on the path when this runs as a script or is
+    # loaded by archive_legacy_to_r2.py from the same directory.
+    import model_taxonomy
+except ImportError:  # pragma: no cover - source exec'd from elsewhere
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import model_taxonomy
+    except (ImportError, NameError):
+        model_taxonomy = None
 
 CONFIG_PATH = Path("/etc/qqai-archive.json")
 STATE_PATH = Path("/var/lib/qqai-state/archive_state.sqlite3")
-LOCK_PATH = Path("/var/run/qqai-archive.lock")
+LOCK_PATH = Path("/run/lock/qqai-archive-worker.lock")
 COLLECTOR_DB = "/var/lib/qqai-state/collector_state.sqlite3"
 
 # The database stores the path the collector sees inside its container.
@@ -279,6 +291,32 @@ def _clean(value, limit=8000):
     return text[:limit]
 
 
+def _novelai_characters(comment: dict) -> list | None:
+    """V4 and later keep each character's prompt in its own box.
+
+    ``Description`` is only the base prompt, and a character's name is usually
+    typed into its box - so without these the gallery cannot find the image by
+    that name. Each box pairs with the negative box at the same position.
+    """
+    def boxes(prompt) -> list:
+        caption = prompt.get("caption") if isinstance(prompt, dict) else None
+        items = caption.get("char_captions") if isinstance(caption, dict) else None
+        if not isinstance(items, list):
+            return []
+        return [_clean(item.get("char_caption")) if isinstance(item, dict) else None for item in items]
+
+    negatives = boxes(comment.get("v4_negative_prompt"))
+    out = []
+    for index, prompt in enumerate(boxes(comment.get("v4_prompt"))):
+        negative = negatives[index] if index < len(negatives) else None
+        if prompt or negative:
+            box = {"prompt": prompt or ""}
+            if negative:
+                box["negative"] = negative
+            out.append(box)
+    return out or None
+
+
 def _novelai_fields(fields: dict) -> dict:
     """NovelAI writes the prompt as plain text and everything else as JSON in a string."""
     out = {"tags": _clean(fields.get("Description")), "model": _clean(fields.get("Source"), 200)}
@@ -290,6 +328,7 @@ def _novelai_fields(fields: dict) -> dict:
         if not out["tags"]:
             out["tags"] = _clean(comment.get("prompt"))
         out["negative"] = _clean(comment.get("uc"))
+        out["characters"] = _novelai_characters(comment)
         params = {
             "steps": comment.get("steps"),
             "sampler": comment.get("sampler"),
@@ -534,15 +573,30 @@ def title_for(tags: str | None, model: str | None, day: str) -> str:
     return day
 
 
+def classify_model(source, fields, category, fallback_family=None, fallback_model=None):
+    """(modelFamily, model) for a listing record, from ``model_taxonomy``.
+
+    The family is the gallery's model filter (NAI-V5 ... / Anima, Illustrious
+    ...); the model is the checkpoint, as people would name it.  Falls back to
+    whatever the caller had when the classifier is unavailable.
+    """
+    if model_taxonomy is None:
+        return fallback_family, fallback_model
+    family, model = model_taxonomy.classify(source, fields if isinstance(fields, dict) else {}, category)
+    return family, (model or fallback_model)
+
+
 def light_record(row: sqlite3.Row) -> dict:
     """The per-image record a listing page loads. No provenance, no raw workflow."""
     source = row["metadata_source"]
     fields = _loads(row["metadata_json"]) or {}
     shaped = SHAPERS.get(source, lambda _f: {})(fields) if isinstance(fields, dict) else {}
     day = dt.datetime.fromtimestamp(row["canonical_sent_at"], TZ).strftime("%Y-%m-%d")
+    family, model = classify_model(source, fields, row["category"], row["model_family"],
+                                   shaped.get("model") or row["model"])
     record = {
         "id": row["sha256"],
-        "title": title_for(shaped.get("tags"), shaped.get("model") or row["model"], day),
+        "title": title_for(shaped.get("tags"), model, day),
         "path": [row["category"], day],
         "ext": row["file_extension"],
         "width": row["width"],
@@ -553,11 +607,11 @@ def light_record(row: sqlite3.Row) -> dict:
         "metadataSource": source,
         "origin": "server",
     }
-    if row["model_family"]:
-        record["modelFamily"] = row["model_family"]
-    if row["model"]:
-        record["model"] = row["model"]
-    for key in ("tags", "negative", "params", "model", "hasWorkflow", "promptSource"):
+    if family:
+        record["modelFamily"] = family
+    if model:
+        record["model"] = model
+    for key in ("tags", "negative", "characters", "params", "model", "hasWorkflow", "promptSource"):
         value = shaped.get(key)
         if value:
             record.setdefault(key, value)
@@ -583,8 +637,47 @@ def private_record(row: sqlite3.Row) -> dict:
 # --------------------------------------------------------------------------
 
 
-def collector_conn(path: str = COLLECTOR_DB) -> sqlite3.Connection:
-    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=30)
+class CollectorConnection(sqlite3.Connection):
+    """The collector database, plus which assets rows fall on which day.
+
+    ``canonical_sent_at`` has no index and sits after ``metadata_json`` in the
+    row, so any filter on it walks every overflow page of the table: ~33 s on
+    the server in October 2026, whichever day is asked for.  Asking once per
+    day, in the upload loop and again in the purge loop, made that most of a
+    100-minute run that grew by a minute a day, until on 2026-10-26 it held the
+    archive lock past the hour gallery maintenance waits for it.
+
+    So the table is read once per run, rowids per day, and a day's rows are
+    fetched by rowid.  Rows inserted after that pass have higher rowids and are
+    picked up too; the time bounds stay in the query so a row whose day moved
+    since is not filed under the old one.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._day_rowids: dict[str, list[int]] | None = None
+        self._last_rowid = 0
+        self.projected_days: dict[str, str] | None = None
+
+    def day_rowids(self) -> tuple[dict[str, list[int]], int]:
+        if self._day_rowids is None:
+            started = time.monotonic()
+            days: dict[str, list[int]] = {}
+            last = 0
+            for rowid, sent_at in self.execute("SELECT rowid, canonical_sent_at FROM assets"):
+                last = max(last, rowid)
+                if sent_at is not None:
+                    day = dt.datetime.fromtimestamp(sent_at, TZ).strftime("%Y-%m-%d")
+                    days.setdefault(day, []).append(rowid)
+            self._day_rowids, self._last_rowid = days, last
+            log(f"assets: {sum(map(len, days.values()))} rows over {len(days)} days, "
+                f"read in {time.monotonic() - started:.0f}s")
+        return self._day_rowids, self._last_rowid
+
+
+def collector_conn(path: str = COLLECTOR_DB) -> CollectorConnection:
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=30,
+                           factory=CollectorConnection)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -594,26 +687,32 @@ def day_bounds(day: str) -> tuple[int, int]:
     return int(start.timestamp()), int((start + dt.timedelta(days=1)).timestamp())
 
 
-def all_days(conn: sqlite3.Connection) -> list[str]:
-    return [
-        row[0]
-        for row in conn.execute(
-            "SELECT DISTINCT date(canonical_sent_at, 'unixepoch', '+8 hours') AS d "
-            "FROM assets ORDER BY d"
-        )
-    ]
+def all_days(conn: CollectorConnection) -> list[str]:
+    return sorted(conn.day_rowids()[0])
 
 
-def assets_for_day(conn: sqlite3.Connection, day: str) -> list[sqlite3.Row]:
+def assets_for_day(conn: CollectorConnection, day: str) -> list[sqlite3.Row]:
     start, end = day_bounds(day)
+    if conn.projected_days is not None:
+        return conn.execute(
+            """SELECT a.*,m.model,m.model_family
+               FROM assets a LEFT JOIN asset_model m ON m.sha256=a.sha256
+               WHERE a.sha256 IN (SELECT value FROM json_each(?))
+                 AND a.canonical_sent_at >= ? AND a.canonical_sent_at < ?
+               ORDER BY a.canonical_sent_at,a.sha256""",
+            (conn.projected_days[day], start, end),
+        ).fetchall()
+    rowids, last = conn.day_rowids()
     return conn.execute(
         """
         SELECT a.*, m.model, m.model_family
         FROM assets a LEFT JOIN asset_model m ON m.sha256 = a.sha256
-        WHERE a.canonical_sent_at >= ? AND a.canonical_sent_at < ?
+        WHERE a.rowid IN (SELECT value FROM json_each(?)
+                          UNION ALL SELECT rowid FROM assets WHERE rowid > ?)
+          AND a.canonical_sent_at >= ? AND a.canonical_sent_at < ?
         ORDER BY a.canonical_sent_at
         """,
-        (start, end),
+        (json.dumps(rowids.get(day, [])), last, start, end),
     ).fetchall()
 
 
@@ -691,12 +790,27 @@ class Budget:
             return self.remaining is not None and self.remaining <= 0
 
 
-def upload_day(client, state, conn, day, args, budget) -> dict:
-    rows = assets_for_day(conn, day)
+def upload_day(client, state, conn, day, args, budget, rows=None) -> dict:
+    if rows is None:
+        rows = assets_for_day(conn, day)
     done = {
         row[0]
         for row in state.execute("SELECT sha256 FROM uploaded WHERE day = ?", (day,))
     }
+    if conn.projected_days is not None and rows:
+        # The original key is content-addressed. A corrected day can reuse
+        # an already archived original even after the local file was purged.
+        existing = state.execute(
+            "SELECT sha256,key,size FROM uploaded WHERE origin='server' AND sha256 IN (SELECT value FROM json_each(?))",
+            (json.dumps([r["sha256"] for r in rows if r["sha256"] not in done]),),
+        )
+        archived = {sha: (key, size) for sha, key, size in existing}
+        moves = [(day, r["sha256"]) for r in rows if archived.get(r["sha256"]) ==
+                 (object_key(r["sha256"], r["file_extension"]), r["file_size"])]
+        if moves:
+            state.executemany("UPDATE uploaded SET day=? WHERE sha256=?", moves)
+            state.commit()
+            done.update(sha for _, sha in moves)
     todo = [r for r in rows if r["sha256"] not in done]
     stats = {"day": day, "total": len(rows), "uploaded": 0, "skipped": len(done),
              "bytes": 0, "missing": 0, "failed": 0, "stopped": False}
@@ -780,9 +894,11 @@ def content_type_for(ext: str) -> str:
     return CONTENT_TYPES.get(ext.lower(), "application/octet-stream")
 
 
-def write_day_indexes(client, state, conn, day, args) -> dict | None:
+def write_day_indexes(client, state, conn, day, args, rows=None) -> dict | None:
     """Publish the day's listing, its private provenance, and any missing meta blobs."""
-    rows = assets_for_day(conn, day)
+    if rows is None:
+        rows = assets_for_day(conn, day)
+    incremental = conn.projected_days is not None
     if not rows:
         return None
     have = {r[0] for r in state.execute("SELECT sha256 FROM uploaded WHERE day = ?", (day,))}
@@ -790,7 +906,10 @@ def write_day_indexes(client, state, conn, day, args) -> dict | None:
     if not rows:
         return None
 
-    meta_done = {r[0] for r in state.execute("SELECT sha256 FROM meta_uploaded")}
+    meta_done = {r[0] for r in state.execute(
+        "SELECT sha256 FROM meta_uploaded WHERE sha256 IN (SELECT value FROM json_each(?))",
+        (json.dumps([r["sha256"] for r in rows]),),
+    )}
     pending_meta = [r for r in rows if r["sha256"] not in meta_done and r["metadata_json"]]
     if pending_meta:
         log(f"{day}: uploading {len(pending_meta)} metadata blobs")
@@ -821,9 +940,20 @@ def write_day_indexes(client, state, conn, day, args) -> dict | None:
                         "INSERT OR REPLACE INTO meta_uploaded VALUES (?,?)",
                         (sha, int(time.time())),
                     )
+                    meta_done.add(sha)
         state.commit()
+        if incremental and any(r["sha256"] not in meta_done for r in pending_meta):
+            return {"incomplete": True}
 
     entries = [light_record(r) for r in rows]
+    records = [private_record(r) for r in rows]
+    if incremental:
+        fingerprint = hashlib.sha256(
+            json.dumps([entries, records], ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        known = state.execute("SELECT fingerprint FROM archive_day_content WHERE day=?", (day,)).fetchone()
+        if known == (fingerprint,):
+            return {"unchanged": True}
     categories, families = {}, {}
     for entry in entries:
         categories[entry["category"]] = categories.get(entry["category"], 0) + 1
@@ -846,7 +976,7 @@ def write_day_indexes(client, state, conn, day, args) -> dict | None:
     client.put_json(
         f"private/days/{day}.json",
         {"day": day, "generatedAt": index["generatedAt"],
-         "records": [private_record(r) for r in rows]},
+         "records": records},
         cache_control="private, no-store",
     )
     state.execute(
@@ -858,6 +988,11 @@ def write_day_indexes(client, state, conn, day, args) -> dict | None:
          json.dumps(categories, ensure_ascii=False), json.dumps(families, ensure_ascii=False),
          day, day),
     )
+    if incremental:
+        state.execute("INSERT OR REPLACE INTO archive_day_content VALUES(?,?)", (day, fingerprint))
+        state.execute("INSERT OR IGNORE INTO archive_root_pending VALUES(1)")
+    elif state.execute("SELECT 1 FROM sqlite_master WHERE name='archive_day_content'").fetchone():
+        state.execute("DELETE FROM archive_day_content WHERE day=?", (day,))
     state.commit()
     log(f"{day}: index {len(entries)} entries, {raw_size / 1024:.0f} KB -> {gz_size / 1024:.0f} KB gz")
     return {"day": day, "origin": "server", "entryCount": len(entries),
@@ -1094,18 +1229,48 @@ def print_status(state, conn) -> None:
     print(f"remaining         : {assets - total:>7}")
     print()
     print(f"{'day':<12}{'assets':>8}{'in R2':>8}{'GB':>7}  state")
-    for day in all_days(conn):
-        rows = conn.execute(
-            "SELECT count(*), coalesce(sum(file_size), 0) FROM assets "
-            "WHERE canonical_sent_at >= ? AND canonical_sent_at < ?",
-            day_bounds(day),
-        ).fetchone()
+    # One pass for every day: a filter on canonical_sent_at reads the whole
+    # table (see CollectorConnection).
+    per_day = {
+        row[0]: (row[1], row[2])
+        for row in conn.execute(
+            "SELECT date(canonical_sent_at, 'unixepoch', '+8 hours') AS d, count(*), "
+            "coalesce(sum(file_size), 0) FROM assets GROUP BY d"
+        )
+    }
+    for day in sorted(day for day in per_day if day):
+        rows = per_day[day]
         done = state.execute("SELECT count(*) FROM uploaded WHERE day = ?", (day,)).fetchone()[0]
         purged = state.execute(
             "SELECT purged_at FROM days WHERE day = ? AND origin = 'server'", (day,)
         ).fetchone()
         mark = "purged" if purged and purged[0] else ("complete" if done >= rows[0] else "")
         print(f"{day:<12}{rows[0]:>8}{done:>8}{rows[1] / 1073741824:>7.1f}  {mark}")
+
+
+def incremental_upload(client, state, conn, args):
+    import archive_incremental
+
+    archive_incremental.stage(conn, state)
+    now = int(time.time())
+    conn.projected_days = archive_incremental.select_days(state, now, 6)
+    budget = Budget(args.max_seconds, args.max_bytes)
+    for day in conn.projected_days:
+        if budget.exhausted():
+            break
+        rows = assets_for_day(conn, day)
+        stats = upload_day(client, state, conn, day, args, budget, rows)
+        index = write_day_indexes(client, state, conn, day, args, rows)
+        if stats["stopped"] or stats["failed"] or stats["missing"] or index and index.get("incomplete"):
+            archive_incremental.finish_day(state, day, now + 900)
+        else:
+            archive_incremental.finish_day(state, day)
+    if state.execute("SELECT 1 FROM archive_root_pending").fetchone():
+        write_root_index(client, state, conn)
+        with state:
+            state.execute("DELETE FROM archive_root_pending")
+    if not conn.projected_days:
+        log("incremental: no archive changes")
 
 
 def main() -> int:
@@ -1134,9 +1299,21 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true", help="do not delete anything")
     parser.add_argument("--config", type=Path, default=CONFIG_PATH)
     parser.add_argument("--state", type=Path, default=STATE_PATH)
+    parser.add_argument("--incremental", action="store_true", help="upload only dates queued by the collector")
+    parser.add_argument("--install-change-feed", action="store_true", help="install the incremental feed in the collector DB")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
+    if args.install_change_feed:
+        import archive_incremental
+
+        if args.upload or args.purge or args.index or args.reindex or args.merge_days or args.incremental:
+            parser.error("install the feed as a separate operation")
+        with sqlite3.connect(cfg.get("collector_db", COLLECTOR_DB), timeout=2) as collector:
+            archive_incremental.install(collector)
+        return 0
+    if args.incremental and (args.upload or args.purge or args.index or args.reindex or args.merge_days or args.day):
+        parser.error("--incremental cannot be combined with other archive actions")
     args.keep_days = args.keep_days if args.keep_days is not None else cfg.get("keep_days", DEFAULT_KEEP_DAYS)
     args.seal_hours = args.seal_hours if args.seal_hours is not None else cfg.get("seal_hours", DEFAULT_SEAL_HOURS)
     args.workers = min(MAX_WORKERS, args.workers or cfg.get("workers", DEFAULT_WORKERS))
@@ -1148,12 +1325,15 @@ def main() -> int:
         print_status(state, conn)
         return 0
 
-    if not (args.upload or args.purge or args.index or args.reindex or args.merge_days):
+    if not (args.upload or args.purge or args.index or args.reindex or args.merge_days or args.incremental):
         parser.error("nothing to do: pass --upload, --purge, --reindex, --index, "
                      "--merge-days or --status")
 
     lock = acquire_lock()  # noqa: F841 - held for the lifetime of the process
     client = R2Client(cfg)
+    if args.incremental:
+        incremental_upload(client, state, conn, args)
+        return 0
     if args.merge_days:
         merge_days(state, args.merge_days)
     budget = Budget(args.max_seconds, args.max_bytes)

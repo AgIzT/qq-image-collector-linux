@@ -110,9 +110,10 @@ def build_record(*, sha, day, category, source, fields, model, family,
                  ext, width, height, size, sent_at) -> dict:
     """Shape one listing record, exactly as archive_to_r2 shapes the server's."""
     shaped = archive.SHAPERS.get(source, lambda _f: {})(fields)
+    family, model = archive.classify_model(source, fields, category, family, shaped.get("model") or model)
     record = {
         "id": sha,
-        "title": archive.title_for(shaped.get("tags"), shaped.get("model") or model, day),
+        "title": archive.title_for(shaped.get("tags"), model, day),
         "path": [category, day],
         "ext": ext,
         "width": width,
@@ -126,7 +127,7 @@ def build_record(*, sha, day, category, source, fields, model, family,
     }
     if model:
         record["model"] = model
-    for key in ("tags", "negative", "params", "model", "hasWorkflow", "promptSource"):
+    for key in ("tags", "negative", "characters", "params", "model", "hasWorkflow", "promptSource"):
         value = shaped.get(key)
         if value:
             record.setdefault(key, value)

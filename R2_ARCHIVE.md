@@ -78,7 +78,8 @@ JSON 都带 `Content-Encoding: gzip`（图片不压——PNG/WebP 已压过，�
 落盘目录，所以今天跑一次补漏，可能往 `2026-08-13/` 里加文件。
 **"这天已经过完了" ≠ "这天不会再变"。** 四个条件全满足才删：
 
-1. 日期比今天早 `keep_days` 天（默认 14）
+1. 日期比今天早 `keep_days` 天（默认 14；生产 2026-11-18 起 `qqai-set-r2 keep 7`，
+   给群文件补采腾地方）
 2. `images` 表里那一天没有 `queued` / `deferred` / `downloading` 的记录
 3. 那天的目录里最新的文件 mtime 已经 `seal_hours` 小时（默认 6）没动
 4. 那天每个 asset 都通过了 HEAD 核对
